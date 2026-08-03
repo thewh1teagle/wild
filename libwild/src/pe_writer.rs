@@ -2356,24 +2356,101 @@ fn cached_comdat_sections(
     }
 }
 
-fn section_is_comdat(file: &object::File<'_>, index: object::SectionIndex) -> bool {
-    file.section_by_index(index)
-        .ok()
-        .is_some_and(|section| match section.flags() {
-            SectionFlags::Coff { characteristics } => {
-                characteristics.0 & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0
-            }
-            _ => false,
-        })
-}
-
 type ObjectSectionKey = (usize, object::SectionIndex);
 type SectionRedirects = HashMap<ObjectSectionKey, ObjectSectionKey>;
+type SectionNode = usize;
+type ComdatGroupId = usize;
+
+#[derive(Debug, Default)]
+struct CompactComdatAnalysis {
+    keys: Vec<ObjectSectionKey>,
+    nodes_by_object: Vec<Vec<Option<SectionNode>>>,
+    is_comdat: Vec<bool>,
+    groups: Vec<Vec<SectionNode>>,
+    group_by_node: Vec<ComdatGroupId>,
+}
+
+impl CompactComdatAnalysis {
+    fn new(
+        objects: &[crate::coff::CoffObject<'_>],
+        section_groups: &[HashMap<object::SectionIndex, CachedComdatGroup>],
+    ) -> Result<Self> {
+        let mut analysis = Self {
+            nodes_by_object: Vec::with_capacity(objects.len()),
+            ..Self::default()
+        };
+        for (object_index, object) in objects.iter().enumerate() {
+            let section_count = object.file().sections().count();
+            let mut nodes = vec![None; section_count.saturating_add(1)];
+            for section in object.file().sections() {
+                let index = section.index();
+                if index.0 >= nodes.len() {
+                    nodes.resize(index.0 + 1, None);
+                }
+                let node = analysis.keys.len();
+                nodes[index.0] = Some(node);
+                analysis.keys.push((object_index, index));
+                analysis.is_comdat.push(match section.flags() {
+                    SectionFlags::Coff { characteristics } => {
+                        characteristics.0 & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0
+                    }
+                    _ => false,
+                });
+            }
+            analysis.nodes_by_object.push(nodes);
+        }
+        analysis.group_by_node = vec![usize::MAX; analysis.keys.len()];
+
+        // Walk leaders in object section order. Group IDs therefore remain deterministic even
+        // though the cached lookup itself is a HashMap.
+        for (object_index, object) in objects.iter().enumerate() {
+            for section in object.file().sections() {
+                let Some(group) = section_groups[object_index].get(&section.index()) else {
+                    continue;
+                };
+                let group_id = analysis.groups.len();
+                let mut members = Vec::with_capacity(group.sections.len());
+                for &member in &group.sections {
+                    let node = analysis
+                        .node((object_index, member))
+                        .context("COMDAT group refers to an invalid section")?;
+                    ensure!(
+                        analysis.group_by_node[node] == usize::MAX,
+                        "COFF section belongs to multiple COMDAT groups"
+                    );
+                    analysis.group_by_node[node] = group_id;
+                    members.push(node);
+                }
+                analysis.groups.push(members);
+            }
+        }
+        // Ordinary sections, and defensive fallback COMDATs without an auxiliary group, are
+        // singleton reachability units.
+        for node in 0..analysis.keys.len() {
+            if analysis.group_by_node[node] != usize::MAX {
+                continue;
+            }
+            let group_id = analysis.groups.len();
+            analysis.group_by_node[node] = group_id;
+            analysis.groups.push(vec![node]);
+        }
+        Ok(analysis)
+    }
+
+    fn node(&self, (object, section): ObjectSectionKey) -> Option<SectionNode> {
+        self.nodes_by_object
+            .get(object)?
+            .get(section.0)
+            .copied()
+            .flatten()
+    }
+}
 
 #[derive(Debug, Default)]
 struct ComdatResolution {
     discarded: HashSet<ObjectSectionKey>,
     redirects: SectionRedirects,
+    analysis: CompactComdatAnalysis,
 }
 
 fn record_comdat_redirects(
@@ -2459,30 +2536,35 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
     use linker_utils::coff_symbols::select_comdat;
 
     let classify_phase = crate::timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
+    let section_groups = objects
+        .iter()
+        .map(|input| cached_comdat_sections(input.file()))
+        .collect::<Result<Vec<_>>>()?;
+    let analysis = CompactComdatAnalysis::new(objects, &section_groups)?;
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
-    for input in objects {
+    for (object_index, input) in objects.iter().enumerate() {
         for symbol in input.file().symbols() {
             if !symbol.is_global() || !symbol.is_definition() {
                 continue;
             }
             if symbol
                 .section_index()
-                .is_some_and(|section| section_is_comdat(input.file(), section))
+                .and_then(|section| analysis.node((object_index, section)))
+                .is_some_and(|node| analysis.is_comdat[node])
             {
                 continue;
             }
             strong_definitions.insert(symbol.name_bytes()?.to_vec());
         }
     }
-    let section_groups = objects
-        .iter()
-        .map(|input| cached_comdat_sections(input.file()))
-        .collect::<Result<Vec<_>>>()?;
     drop(classify_phase);
 
     let selection_phase = crate::timing_guard!(PE_DETAIL_COMDAT_SELECT);
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
-    let mut resolution = ComdatResolution::default();
+    let mut resolution = ComdatResolution {
+        analysis,
+        ..ComdatResolution::default()
+    };
     for (object_index, (input, mut section_groups)) in
         objects.iter().zip(section_groups).enumerate()
     {
@@ -2688,38 +2770,36 @@ fn unreferenced_comdat_sections(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashSet<ObjectSectionKey>> {
     let topology_phase = crate::timing_guard!(PE_DETAIL_REF_TOPOLOGY);
-    let mut group_members = HashMap::<ObjectSectionKey, Vec<ObjectSectionKey>>::new();
-    for (object_index, object) in objects.iter().enumerate() {
-        for group in cached_comdat_sections(object.file())?.into_values() {
-            let members = group
-                .sections
-                .iter()
-                .map(|section| (object_index, *section))
-                .collect::<Vec<_>>();
-            for member in &members {
-                group_members.insert(*member, members.clone());
-            }
-        }
-    }
-    drop(topology_phase);
-    let resolve = |mut key: ObjectSectionKey| -> Result<Option<ObjectSectionKey>> {
+    let mut resolved_groups = vec![None; comdats.analysis.keys.len()];
+    for (start, resolved_group) in resolved_groups.iter_mut().enumerate() {
+        let mut node = start;
         for _ in 0..=comdats.redirects.len() {
+            let key = comdats.analysis.keys[node];
             if !comdats.discarded.contains(&key) {
-                return Ok(Some(key));
+                *resolved_group = Some(comdats.analysis.group_by_node[node]);
+                break;
             }
             let Some(next) = comdats.redirects.get(&key) else {
-                return Ok(None);
+                break;
             };
-            key = *next;
+            node = comdats
+                .analysis
+                .node(*next)
+                .context("COMDAT redirect targets an invalid section")?;
         }
-        Err(error!("cycle in COMDAT section redirects"))
-    };
+        ensure!(
+            resolved_group.is_some()
+                || !comdats.redirects.contains_key(&comdats.analysis.keys[node]),
+            "cycle in COMDAT section redirects"
+        );
+    }
+    drop(topology_phase);
 
     // Relocations to external symbols have no section on their local symbol record. Resolve
     // them through the selected global definition, while direct/local relocations use the
     // symbol's own section below.
     let definitions_phase = crate::timing_guard!(PE_DETAIL_REF_DEFINITIONS);
-    let mut definitions = HashMap::<Vec<u8>, ObjectSectionKey>::new();
+    let mut definitions = HashMap::<Vec<u8>, ComdatGroupId>::new();
     for (object_index, object) in objects.iter().enumerate() {
         for symbol in object.file().symbols() {
             if !symbol.is_global() || !symbol.is_definition() {
@@ -2728,18 +2808,22 @@ fn unreferenced_comdat_sections(
             let Some(section) = symbol.section_index() else {
                 continue;
             };
-            let Some(section) = resolve((object_index, section))? else {
+            let node = comdats
+                .analysis
+                .node((object_index, section))
+                .context("definition refers to an invalid COFF section")?;
+            let Some(group) = resolved_groups[node] else {
                 continue;
             };
             definitions
                 .entry(symbol.name_bytes()?.to_vec())
-                .or_insert(section);
+                .or_insert(group);
         }
     }
     let weak_resolution = weak_external_resolution(objects)?;
-    let resolve_definition = |name: &[u8]| -> Result<Option<ObjectSectionKey>> {
-        if let Some(&section) = definitions.get(name) {
-            return Ok(Some(section));
+    let resolve_definition = |name: &[u8]| -> Result<Option<ComdatGroupId>> {
+        if let Some(&group) = definitions.get(name) {
+            return Ok(Some(group));
         }
 
         // A weak external is undefined at the relocation site; its auxiliary symbol names
@@ -2747,8 +2831,8 @@ fn unreferenced_comdat_sections(
         // COMDAT is dead. A strong definition of any intermediate name stops the chain.
         let weak_target =
             weak_resolution.resolve(name, |candidate| definitions.contains_key(candidate))?;
-        if let Some(&section) = definitions.get(weak_target) {
-            return Ok(Some(section));
+        if let Some(&group) = definitions.get(weak_target) {
+            return Ok(Some(group));
         }
 
         // `/alternatename` has the same selected-definition rule as weak externals. Keep the
@@ -2764,81 +2848,92 @@ fn unreferenced_comdat_sections(
     };
     drop(definitions_phase);
 
-    let mut live = HashSet::<ObjectSectionKey>::new();
-    let mut pending = Vec::<ObjectSectionKey>::new();
-    let mark_live = |key: ObjectSectionKey,
-                     live: &mut HashSet<ObjectSectionKey>,
-                     pending: &mut Vec<ObjectSectionKey>| {
-        let members = group_members
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| vec![key]);
-        for member in members {
-            if live.insert(member) {
-                pending.push(member);
-            }
+    let mut live = vec![false; comdats.analysis.groups.len()];
+    let mut pending = Vec::<ComdatGroupId>::new();
+    let mark_live = |group: ComdatGroupId, live: &mut [bool], pending: &mut Vec<ComdatGroupId>| {
+        if !live[group] {
+            live[group] = true;
+            pending.push(group);
         }
     };
 
     // See the function comment above: all ordinary sections are roots.  This also makes REF
     // compatible with objects compiled without /Gy, where a whole .text section is indivisible.
     let roots_phase = crate::timing_guard!(PE_DETAIL_REF_ROOTS);
-    for (object_index, object) in objects.iter().enumerate() {
-        for section in object.file().sections() {
-            let key = (object_index, section.index());
-            if !section_is_comdat(object.file(), section.index())
-                && let Some(key) = resolve(key)?
-            {
-                mark_live(key, &mut live, &mut pending);
-            }
+    for (node, resolved_group) in resolved_groups.iter().enumerate() {
+        if !comdats.analysis.is_comdat[node]
+            && let Some(group) = *resolved_group
+        {
+            mark_live(group, &mut live, &mut pending);
         }
     }
     for root in roots {
-        if let Some(section) = resolve_definition(root)? {
-            mark_live(section, &mut live, &mut pending);
+        if let Some(group) = resolve_definition(root)? {
+            mark_live(group, &mut live, &mut pending);
         }
     }
     drop(roots_phase);
 
     let reachability_phase = crate::timing_guard!(PE_DETAIL_REF_REACHABILITY);
-    while let Some((object_index, section_index)) = pending.pop() {
-        let section = objects[object_index]
-            .file()
-            .section_by_index(section_index)
-            .context("invalid live COFF section")?;
-        for (_, relocation) in section.relocations() {
-            let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+    let mut edges = vec![Vec::<ComdatGroupId>::new(); comdats.analysis.groups.len()];
+    for (object_index, object) in objects.iter().enumerate() {
+        for section in object.file().sections() {
+            let key = (object_index, section.index());
+            if comdats.discarded.contains(&key) {
+                continue;
+            }
+            let source_node = comdats
+                .analysis
+                .node(key)
+                .context("relocation source has an invalid COFF section")?;
+            let Some(source_group) = resolved_groups[source_node] else {
                 continue;
             };
-            let symbol = objects[object_index]
-                .file()
-                .symbol_by_index(symbol_index)
-                .context("invalid COFF relocation symbol")?;
-            let target = if let Some(section) = symbol.section_index() {
-                resolve((object_index, section))?
-            } else if symbol.is_global() {
-                resolve_definition(symbol.name_bytes()?)?
-            } else {
-                None
-            };
-            if let Some(target) = target {
-                mark_live(target, &mut live, &mut pending);
+            for (_, relocation) in section.relocations() {
+                let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                    continue;
+                };
+                let symbol = object
+                    .file()
+                    .symbol_by_index(symbol_index)
+                    .context("invalid COFF relocation symbol")?;
+                let target = if let Some(section) = symbol.section_index() {
+                    let node = comdats
+                        .analysis
+                        .node((object_index, section))
+                        .context("relocation targets an invalid COFF section")?;
+                    resolved_groups[node]
+                } else if symbol.is_global() {
+                    resolve_definition(symbol.name_bytes()?)?
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    edges[source_group].push(target);
+                }
             }
+        }
+    }
+    for targets in &mut edges {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+    while let Some(group) = pending.pop() {
+        for &target in &edges[group] {
+            mark_live(target, &mut live, &mut pending);
         }
     }
     drop(reachability_phase);
 
     let classification_phase = crate::timing_guard!(PE_DETAIL_REF_CLASSIFY);
     let mut discarded = HashSet::new();
-    for (object_index, object) in objects.iter().enumerate() {
-        for section in object.file().sections() {
-            let key = (object_index, section.index());
-            if section_is_comdat(object.file(), section.index())
-                && !comdats.discarded.contains(&key)
-                && !live.contains(&key)
-            {
-                discarded.insert(key);
-            }
+    for node in 0..comdats.analysis.keys.len() {
+        let key = comdats.analysis.keys[node];
+        if comdats.analysis.is_comdat[node]
+            && !comdats.discarded.contains(&key)
+            && !live[comdats.analysis.group_by_node[node]]
+        {
+            discarded.insert(key);
         }
     }
     drop(classification_phase);
@@ -4672,6 +4767,56 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn comdat_relocation_object(source: &[u8], target: &[u8]) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_subsection(object::write::StandardSection::Text, source);
+        object.append_section_data(text, &[0, 0, 0, 0, 0xc3], 1);
+        object.section_symbol(text);
+        let source = object.add_symbol(Symbol {
+            name: source.to_vec(),
+            value: 0,
+            size: 5,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        let target = object.add_symbol(Symbol {
+            name: target.to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: source,
+            sections: vec![text],
+        });
+        object
+            .add_relocation(
+                text,
+                Relocation {
+                    offset: 0,
+                    symbol: target,
+                    addend: 0,
+                    flags: object::RelocationFlags::Coff {
+                        typ: object::pe::IMAGE_REL_AMD64_REL32,
+                    },
+                },
+            )
+            .unwrap();
+        object.write().unwrap()
+    }
+
     fn weak_comdat_object(alias: &[u8], fallback: &[u8]) -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -5114,6 +5259,59 @@ mod tests {
     }
 
     #[test]
+    fn opt_ref_follows_transitive_compact_group_edges() {
+        let caller = relocation_object(b"caller", b"middle");
+        let middle = comdat_relocation_object(b"middle", b"target");
+        let target = comdat_object(
+            b"target",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"target",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&middle).unwrap(),
+            crate::coff::CoffObject::parse(&target).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"caller".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert!(contributions.iter().any(|contribution| {
+            matches!(contribution.source, Source::Object { object: 1, .. })
+        }));
+        assert!(contributions.iter().any(|contribution| {
+            matches!(contribution.source, Source::Object { object: 2, .. })
+        }));
+        assert!(contributions.iter().all(|contribution| {
+            !matches!(contribution.source, Source::Object { object: 3, .. })
+        }));
+    }
+
+    #[test]
     fn opt_ref_follows_weak_external_fallback_into_comdat() {
         let caller = relocation_object(b"caller", b"weak_alias");
         let target = weak_comdat_object(b"weak_alias", b"fallback");
@@ -5517,6 +5715,19 @@ mod tests {
             let discarded = discarded_comdat_sections(&objects).unwrap();
             assert_eq!(discarded.discarded.len(), 2, "selection {kind:?}");
             assert_eq!(discarded.redirects.len(), 2, "selection {kind:?}");
+            for object in 0..2 {
+                let primary = discarded
+                    .analysis
+                    .node((object, object::SectionIndex(1)))
+                    .unwrap();
+                let associate = discarded
+                    .analysis
+                    .node((object, object::SectionIndex(2)))
+                    .unwrap();
+                let group = discarded.analysis.group_by_node[primary];
+                assert_eq!(discarded.analysis.group_by_node[associate], group);
+                assert_eq!(discarded.analysis.groups[group], [primary, associate]);
+            }
             let (loser, winner) = if matches!(
                 kind,
                 object::ComdatKind::Largest | object::ComdatKind::Newest
