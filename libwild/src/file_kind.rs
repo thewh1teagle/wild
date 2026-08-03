@@ -27,10 +27,16 @@ pub(crate) enum FileKind {
     Text,
     LlvmIr,
     GccIr,
+    CoffObject,
 }
 
 impl FileKind {
     pub(crate) fn identify_bytes(bytes: &[u8]) -> Result<FileKind> {
+        if crate::coff::has_amd64_machine(bytes) {
+            crate::coff::validate_x86_64_object(bytes)?;
+            return Ok(FileKind::CoffObject);
+        }
+
         if bytes.starts_with(&object::archive::MAGIC) {
             Ok(FileKind::Archive)
         } else if bytes.starts_with(&object::archive::THIN_MAGIC) {
@@ -153,7 +159,30 @@ impl std::fmt::Display for FileKind {
             FileKind::Text => "text",
             FileKind::LlvmIr => "LLVM-IR",
             FileKind::GccIr => "GCC-IR",
+            FileKind::CoffObject => "x86-64 COFF object",
         };
         std::fmt::Display::fmt(s, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_minimal_amd64_coff_header() {
+        let bytes = crate::coff::test_object();
+        assert_eq!(
+            FileKind::identify_bytes(&bytes).unwrap(),
+            FileKind::CoffObject
+        );
+        assert_eq!(FileKind::CoffObject.to_string(), "x86-64 COFF object");
+    }
+
+    #[test]
+    fn rejects_truncated_amd64_coff() {
+        let error = FileKind::identify_bytes(&object::pe::IMAGE_FILE_MACHINE_AMD64.0.to_le_bytes())
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid x86-64 COFF object"));
     }
 }
