@@ -938,6 +938,7 @@ name = "linker-utils"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "foldhash 0.2.0",
  "leb128",
  "object 0.40.0",
  "paste",
