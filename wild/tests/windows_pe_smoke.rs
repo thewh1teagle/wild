@@ -6,8 +6,10 @@
 #[cfg(any(windows, target_os = "macos"))]
 mod corpus {
     use std::ffi::OsStr;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::process::Output;
 
     #[cfg_attr(not(windows), allow(dead_code))]
     struct Case {

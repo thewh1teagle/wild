@@ -4,7 +4,8 @@
 //! spelling and source location needed for diagnostics while normalizing both
 //! input syntaxes into the same deterministic export representation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 

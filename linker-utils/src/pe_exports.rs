@@ -1,8 +1,10 @@
 //! Construction of deterministic PE export directories.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const EXPORT_DIRECTORY_SIZE: usize = 40;
 

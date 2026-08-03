@@ -5,9 +5,11 @@
 //! it returns symbolic relocation requirements for each helper thunk, allowing
 //! the linker to choose and evolve its own code sequence.
 
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use std::cmp::Ordering;
-
-use anyhow::{Context, Result, bail, ensure};
 
 /// Size of one `ImgDelayDescr` record.
 pub const IMAGE_DELAY_IMPORT_DESCRIPTOR_SIZE: u32 = 32;

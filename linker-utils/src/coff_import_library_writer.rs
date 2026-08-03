@@ -1,9 +1,11 @@
 //! Deterministic AMD64 COFF import-library construction.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use object::pe;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const ARCHIVE_MAGIC: &[u8] = b"!<arch>\n";
 const ARCHIVE_HEADER_SIZE: usize = 60;
@@ -304,9 +306,11 @@ fn display(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coff_imports::{
-        ImportLibrary, ImportLibraryMember, ImportNameType, ImportTarget, ImportType,
-    };
+    use crate::coff_imports::ImportLibrary;
+    use crate::coff_imports::ImportLibraryMember;
+    use crate::coff_imports::ImportNameType;
+    use crate::coff_imports::ImportTarget;
+    use crate::coff_imports::ImportType;
 
     #[test]
     fn round_trips_named_ordinal_alias_and_data_imports() {

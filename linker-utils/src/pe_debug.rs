@@ -4,7 +4,10 @@
 //! reproducible build-id record and passes an existing CodeView RSDS identity
 //! through to the image.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use std::ops::Range;
 
 pub const IMAGE_DEBUG_DIRECTORY_SIZE: usize = 28;

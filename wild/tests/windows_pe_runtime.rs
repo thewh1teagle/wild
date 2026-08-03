@@ -7,9 +7,12 @@
 
 #[cfg(any(windows, target_os = "macos"))]
 mod corpus {
-    use std::ffi::{OsStr, OsString};
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::process::Output;
 
     struct ExpectedProgram {
         label: &'static str,

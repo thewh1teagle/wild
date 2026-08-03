@@ -5,13 +5,14 @@
 //! sections and exposes deterministic queries that a PE linker can integrate
 //! into its own archive-extraction loop.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::fmt;
-
 use object::LittleEndian as LE;
 use object::pe;
-use object::read::coff::{CoffHeader as _, Symbol as _};
+use object::read::coff::CoffHeader as _;
+use object::read::coff::Symbol as _;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 
 /// A malformed or contradictory runtime-link directive.
 #[derive(Clone, Debug, Eq, PartialEq)]
