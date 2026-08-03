@@ -13,6 +13,11 @@ use crate::error::Result;
 use crate::fs::{FileReplacementMode, FileSystem, InputFileData, OutputFileData, OutputOptions};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationKind, RelocationTarget, SectionFlags};
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+#[path = "pe_imports.rs"]
+mod pe_imports;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeWriterConfig {
@@ -69,8 +74,8 @@ struct InputSection {
 /// Link the deliberately small first PE/COFF vertical slice.
 ///
 /// Keeping this path separate from the ELF-oriented generic layout makes the constraints explicit
-/// while the COFF resolver grows. Archives, COMDAT selection and imports are rejected rather than
-/// silently producing a corrupt image.
+/// while the COFF resolver grows. Import libraries are consumed directly; general static archives
+/// and COMDAT selection remain future resolution work.
 pub(crate) fn link<F: FileSystem>(
     fs: &F,
     args: &crate::args::coff::CoffArgs,
@@ -85,7 +90,7 @@ pub(crate) fn link<F: FileSystem>(
         .ok_or_else(|| error!("PE output currently requires /ENTRY:<symbol>"))?;
     ensure!(!args.common.inputs.is_empty(), "no COFF input files");
 
-    let mut inputs = Vec::new();
+    let mut requested = Vec::new();
     for input in &args.common.inputs {
         let path = match &input.spec {
             crate::args::InputSpec::File(path) => path.as_ref(),
@@ -95,21 +100,104 @@ pub(crate) fn link<F: FileSystem>(
                 ));
             }
         };
-        let (data, _) = fs
-            .open_input(path, args.common.prepopulate_maps)
-            .with_context(|| format!("Failed to open COFF input `{}`", path.display()))?;
-        inputs.push((path.to_path_buf(), data));
+        requested.push(path.to_path_buf());
     }
 
-    let objects = inputs
-        .iter()
-        .map(|(path, data)| {
-            crate::coff::CoffObject::parse(data.bytes())
-                .with_context(|| format!("while reading `{}`", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if !args.no_default_libraries {
+        for library in &args.default_libraries {
+            if args
+                .excluded_default_libraries
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(library))
+            {
+                continue;
+            }
+            requested.push(PathBuf::from(library));
+        }
+    }
+
+    let mut inputs = Vec::new();
+    for requested_path in requested {
+        let path = find_input(fs, &requested_path, args)?;
+        let (data, _) = fs
+            .open_input(&path, args.common.prepopulate_maps)
+            .with_context(|| format!("Failed to open COFF input `{}`", path.display()))?;
+        inputs.push((path, data));
+    }
+
+    // Compiler-generated `.drectve` sections carry the CRT and SDK libraries that link.exe would
+    // add to the command line. Parse them before borrowing the input buffers as COFF objects so
+    // any additional libraries can be opened into the same owning collection.
+    if !args.no_default_libraries {
+        let mut directive_libraries = Vec::new();
+        for (path, data) in &inputs {
+            if object::FileKind::parse(data.bytes()).ok() != Some(object::FileKind::Coff) {
+                continue;
+            }
+            let file = crate::coff::CoffObject::parse(data.bytes())?;
+            let Some(section) = file.file().section_by_name(".drectve") else {
+                continue;
+            };
+            let directives = section
+                .data()
+                .with_context(|| format!("invalid .drectve section in `{}`", path.display()))?;
+            let directives = std::str::from_utf8(directives)
+                .with_context(|| format!("non-UTF-8 .drectve section in `{}`", path.display()))?
+                .trim_end_matches('\0');
+            let mut parsed = crate::args::coff::CoffArgs::default();
+            crate::args::coff::parse_directives(&mut parsed, directives)
+                .with_context(|| format!("invalid .drectve section in `{}`", path.display()))?;
+            if !parsed.no_default_libraries {
+                for library in parsed.default_libraries {
+                    if !args
+                        .excluded_default_libraries
+                        .iter()
+                        .chain(parsed.excluded_default_libraries.iter())
+                        .any(|excluded| excluded.eq_ignore_ascii_case(&library))
+                    {
+                        directive_libraries.push(library);
+                    }
+                }
+            }
+        }
+        for library in directive_libraries {
+            let requested = Path::new(&library);
+            let path = find_input(fs, requested, args)?;
+            if inputs.iter().any(|(existing, _)| existing == &path) {
+                continue;
+            }
+            let (data, _) = fs
+                .open_input(&path, args.common.prepopulate_maps)
+                .with_context(|| format!("Failed to open COFF input `{}`", path.display()))?;
+            inputs.push((path, data));
+        }
+    }
+
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (path, data) in &inputs {
+        match object::FileKind::parse(data.bytes())
+            .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
+        {
+            object::FileKind::Coff => objects.push(
+                crate::coff::CoffObject::parse(data.bytes())
+                    .with_context(|| format!("while reading `{}`", path.display()))?,
+            ),
+            object::FileKind::Archive => libraries.push(data.bytes()),
+            kind => {
+                return Err(error!(
+                    "unsupported PE input kind {kind:?} in `{}`",
+                    path.display()
+                ));
+            }
+        }
+    }
+    ensure!(!objects.is_empty(), "no COFF object files");
+
+    let undefined = undefined_symbols(&objects)?;
+    let imports = pe_imports::select_from_libraries(&libraries, &undefined)?;
     let config = PeWriterConfig::default().validate()?;
-    let image = build_image(&objects, entry_name, args, config)?;
+    let image = build_image(&objects, &imports, entry_name, args, config)?;
 
     let mut output = fs.create_output(
         args.common.output.clone(),
@@ -127,8 +215,54 @@ pub(crate) fn link<F: FileSystem>(
     Ok(crate::LinkerOutput { layout: None })
 }
 
+fn find_input<F: FileSystem>(
+    fs: &F,
+    requested: &Path,
+    args: &crate::args::coff::CoffArgs,
+) -> Result<PathBuf> {
+    if matches!(fs.file_type(requested), Ok(crate::fs::FileType::File)) {
+        return Ok(requested.to_path_buf());
+    }
+    let environment_paths = std::env::var_os("LIB")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for directory in args
+        .lib_search_path
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(environment_paths.iter().map(PathBuf::as_path))
+    {
+        let candidate = directory.join(requested);
+        if matches!(fs.file_type(&candidate), Ok(crate::fs::FileType::File)) {
+            return Ok(candidate);
+        }
+    }
+    Err(error!("cannot find COFF input `{}`", requested.display()))
+}
+
+fn undefined_symbols(objects: &[crate::coff::CoffObject<'_>]) -> Result<HashSet<Vec<u8>>> {
+    let mut undefined = HashSet::new();
+    let mut defined = HashSet::new();
+    for object in objects {
+        for symbol in object.file().symbols() {
+            let name = symbol.name_bytes().context("invalid COFF symbol name")?;
+            if name.is_empty() || !symbol.is_global() {
+                continue;
+            }
+            if symbol.is_undefined() {
+                undefined.insert(name.to_vec());
+            } else if symbol.section_index().is_some() {
+                defined.insert(name.to_vec());
+            }
+        }
+    }
+    undefined.retain(|name| !defined.contains(name));
+    Ok(undefined)
+}
+
 fn build_image(
     objects: &[crate::coff::CoffObject<'_>],
+    imports: &[pe_imports::Import],
     entry_name: &str,
     args: &crate::args::coff::CoffArgs,
     config: PeWriterConfig,
@@ -183,6 +317,45 @@ fn build_image(
             });
         }
     }
+    let (idata_size, thunk_size) = pe_imports::section_sizes(imports)?;
+    let thunk_section = if thunk_size == 0 {
+        None
+    } else {
+        let index = sections.len();
+        sections.push(InputSection {
+            object: usize::MAX,
+            index: object::SectionIndex(usize::MAX),
+            name: *b".text\0\0\0",
+            data: vec![0; thunk_size],
+            virtual_size: u32::try_from(thunk_size).context("PE thunk section is too large")?,
+            characteristics: (object::pe::IMAGE_SCN_CNT_CODE
+                | object::pe::IMAGE_SCN_MEM_EXECUTE
+                | object::pe::IMAGE_SCN_MEM_READ)
+                .0,
+            rva: 0,
+            file_offset: 0,
+        });
+        Some(index)
+    };
+    let idata_section = if idata_size == 0 {
+        None
+    } else {
+        let index = sections.len();
+        sections.push(InputSection {
+            object: usize::MAX,
+            index: object::SectionIndex(usize::MAX - 1),
+            name: *b".idata\0\0",
+            data: vec![0; idata_size],
+            virtual_size: u32::try_from(idata_size).context("PE import section is too large")?,
+            characteristics: (object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                | object::pe::IMAGE_SCN_MEM_READ
+                | object::pe::IMAGE_SCN_MEM_WRITE)
+                .0,
+            rva: 0,
+            file_offset: 0,
+        });
+        Some(index)
+    };
     ensure!(
         !sections.is_empty(),
         "COFF inputs contain no allocatable sections"
@@ -218,6 +391,18 @@ fn build_image(
     }
     let size_of_image = next_rva;
 
+    let emitted_imports = if let Some(idata_index) = idata_section {
+        let thunk_rva = thunk_section.map_or(0, |index| sections[index].rva);
+        let emitted = pe_imports::emit(imports, sections[idata_index].rva, thunk_rva)?;
+        sections[idata_index].data = emitted.idata.clone();
+        if let Some(thunk_index) = thunk_section {
+            sections[thunk_index].data = emitted.thunks.clone();
+        }
+        emitted
+    } else {
+        pe_imports::EmittedImports::default()
+    };
+
     let section_locations: HashMap<_, _> = sections
         .iter()
         .enumerate()
@@ -245,6 +430,11 @@ fn build_image(
                 );
             }
         }
+    }
+    for (name, rva) in &emitted_imports.symbols {
+        definitions
+            .entry(name.clone())
+            .or_insert(config.image_base + u64::from(*rva));
     }
 
     let entry_va = definitions
@@ -281,6 +471,8 @@ fn build_image(
         headers_size,
         size_of_image,
         entry_rva,
+        emitted_imports.import_directory,
+        emitted_imports.iat_directory,
     );
     for section in &sections {
         if !section.data.is_empty() {
@@ -426,6 +618,8 @@ fn write_headers(
     headers_size: u32,
     image_size: u32,
     entry_rva: u32,
+    import_directory: Option<(u32, u32)>,
+    iat_directory: Option<(u32, u32)>,
 ) {
     image[..2].copy_from_slice(b"MZ");
     put_u32(image, 0x3c, 0x80);
@@ -505,6 +699,21 @@ fn write_headers(
     put_u64(image, opt + 88, 0x10_0000);
     put_u64(image, opt + 96, 0x1000);
     put_u32(image, opt + 108, 16);
+    if let Some((rva, size)) = import_directory {
+        put_u32(image, opt + 120, rva);
+        put_u32(image, opt + 124, size);
+    }
+    if let Some((rva, size)) = iat_directory {
+        put_u32(image, opt + 208, rva);
+        put_u32(image, opt + 212, size);
+    }
+    if let Some(section) = sections
+        .iter()
+        .find(|section| &section.name == b".pdata\0\0")
+    {
+        put_u32(image, opt + 136, section.rva);
+        put_u32(image, opt + 140, section.virtual_size);
+    }
     let table = opt + 240;
     for (index, section) in sections.iter().enumerate() {
         let at = table + index * 40;
@@ -623,10 +832,11 @@ mod tests {
             entry: Some("entry".into()),
             ..Default::default()
         };
-        let first = build_image(&[object], "entry", &args, PeWriterConfig::default()).unwrap();
+        let first = build_image(&[object], &[], "entry", &args, PeWriterConfig::default()).unwrap();
 
         let object = crate::coff::CoffObject::parse(&input).unwrap();
-        let second = build_image(&[object], "entry", &args, PeWriterConfig::default()).unwrap();
+        let second =
+            build_image(&[object], &[], "entry", &args, PeWriterConfig::default()).unwrap();
         assert_eq!(first, second);
         assert_eq!(&first[..2], b"MZ");
         assert_eq!(&first[0x80..0x84], b"PE\0\0");
