@@ -52,6 +52,7 @@ impl ResolverNameState {
     const DEFINED: u8 = 1 << 0;
     const UNRESOLVED: u8 = 1 << 1;
     const DEMANDED: u8 = 1 << 2;
+    const UNRESOLVED_LISTED: u8 = 1 << 3;
 
     pub(super) const fn is_defined(self) -> bool {
         self.0 & Self::DEFINED != 0
@@ -70,11 +71,16 @@ impl ResolverNameState {
         self.0 |= Self::DEMANDED;
     }
 
-    fn mark_unresolved(&mut self) {
+    /// Returns true exactly once, when this name first enters the unresolved frontier.
+    fn mark_unresolved(&mut self) -> bool {
         self.mark_demanded();
-        if !self.is_defined() {
-            self.0 |= Self::UNRESOLVED;
+        if self.is_defined() {
+            return false;
         }
+        self.0 |= Self::UNRESOLVED;
+        let newly_listed = self.0 & Self::UNRESOLVED_LISTED == 0;
+        self.0 |= Self::UNRESOLVED_LISTED;
+        newly_listed
     }
 
     fn mark_defined(&mut self) -> bool {
@@ -169,6 +175,9 @@ impl<'data> ResolverSeed<'data> {
 struct IncrementalSymbolState<'data> {
     names: OrderedNameInterner<'data>,
     states: Vec<ResolverNameState>,
+    /// Append-only frontier of names that have ever become unresolved. Definitions leave stale
+    /// entries which snapshots filter without revisiting the much larger canonical state table.
+    unresolved_names: Vec<NameId>,
     weak_resolution: WeakExternalResolution,
     weak_names: Vec<ResolverWeakFallback>,
     alternate_names: Vec<ResolverAlternateFallback>,
@@ -226,6 +235,7 @@ impl<'data> IncrementalSymbolState<'data> {
         Self {
             names: OrderedNameInterner::new(),
             states: Vec::new(),
+            unresolved_names: Vec::new(),
             weak_resolution: WeakExternalResolution::default(),
             weak_names: Vec::new(),
             alternate_names: Vec::new(),
@@ -238,8 +248,7 @@ impl<'data> IncrementalSymbolState<'data> {
     fn add_roots(&mut self, roots: &[Vec<u8>]) {
         for root in roots {
             let id = self.intern_owned(root);
-            let state = &mut self.states[id.index()];
-            state.mark_unresolved();
+            self.mark_unresolved(id);
         }
     }
 
@@ -307,7 +316,7 @@ impl<'data> IncrementalSymbolState<'data> {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
-                self.states[name_id.index()].mark_unresolved();
+                self.mark_unresolved(name_id);
             } else if symbol.is_definition() || symbol.is_common() {
                 let object = u32::try_from(index).context("PE object index exceeds u32")?;
                 let raw_symbol =
@@ -358,6 +367,13 @@ impl<'data> IncrementalSymbolState<'data> {
         self.states[id.index()].mark_defined()
     }
 
+    fn mark_unresolved(&mut self, id: NameId) {
+        if self.states[id.index()].mark_unresolved() {
+            note_vec_push(&self.unresolved_names);
+            self.unresolved_names.push(id);
+        }
+    }
+
     fn define_owned_with_id(&mut self, name: &[u8]) -> (NameId, bool) {
         let id = self.intern_owned(name);
         (id, self.define_id(id))
@@ -382,11 +398,13 @@ impl<'data> IncrementalSymbolState<'data> {
 
     fn unresolved_in_byte_order(&self) -> Vec<NameId> {
         let mut ids = self
-            .states
+            .unresolved_names
             .iter()
-            .enumerate()
-            .filter(|(_, state)| state.is_unresolved() && !state.is_defined())
-            .map(|(index, _)| NameId::from_u32(index as u32))
+            .copied()
+            .filter(|id| {
+                let state = self.states[id.index()];
+                state.is_unresolved() && !state.is_defined()
+            })
             .collect::<Vec<_>>();
         ids.sort_by(|&left, &right| {
             self.names
@@ -583,6 +601,7 @@ impl<'data> ResolverSession<'data> {
         let IncrementalSymbolState {
             names,
             states,
+            unresolved_names: _,
             weak_resolution,
             weak_names,
             alternate_names,
@@ -1061,6 +1080,36 @@ mod tests {
         seed.names
             .lookup_prehashed(name, crate::hash::hash_bytes(name))
             .unwrap_or_else(|| panic!("seed does not contain {}", String::from_utf8_lossy(name)))
+    }
+
+    #[test]
+    fn unresolved_snapshot_frontier_scales_with_demands_not_definitions() {
+        let mut state = IncrementalSymbolState::new();
+        for index in 0..4096 {
+            let name = format!("defined_{index:04}");
+            state.define_owned_with_id(name.as_bytes());
+        }
+
+        state.add_roots(&[b"z_demand".to_vec(), b"a_demand".to_vec()]);
+        state.add_roots(&[b"z_demand".to_vec()]);
+        assert_eq!(state.states.len(), 4098);
+        assert_eq!(state.unresolved_names.len(), 2);
+        let unresolved = state
+            .unresolved_in_byte_order()
+            .into_iter()
+            .map(|id| state.names.bytes(id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved, [b"a_demand".as_slice(), b"z_demand".as_slice()]);
+
+        let z = state.intern_owned(b"z_demand");
+        state.define_id(z);
+        assert_eq!(state.unresolved_names.len(), 2, "definitions remain stale");
+        let unresolved = state
+            .unresolved_in_byte_order()
+            .into_iter()
+            .map(|id| state.names.bytes(id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved, [b"a_demand".as_slice()]);
     }
 
     #[test]
