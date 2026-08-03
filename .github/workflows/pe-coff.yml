@@ -1,0 +1,67 @@
+name: PE/COFF
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['feature/pe-coff-v1']
+
+concurrency:
+  group: pe-coff-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  macos-structure:
+    name: Structure (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - name: Install LLVM tools
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+      - name: Validate differential inspector
+        run: uv run plans/pe-coff/pe-coff_001.py --self-test
+      - name: Inspect PE/COFF corpus
+        run: >-
+          cargo test --profile ci -p wild-linker --test windows_pe_smoke
+          --no-default-features --features pe
+
+  windows-execution:
+    name: Execute (Windows x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Wild PE linker
+        run: cargo build --profile ci -p wild-linker --no-default-features --features pe
+      - name: Select COFF linker flavor
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/pe-linker | Out-Null
+          Copy-Item target/ci/wild.exe target/pe-linker/link.exe
+          $linker = (Resolve-Path target/pe-linker/link.exe).Path
+          "WILD_PE_LINKER=$linker" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Execute reference and Wild PE corpus
+        run: >-
+          cargo test --profile ci -p wild-linker --test windows_pe_smoke
+          --no-default-features --features pe

@@ -74,6 +74,8 @@ wasm = ["libwild/wasm"]
 
 macho = ["libwild/macho"]
 
+pe = ["libwild/pe"]
+
 # external tests
 external_tests = ["mold_tests"]
 mold_tests = []
