@@ -114,7 +114,7 @@ fn extract_pass<'data>(
                 continue;
             }
             match member.kind() {
-                CoffArchiveMemberKind::CoffObject { is_bigobj: false } => {
+                CoffArchiveMemberKind::CoffObject { .. } => {
                     objects.push(crate::coff::CoffObject::parse(member.data()).with_context(
                         || {
                             format!(
@@ -124,12 +124,6 @@ fn extract_pass<'data>(
                         },
                     )?);
                     changed = true;
-                }
-                CoffArchiveMemberKind::CoffObject { is_bigobj: true } => {
-                    return Err(error!(
-                        "bigobj archive member `{}` is not supported yet",
-                        String::from_utf8_lossy(member.name())
-                    ));
                 }
                 CoffArchiveMemberKind::ShortImport(_) => {
                     // The PE import builder consumes selected import symbols from
