@@ -139,6 +139,12 @@ jobs:
             if (-not (Test-Path $executable)) {
               throw "Missing Vibe $profile executable: $executable"
             }
+            foreach ($sidecar in @('sona.exe', 'ffmpeg.exe')) {
+              $sidecarPath = Join-Path $directory $sidecar
+              if (-not (Test-Path $sidecarPath)) {
+                throw "Missing Vibe $profile sidecar: $sidecarPath"
+              }
+            }
 
             $headers = (& dumpbin.exe /headers $executable | Out-String)
             if ($LASTEXITCODE -ne 0 -or $headers -notmatch '8664 machine \(x64\)') {
