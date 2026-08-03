@@ -2220,10 +2220,11 @@ mod tests {
 
     fn single_member_archive(name: &[u8], data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        let mut builder = ar::Builder::new(&mut bytes);
-        let header = ar::Header::new(name.to_vec(), data.len() as u64);
-        builder.append(&header, data).unwrap();
-        drop(builder);
+        {
+            let mut builder = ar::Builder::new(&mut bytes);
+            let header = ar::Header::new(name.to_vec(), data.len() as u64);
+            builder.append(&header, data).unwrap();
+        }
         bytes
     }
 
