@@ -383,6 +383,17 @@ impl RuntimeResolution {
             .map(|value| value.value.as_str())
     }
 
+    /// Returns all configured fallback aliases in deterministic source-name order.
+    ///
+    /// This is primarily useful after address assignment, when a linker needs to
+    /// bind each still-undefined source name to the selected target address.
+    #[must_use]
+    pub fn alternate_names(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.alternate_names
+            .iter()
+            .map(|(symbol, value)| (symbol.as_str(), value.value.as_str()))
+    }
+
     #[must_use]
     pub fn mismatch_value(&self, key: &str) -> Option<&str> {
         self.mismatches.get(key).map(|value| value.value.as_str())
