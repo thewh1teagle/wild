@@ -1,20 +1,22 @@
 //! PE/COFF input primitives.
 //!
-//! This module deliberately starts with the standard COFF reader from `object`. Wild will add its
-//! own allocation-friendly representation once the resolution and layout phases consume COFF.
+//! `CoffObject::parse` validates the container and immediately builds one immutable, source-backed
+//! index. Generic `object` iterators are confined to that indexing boundary. Malformed symbol-name
+//! offsets and relocation symbol indices are recorded, not diagnosed: the consumer that first
+//! needs a live name or target remains the final diagnostic boundary.
 
 #![allow(dead_code)]
 
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
-use foldhash::HashMap;
-use foldhash::HashMapExt;
 use object::Object as _;
 use object::ObjectSection as _;
 use object::ObjectSymbol as _;
-use std::ops::Range;
-use std::sync::OnceLock;
+use object::read::coff::CoffHeader;
+use object::read::coff::Symbol as _;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 /// Marker type for the PE/COFF platform.
 #[derive(Debug, Copy, Clone, Default)]
@@ -25,42 +27,80 @@ pub(crate) struct Pe;
 pub(crate) struct CoffObject<'data> {
     file: object::File<'data>,
     bytes: &'data [u8],
-    relocation_index: OnceLock<CoffRelocationIndex>,
+    index: CoffRelocationIndex,
+    legacy_relocation_index_accessed: AtomicBool,
 }
 
+/// The complete object-local index. The historical name is retained until writer consumers move
+/// to `PeIr`; it no longer means that only relocation-referenced symbols are indexed.
 #[derive(Debug)]
 pub(crate) struct CoffRelocationIndex {
     sections: Box<[CoffSectionRecord]>,
     relocations: Box<[CoffRelocationRecord]>,
-    symbols: Box<[CoffRelocationSymbolCache]>,
+    symbols: Box<[CoffSymbolRecord]>,
+    names: Box<[CoffNameOccurrence]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CoffSourceRange {
+    pub(super) start: u32,
+    pub(super) len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CoffNameId(pub(super) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoffDeferredNameError {
+    InvalidNameOffset,
+    InvalidRelocationSymbol,
+}
+
+/// One occurrence, in primary-symbol then section/relocation input order. Equal byte strings
+/// intentionally remain separate here so global NameId assignment can be finalized deterministically
+/// across objects.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CoffNameOccurrence {
+    pub(super) source: Option<CoffSourceRange>,
+    pub(super) hash: u64,
+    error: Option<CoffDeferredNameError>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CoffSectionRecord {
-    index: object::SectionIndex,
-    size: u64,
-    align: u64,
-    kind: object::SectionKind,
-    characteristics: Option<u32>,
-    data_range: Option<Range<u64>>,
-    relocations: Range<usize>,
+    pub(super) index: object::SectionIndex,
+    pub(super) name: CoffNameId,
+    pub(super) size: u64,
+    pub(super) align: u64,
+    pub(super) kind: object::SectionKind,
+    pub(super) characteristics: Option<u32>,
+    pub(super) data_range: Option<CoffSourceRange>,
+    pub(super) relocation_start: u32,
+    pub(super) relocation_len: u32,
+    pub(super) comdat_selection: u8,
+    pub(super) associative_section: Option<object::SectionIndex>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoffRelocationRecord {
-    offset: u32,
-    typ: u16,
-    symbol: CoffRelocationSymbolId,
+    pub(super) offset: u32,
+    pub(super) typ: u16,
+    pub(super) symbol: CoffRelocationSymbolId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CoffRelocationSymbolId(u32);
+pub(crate) struct CoffRelocationSymbolId(pub(super) u32);
 
 #[derive(Debug)]
-pub(crate) struct CoffRelocationSymbolCache {
-    raw_index: object::SymbolIndex,
-    shape: OnceLock<CoffRelocationSymbolShape>,
-    name: OnceLock<Box<[u8]>>,
+pub(crate) struct CoffSymbolRecord {
+    pub(super) raw_index: u32,
+    pub(super) name: CoffNameId,
+    pub(super) shape: Option<CoffRelocationSymbolShape>,
+    pub(super) value: u32,
+    pub(super) size: u32,
+    pub(super) typ: u16,
+    pub(super) storage_class: u8,
+    pub(super) weak_default: Option<CoffRelocationSymbolId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,19 +129,21 @@ impl<'data> CoffObject<'data> {
             file.kind() == object::ObjectKind::Relocatable,
             "Only relocatable COFF objects are currently supported"
         );
+        let index = CoffRelocationIndex::new(&file, bytes)?;
         Ok(Self {
             file,
             bytes,
-            relocation_index: OnceLock::new(),
+            index,
+            legacy_relocation_index_accessed: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn section_count(&self) -> usize {
-        self.file.sections().count()
+        self.index.sections.len()
     }
 
     pub(crate) fn symbol_count(&self) -> usize {
-        self.file.symbols().count()
+        self.index.symbols.len()
     }
 
     pub(crate) fn file(&self) -> &object::File<'data> {
@@ -113,74 +155,199 @@ impl<'data> CoffObject<'data> {
     }
 
     pub(crate) fn relocation_index(&self) -> &CoffRelocationIndex {
-        self.relocation_index
-            .get_or_init(|| CoffRelocationIndex::new(&self.file))
+        self.legacy_relocation_index_accessed
+            .store(true, Ordering::Relaxed);
+        &self.index
+    }
+
+    pub(super) fn index(&self) -> &CoffRelocationIndex {
+        &self.index
     }
 
     #[cfg(test)]
     pub(crate) fn relocation_index_initialized(&self) -> bool {
-        self.relocation_index.get().is_some()
+        self.legacy_relocation_index_accessed
+            .load(Ordering::Relaxed)
     }
 }
 
 impl CoffRelocationIndex {
-    fn new(file: &object::File<'_>) -> Self {
-        let mut sections = Vec::with_capacity(file.sections().count());
+    fn new(file: &object::File<'_>, bytes: &[u8]) -> Result<Self> {
+        count_object_parse();
+        match file {
+            object::File::Coff(file) => Self::new_typed(file, bytes),
+            object::File::CoffBig(file) => Self::new_typed(file, bytes),
+            _ => Err(crate::error!(
+                "Internal non-COFF file reached COFF indexing"
+            )),
+        }
+    }
+
+    fn new_typed<'data, Coff>(
+        file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
+        bytes: &[u8],
+    ) -> Result<Self>
+    where
+        Coff: CoffHeader,
+    {
+        let section_count = file.coff_header().number_of_sections() as usize;
+        let mut sections = Vec::with_capacity(section_count);
         let mut relocations = Vec::new();
         let mut symbols = Vec::new();
-        let mut symbol_ids = HashMap::<object::SymbolIndex, CoffRelocationSymbolId>::new();
-        for section in file.sections() {
-            let relocation_start = relocations.len();
+        let mut names = Vec::new();
+        let mut raw_to_dense = vec![None; file.coff_symbol_table().len()];
+        let mut weak_defaults = Vec::new();
+        let mut section_comdats = vec![(0, None); section_count];
+
+        for (raw_index, raw_symbol) in file.coff_symbol_table().iter() {
+            let name_bytes = if raw_symbol.has_aux_file_name() {
+                file.coff_symbol_table()
+                    .aux_file_name(raw_index, raw_symbol.number_of_aux_symbols())
+            } else {
+                raw_symbol.name(file.coff_symbol_table().strings())
+            };
+            let name = push_name_occurrence(&mut names, bytes, name_bytes)?;
+            let symbol_id = CoffRelocationSymbolId(dense_u32(symbols.len(), "COFF symbol")?);
+            raw_to_dense[raw_index.0] = Some(symbol_id);
+            let storage_class = raw_symbol.storage_class();
+            let section_number = raw_symbol.section_number();
+            let is_global = matches!(
+                storage_class,
+                object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            );
+            symbols.push(CoffSymbolRecord {
+                raw_index: dense_u32(raw_index.0, "raw COFF symbol index")?,
+                name,
+                shape: Some(CoffRelocationSymbolShape {
+                    section: raw_symbol.section(),
+                    address: u64::from(raw_symbol.value()),
+                    is_global,
+                    is_common: storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
+                        && section_number == object::pe::IMAGE_SYM_UNDEFINED
+                        && raw_symbol.value() != 0,
+                    is_weak: storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                }),
+                value: raw_symbol.value(),
+                size: file
+                    .symbol_by_index(raw_index)
+                    .ok()
+                    .and_then(|symbol| u32::try_from(symbol.size()).ok())
+                    .unwrap_or(0),
+                typ: raw_symbol.typ().0,
+                storage_class: storage_class.0,
+                weak_default: None,
+            });
+            if raw_symbol.has_aux_weak_external()
+                && let Ok(aux) = file.coff_symbol_table().aux_weak_external(raw_index)
+            {
+                weak_defaults.push((symbol_id, aux.default_symbol()));
+            }
+            if let Ok(symbol) = file.symbol_by_index(raw_index)
+                && let object::SymbolFlags::CoffSection {
+                    selection,
+                    associative_section,
+                    ..
+                } = symbol.flags()
+                && let Some(section) = symbol.section_index()
+                && let Some(slot) = section
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| section_comdats.get_mut(index))
+            {
+                *slot = (selection.0, associative_section);
+            }
+        }
+
+        // Auxiliary weak records refer to raw table indices; translate them after the single
+        // primary-symbol pass has assigned every dense ID.
+        for (symbol, raw_default) in weak_defaults {
+            symbols[symbol.0 as usize].weak_default =
+                raw_to_dense.get(raw_default.0).copied().flatten();
+        }
+
+        for (section_ordinal, section) in file.sections().enumerate() {
+            let name = push_name_occurrence(&mut names, bytes, section.name_bytes())?;
+            let relocation_start = dense_u32(relocations.len(), "COFF relocation")?;
             for (offset, relocation) in section.relocations() {
                 // Both standard and bigobj COFF readers always expose a raw COFF relocation as a
                 // symbol target with COFF flags. CoffObject::parse has already excluded every
                 // other format, so retaining these compact raw fields performs no policy or kind
                 // validation.
                 let object::RelocationTarget::Symbol(raw_index) = relocation.target() else {
-                    unreachable!("the object COFF reader always emits symbol relocation targets")
+                    return Err(crate::error!("COFF relocation has a non-symbol target"));
                 };
                 let object::RelocationFlags::Coff { typ } = relocation.flags() else {
-                    unreachable!("the object COFF reader always emits COFF relocation flags")
+                    return Err(crate::error!("COFF relocation has non-COFF flags"));
                 };
-                let next = CoffRelocationSymbolId(
-                    u32::try_from(symbols.len()).expect("COFF symbol count fits in u32"),
-                );
-                let symbol = *symbol_ids.entry(raw_index).or_insert_with(|| {
-                    symbols.push(CoffRelocationSymbolCache {
-                        raw_index,
-                        shape: OnceLock::new(),
-                        name: OnceLock::new(),
+                count_relocation_decode();
+                let symbol = if let Some(symbol) = raw_to_dense.get(raw_index.0).copied().flatten()
+                {
+                    symbol
+                } else {
+                    let id = CoffRelocationSymbolId(dense_u32(
+                        symbols.len(),
+                        "invalid COFF relocation symbol",
+                    )?);
+                    let name = push_invalid_name(
+                        &mut names,
+                        CoffDeferredNameError::InvalidRelocationSymbol,
+                    )?;
+                    symbols.push(CoffSymbolRecord {
+                        raw_index: dense_u32(raw_index.0, "invalid raw COFF symbol index")?,
+                        name,
+                        shape: None,
+                        value: 0,
+                        size: 0,
+                        typ: 0,
+                        storage_class: 0,
+                        weak_default: None,
                     });
-                    next
-                });
+                    id
+                };
                 relocations.push(CoffRelocationRecord {
-                    offset: u32::try_from(offset).expect("COFF relocation offset fits in u32"),
+                    offset: u32::try_from(offset)
+                        .map_err(|_| crate::error!("COFF relocation offset exceeds u32"))?,
                     typ: typ.0,
                     symbol,
                 });
             }
             let data_range = section
                 .file_range()
-                .map(|(offset, size)| offset..offset + size);
+                .map(|(offset, size)| {
+                    Ok::<_, crate::error::Error>(CoffSourceRange {
+                        start: u32::try_from(offset).map_err(|_| {
+                            crate::error!("COFF section payload offset exceeds u32")
+                        })?,
+                        len: u32::try_from(size)
+                            .map_err(|_| crate::error!("COFF section payload size exceeds u32"))?,
+                    })
+                })
+                .transpose()?;
             let characteristics = match section.flags() {
                 object::SectionFlags::Coff { characteristics } => Some(characteristics.0),
                 _ => None,
             };
+            let (comdat_selection, associative_section) = section_comdats[section_ordinal];
             sections.push(CoffSectionRecord {
                 index: section.index(),
+                name,
                 size: section.size(),
                 align: section.align(),
                 kind: section.kind(),
                 characteristics,
                 data_range,
-                relocations: relocation_start..relocations.len(),
+                relocation_start,
+                relocation_len: dense_u32(relocations.len(), "COFF relocation")? - relocation_start,
+                comdat_selection,
+                associative_section,
             });
         }
-        Self {
+        Ok(Self {
             sections: sections.into_boxed_slice(),
             relocations: relocations.into_boxed_slice(),
             symbols: symbols.into_boxed_slice(),
-        }
+            names: names.into_boxed_slice(),
+        })
     }
 
     pub(crate) fn sections(&self) -> &[CoffSectionRecord] {
@@ -188,11 +355,21 @@ impl CoffRelocationIndex {
     }
 
     pub(crate) fn relocations(&self, section: &CoffSectionRecord) -> &[CoffRelocationRecord] {
-        &self.relocations[section.relocations.clone()]
+        let start = section.relocation_start as usize;
+        let end = start + section.relocation_len as usize;
+        &self.relocations[start..end]
     }
 
-    pub(crate) fn symbol(&self, id: CoffRelocationSymbolId) -> &CoffRelocationSymbolCache {
+    pub(crate) fn symbol(&self, id: CoffRelocationSymbolId) -> &CoffSymbolRecord {
         &self.symbols[id.0 as usize]
+    }
+
+    pub(super) fn names(&self) -> &[CoffNameOccurrence] {
+        &self.names
+    }
+
+    pub(super) fn symbols(&self) -> &[CoffSymbolRecord] {
+        &self.symbols
     }
 }
 
@@ -208,35 +385,128 @@ impl CoffRelocationRecord {
     }
 }
 
-impl CoffRelocationSymbolCache {
+impl CoffSymbolRecord {
     pub(crate) fn shape<'object>(
         &'object self,
-        object: &CoffObject<'_>,
+        _object: &CoffObject<'_>,
     ) -> Result<&'object CoffRelocationSymbolShape> {
-        if self.shape.get().is_none() {
-            let symbol = object.file.symbol_by_index(self.raw_index)?;
-            let shape = CoffRelocationSymbolShape {
-                section: symbol.section_index(),
-                address: symbol.address(),
-                is_global: symbol.is_global(),
-                is_common: symbol.is_common(),
-                is_weak: symbol.is_weak(),
-            };
-            let _ = self.shape.set(shape);
-        }
-        Ok(self.shape.get().unwrap())
+        self.shape
+            .as_ref()
+            .ok_or_else(|| crate::error!("Invalid COFF symbol index {}", self.raw_index))
     }
 
-    pub(crate) fn name<'object>(&'object self, object: &CoffObject<'_>) -> Result<&'object [u8]> {
-        if self.name.get().is_none() {
-            let name = object
-                .file
-                .symbol_by_index(self.raw_index)?
-                .name_bytes()?
-                .into();
-            let _ = self.name.set(name);
+    pub(crate) fn name<'data>(&self, object: &'data CoffObject<'data>) -> Result<&'data [u8]> {
+        object.index.name_bytes(object.bytes, self.name)
+    }
+}
+
+impl CoffNameOccurrence {
+    pub(super) fn source(self) -> Option<CoffSourceRange> {
+        self.source
+    }
+
+    pub(super) fn hash(self) -> u64 {
+        self.hash
+    }
+}
+
+fn push_name_occurrence(
+    names: &mut Vec<CoffNameOccurrence>,
+    bytes: &[u8],
+    name: object::read::Result<&[u8]>,
+) -> Result<CoffNameId> {
+    match name
+        .ok()
+        .and_then(|name| source_range(bytes, name).map(|source| (source, name)))
+    {
+        Some((source, name)) => {
+            count_name_hash();
+            let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
+            names.push(CoffNameOccurrence {
+                source: Some(source),
+                hash: hash_name(name),
+                error: None,
+            });
+            Ok(id)
         }
-        Ok(self.name.get().unwrap())
+        None => push_invalid_name(names, CoffDeferredNameError::InvalidNameOffset),
+    }
+}
+
+fn push_invalid_name(
+    names: &mut Vec<CoffNameOccurrence>,
+    error: CoffDeferredNameError,
+) -> Result<CoffNameId> {
+    let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
+    names.push(CoffNameOccurrence {
+        source: None,
+        hash: 0,
+        error: Some(error),
+    });
+    Ok(id)
+}
+
+fn source_range(bytes: &[u8], source: &[u8]) -> Option<CoffSourceRange> {
+    let start = (source.as_ptr() as usize).checked_sub(bytes.as_ptr() as usize)?;
+    let end = start.checked_add(source.len())?;
+    (end <= bytes.len()).then_some(CoffSourceRange {
+        start: u32::try_from(start).ok()?,
+        len: u32::try_from(source.len()).ok()?,
+    })
+}
+
+fn hash_name(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01b3;
+    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+// Unit tests execute independent links concurrently, while removal counters are intentionally
+// process-global. Instrument real `wip` binaries at the exact boundaries without making unrelated
+// unit tests race the counter API's reset tests.
+#[inline]
+fn count_object_parse() {
+    #[cfg(all(feature = "wip", not(test)))]
+    crate::perf::removal_counters::increment_object_full_parse_passes();
+}
+
+#[inline]
+fn count_relocation_decode() {
+    #[cfg(all(feature = "wip", not(test)))]
+    crate::perf::removal_counters::increment_relocation_decodes();
+}
+
+#[inline]
+fn count_name_hash() {
+    #[cfg(all(feature = "wip", not(test)))]
+    crate::perf::removal_counters::increment_name_hash_ops();
+}
+
+fn dense_u32(value: usize, what: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| crate::error!("{what} count exceeds u32"))
+}
+
+impl CoffRelocationIndex {
+    fn name_bytes<'data>(&self, bytes: &'data [u8], name: CoffNameId) -> Result<&'data [u8]> {
+        let occurrence = self
+            .names
+            .get(name.0 as usize)
+            .ok_or_else(|| crate::error!("Invalid dense COFF name ID {}", name.0))?;
+        if let Some(source) = occurrence.source {
+            let start = source.start as usize;
+            let end = start + source.len as usize;
+            return bytes
+                .get(start..end)
+                .ok_or_else(|| crate::error!("Invalid source-backed COFF name range"));
+        }
+        match occurrence.error {
+            Some(CoffDeferredNameError::InvalidRelocationSymbol) => {
+                Err(crate::error!("Invalid COFF relocation symbol"))
+            }
+            _ => Err(crate::error!("Invalid COFF name offset")),
+        }
     }
 }
 
@@ -356,6 +626,106 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn rich_comdat_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let leader_name = b".text$very_long_comdat_leader";
+        let leader =
+            object.add_section(Vec::new(), leader_name.to_vec(), object::SectionKind::Text);
+        object.append_section_data(leader, &[0; 8], 4);
+        object.section_symbol(leader);
+        let child = object.add_section(
+            Vec::new(),
+            b".rdata$very_long_associative_child".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(child, b"child", 1);
+        object.section_symbol(child);
+        let leader_symbol = object.add_symbol(Symbol {
+            name: b"very_long_comdat_definition_name".to_vec(),
+            value: 0,
+            size: 8,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(leader),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_symbol(Symbol {
+            name: b"weak_occurrence".to_vec(),
+            value: 4,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: true,
+            section: SymbolSection::Section(leader),
+            flags: object::SymbolFlags::None,
+        });
+        let target = object.add_symbol(Symbol {
+            name: b"very_long_undefined_relocation_target".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: leader_symbol,
+            sections: vec![leader, child],
+        });
+        for offset in [0, 4] {
+            object
+                .add_relocation(
+                    leader,
+                    Relocation {
+                        offset,
+                        symbol: target,
+                        addend: 0,
+                        flags: object::RelocationFlags::Coff {
+                            typ: object::pe::IMAGE_REL_AMD64_REL32,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        object.write().unwrap()
+    }
+
+    fn weak_external_object() -> Vec<u8> {
+        let mut bytes = vec![0; 20 + 40];
+        bytes[0..2].copy_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.0.to_le_bytes());
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&60u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        bytes[20..25].copy_from_slice(b".text");
+        bytes[56..60].copy_from_slice(
+            &(object::pe::IMAGE_SCN_CNT_CODE.0 | object::pe::IMAGE_SCN_MEM_READ.0).to_le_bytes(),
+        );
+        let mut fallback = [0; 18];
+        fallback[..8].copy_from_slice(b"fallback");
+        fallback[12..14].copy_from_slice(&1i16.to_le_bytes());
+        fallback[16] = object::pe::IMAGE_SYM_CLASS_EXTERNAL.0;
+        bytes.extend_from_slice(&fallback);
+        let mut weak = [0; 18];
+        weak[..7].copy_from_slice(b"primary");
+        weak[16] = object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0;
+        weak[17] = 1;
+        bytes.extend_from_slice(&weak);
+        let mut auxiliary = [0; 18];
+        auxiliary[..4].copy_from_slice(&0u32.to_le_bytes());
+        auxiliary[4..8]
+            .copy_from_slice(&object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS.0.to_le_bytes());
+        bytes.extend_from_slice(&auxiliary);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
     fn assert_send_sync<T: Send + Sync>() {}
 
     fn first_standard_relocation_offset(bytes: &[u8]) -> usize {
@@ -363,11 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn relocation_index_is_stable_ordered_and_interns_symbols() {
+    fn eager_index_is_stable_ordered_and_interns_relocation_targets() {
         assert_send_sync::<CoffRelocationIndex>();
         assert_eq!(std::mem::size_of::<CoffRelocationRecord>(), 12);
         assert!(std::mem::size_of::<CoffSectionRecord>() <= 80);
-        assert!(std::mem::size_of::<CoffRelocationSymbolCache>() <= 96);
+        assert!(std::mem::size_of::<CoffSymbolRecord>() <= 64);
         let bytes = standard_object_with_repeated_relocations();
         let object = CoffObject::parse(&bytes).unwrap();
         let index = object.relocation_index();
@@ -381,7 +751,12 @@ mod tests {
         assert_eq!(section.kind, object::SectionKind::Text);
         assert_eq!(
             section.data_range,
-            raw_section.file_range().map(|(o, s)| o..o + s)
+            raw_section
+                .file_range()
+                .map(|(start, len)| CoffSourceRange {
+                    start: start as u32,
+                    len: len as u32,
+                })
         );
         let relocations = index.relocations(section);
         assert_eq!(relocations.len(), 2);
@@ -396,11 +771,103 @@ mod tests {
         let (first, second) = (relocations[0].symbol, relocations[1].symbol);
         assert_eq!(first, second);
         let symbol = index.symbol(first);
-        assert!(symbol.shape.get().is_none());
-        assert!(symbol.name.get().is_none());
+        assert!(symbol.shape.is_some());
+        assert!(index.names[symbol.name.0 as usize].source.is_some());
         assert!(symbol.shape(&object).unwrap().is_global);
-        assert!(symbol.name.get().is_none());
         assert_eq!(symbol.name(&object).unwrap(), b"target");
+    }
+
+    #[test]
+    fn eager_records_differentially_match_object_for_long_comdat_fixture() {
+        let bytes = rich_comdat_object();
+        let object = CoffObject::parse(&bytes).unwrap();
+        let raw_sections = object.file().sections().collect::<Vec<_>>();
+        let raw_symbols = object.file().symbols().collect::<Vec<_>>();
+        let index = object.index();
+        assert_eq!(index.sections.len(), raw_sections.len());
+        assert_eq!(index.symbols.len(), raw_symbols.len());
+
+        for (record, raw) in index.sections.iter().zip(&raw_sections) {
+            assert_eq!(
+                index.name_bytes(&bytes, record.name).unwrap(),
+                raw.name_bytes().unwrap()
+            );
+            assert_eq!(record.size, raw.size());
+            assert_eq!(record.align, raw.align());
+            assert_eq!(record.kind, raw.kind());
+            assert_eq!(
+                record.characteristics,
+                match raw.flags() {
+                    object::SectionFlags::Coff { characteristics } => Some(characteristics.0),
+                    _ => None,
+                }
+            );
+            let raw_relocations = raw.relocations().collect::<Vec<_>>();
+            let dense_relocations = index.relocations(record);
+            assert_eq!(dense_relocations.len(), raw_relocations.len());
+            for (dense, (offset, raw)) in dense_relocations.iter().zip(raw_relocations) {
+                assert_eq!(u64::from(dense.offset), offset);
+                assert_eq!(
+                    dense.typ,
+                    match raw.flags() {
+                        object::RelocationFlags::Coff { typ } => typ.0,
+                        _ => unreachable!(),
+                    }
+                );
+            }
+        }
+        for (record, raw) in index.symbols.iter().zip(raw_symbols) {
+            assert_eq!(record.raw_index as usize, raw.index().0);
+            assert_eq!(record.name(&object).unwrap(), raw.name_bytes().unwrap());
+            assert_eq!(u64::from(record.value), raw.address());
+            assert_eq!(u64::from(record.size), raw.size());
+            let shape = record.shape(&object).unwrap();
+            assert_eq!(shape.section, raw.section_index());
+            assert_eq!(shape.is_global, raw.is_global());
+            assert_eq!(shape.is_common, raw.is_common());
+            assert_eq!(shape.is_weak, raw.is_weak());
+        }
+        assert_eq!(
+            index.sections[0].comdat_selection,
+            object::pe::IMAGE_COMDAT_SELECT_ANY.0
+        );
+        assert_eq!(
+            index.sections[1].comdat_selection,
+            object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0
+        );
+        assert_eq!(
+            index.sections[1].associative_section,
+            Some(object::SectionIndex(1))
+        );
+        let relocations = index.relocations(&index.sections[0]);
+        assert_eq!(relocations[0].symbol, relocations[1].symbol);
+    }
+
+    #[test]
+    fn weak_external_auxiliary_maps_to_dense_fallback() {
+        let bytes = weak_external_object();
+        let object = CoffObject::parse(&bytes).unwrap();
+        let index = object.index();
+        assert_eq!(index.symbols.len(), 2);
+        assert_eq!(index.symbols[1].name(&object).unwrap(), b"primary");
+        assert!(index.symbols[1].shape(&object).unwrap().is_weak);
+        assert_eq!(
+            index.symbols[1].weak_default,
+            Some(CoffRelocationSymbolId(0))
+        );
+        assert_eq!(index.symbols[0].name(&object).unwrap(), b"fallback");
+    }
+
+    #[test]
+    fn malformed_name_is_recorded_until_a_consumer_requests_it() {
+        let mut bytes = standard_object_with_repeated_relocations();
+        let symbol_table = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        bytes[symbol_table..symbol_table + 4].fill(0);
+        bytes[symbol_table + 4..symbol_table + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let object = CoffObject::parse(&bytes).unwrap();
+        let symbol = &object.index().symbols[0];
+        assert!(symbol.shape(&object).is_ok());
+        assert!(symbol.name(&object).is_err());
     }
 
     #[test]
@@ -428,7 +895,7 @@ mod tests {
         let index = object.relocation_index();
         let relocation = &index.relocations(&index.sections[0])[0];
         let symbol = relocation.symbol;
-        assert!(index.symbol(symbol).shape.get().is_none());
+        assert!(index.symbol(symbol).shape.is_none());
         assert!(index.symbol(symbol).shape(&object).is_err());
     }
 
