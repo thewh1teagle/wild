@@ -321,13 +321,15 @@ fn validate_unwind_info_inner(
     let prolog_size = header[1];
     let code_count = usize::from(header[2]);
     let frame_register = header[3] & 0x0f;
-    let frame_offset = header[3] >> 4;
-    if frame_register == 0 && frame_offset != 0
-        || frame_register != 0 && !matches!(frame_register, 3 | 5 | 6 | 7 | 12..=15)
-    {
+    // The scaled offset has meaning only when a frame register is selected.
+    // The Windows x64 format does not require that otherwise-unused nibble to
+    // be zero, and both lld-link and LLVM's unwind reader preserve/accept it.
+    if frame_register != 0 && !matches!(frame_register, 3 | 5 | 6 | 7 | 12..=15) {
         return Err(PeUnwindError::new(
             PeUnwindErrorKind::InvalidFrameRegister,
-            format!("frame offset is nonzero without a frame register at RVA {rva:#x}"),
+            format!(
+                "volatile register {frame_register} cannot be a frame register at RVA {rva:#x}"
+            ),
         ));
     }
 
@@ -626,6 +628,37 @@ mod tests {
                 IMAGE_SIZE,
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn ignores_frame_offset_when_there_is_no_frame_register() {
+        for frame_offset in 1..=15 {
+            let xdata = [1, 0, 0, frame_offset << 4];
+            build_amd64_exception_table(
+                &function(0x1000, 0x1010, XDATA_RVA),
+                PDATA_RVA,
+                &xdata,
+                XDATA_RVA,
+                IMAGE_SIZE,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_volatile_frame_registers() {
+        for frame_register in [1, 2, 4, 8, 9, 10, 11] {
+            let xdata = [1, 0, 0, frame_register];
+            let error = build_amd64_exception_table(
+                &function(0x1000, 0x1010, XDATA_RVA),
+                PDATA_RVA,
+                &xdata,
+                XDATA_RVA,
+                IMAGE_SIZE,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), PeUnwindErrorKind::InvalidFrameRegister);
         }
     }
 
