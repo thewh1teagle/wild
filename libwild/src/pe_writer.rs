@@ -81,11 +81,16 @@ const PE_DETAIL_REBUILD_SELECTION_ROOTS: &str = "PE detail: Rebuild selection ro
 const PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES: &str = "PE detail: Evaluate default libraries";
 const PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS: &str = "PE detail: Snapshot resolver outputs";
 const PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS: &str = "PE detail: Materialize selected imports";
+#[cfg(test)]
 const PE_DETAIL_REF_CLASSIFY: &str = "PE detail: Classify unreachable COMDATs";
+#[cfg(test)]
 const PE_DETAIL_REF_DEFINITIONS: &str = "PE detail: Build REF definition graph";
+#[cfg(test)]
 const PE_DETAIL_REF_REACHABILITY: &str = "PE detail: Traverse REF relocations";
 const MAX_RELOCATION_RELAYOUTS: usize = 4;
+#[cfg(test)]
 const PE_DETAIL_REF_ROOTS: &str = "PE detail: Mark REF roots";
+#[cfg(test)]
 const PE_DETAIL_REF_TOPOLOGY: &str = "PE detail: Build REF group topology";
 const PE_DETAIL_ROOTS: &str = "PE detail: Prepare GC roots";
 const PE_DETAIL_SOURCE_LOCATIONS: &str = "PE detail: Build source-location map";
@@ -96,7 +101,9 @@ const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
 // Live contributions are generally small compiler-generated sections. Keep at least this many in
 // each import-reference task so Rayon scheduling and per-task set allocation don't dominate, while
 // still creating several tasks per worker to absorb relocation-count skew between sections.
+#[cfg(test)]
 const LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK: usize = 64;
+#[cfg(test)]
 const LIVE_IMPORT_CHUNKS_PER_THREAD: usize = 4;
 const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
 
@@ -1231,6 +1238,7 @@ struct DenseProductionState<'data> {
     symbols: pe_symbol_db::SymbolDb,
     resolver_states: Box<[pe_resolver::ResolverNameState]>,
     alternate_targets: Box<[u32]>,
+    has_import_providers: bool,
 }
 
 impl<'data> DenseProductionState<'data> {
@@ -1274,6 +1282,7 @@ impl<'data> DenseProductionState<'data> {
         }
 
         let mut builder = pe_symbol_db::SymbolDbBuilder::new(names);
+        let mut has_import_providers = false;
         for provider in providers {
             let (name, record) = match provider {
                 pe_resolver::ResolverProviderOccurrence::Object {
@@ -1298,13 +1307,16 @@ impl<'data> DenseProductionState<'data> {
                     selected_import,
                     archive,
                     member: _,
-                } => (
-                    name,
-                    pe_symbol_db::ProviderRecord::import(
-                        pe_ir::ImportLibraryId::from_u32(archive.get()),
-                        pe_ir::ImportId::from_u32(selected_import),
-                    ),
-                ),
+                } => {
+                    has_import_providers = true;
+                    (
+                        name,
+                        pe_symbol_db::ProviderRecord::import(
+                            pe_ir::ImportLibraryId::from_u32(archive.get()),
+                            pe_ir::ImportId::from_u32(selected_import),
+                        ),
+                    )
+                }
                 pe_resolver::ResolverProviderOccurrence::Absolute {
                     name,
                     value,
@@ -1339,6 +1351,7 @@ impl<'data> DenseProductionState<'data> {
             symbols: finalized.symbols,
             resolver_states: resolver_states.into_boxed_slice(),
             alternate_targets: alternate_targets.into_boxed_slice(),
+            has_import_providers,
         })
     }
 
@@ -1576,11 +1589,24 @@ fn build_image(
     resources: &[ResourceRecord],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
-    let snapshot = selected_symbol_snapshot(objects)?;
-    let (symbol_metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
+    // Exercise the production dense GC path in unit-level image tests as well. Re-parsing retains
+    // the caller's borrowed bytes while giving the resolver the owned vector it needs for archive
+    // extraction (there are no archives in this helper).
+    let mut dense_objects = objects
+        .iter()
+        .map(|object| crate::coff::CoffObject::parse(object.bytes()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut resolver = pe_resolver::ResolverSession::new();
+    let mut resolver_runtime = runtime_resolution.clone();
+    resolver.resolve(&mut dense_objects, &[], &mut resolver_runtime)?;
+    let resolved = resolver.finish();
+    materialize_selected_object_indices(&dense_objects)?;
+    let dense = DenseProductionState::finalize(&dense_objects, resolved.seed, &resolved.symbols)?;
+    let (symbol_metadata, _) =
+        SelectedObjectMetadata::new_with_undefined(&resolved.symbols, &[], Some(&dense));
     let mut image = build_image_with_delay_loads(
         objects,
-        None,
+        Some(&dense),
         &symbol_metadata,
         imports,
         exports,
@@ -1614,6 +1640,11 @@ fn build_image_with_delay_loads(
 ) -> Result<BuiltImage> {
     let (mut imports, mut delay_imports) =
         pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
+    // Retained only for the cfg(test) legacy differential path; production import liveness comes
+    // directly from DenseEventGc without rebuilding a byte-owned definition set.
+    #[cfg(not(test))]
+    #[allow(clippy::no_effect_underscore_binding)]
+    let _legacy_definition_names = pe_imports::definition_names;
     let comdat_phase = crate::timing_guard!(PE_PHASE_SELECT_COMDATS);
     let roots_phase = crate::timing_guard!(PE_DETAIL_ROOTS);
     // Archive selection and section GC deliberately remain separate: resolution must see every
@@ -1650,7 +1681,7 @@ fn build_image_with_delay_loads(
     gc_roots.sort();
     gc_roots.dedup();
     drop(roots_phase);
-    let (mut contributions, comdat_redirects) = collect_contributions_with_roots_metadata(
+    let (mut contributions, comdat_redirects, dense_gc) = collect_contributions_with_roots_metadata(
         objects,
         symbol_metadata,
         args,
@@ -1659,16 +1690,40 @@ fn build_image_with_delay_loads(
     )?;
     if opt_ref_enabled(args) {
         let import_selection_phase = crate::timing_guard!(PE_DETAIL_IMPORT_SELECTION);
-        let mut import_definitions = pe_imports::definition_names(&imports);
-        import_definitions.extend(pe_imports::definition_names(&delay_imports));
-        let live_imports = live_import_references(
-            objects,
-            symbol_metadata,
-            &contributions,
-            &gc_roots,
-            &import_definitions,
-            runtime_resolution,
-        )?;
+        let live_imports = if let (Some(dense), Some(gc)) = (dense, dense_gc.as_ref())
+            && (dense.has_import_providers || imports.is_empty() && delay_imports.is_empty())
+        {
+            gc.referenced_import_names
+                .iter()
+                .map(|&name| {
+                    dense
+                        .names
+                        .bytes(name)
+                        .context("live import NameId has no canonical bytes")
+                        .map(<[u8]>::to_vec)
+                })
+                .collect::<Result<HashSet<_>>>()?
+        } else {
+            #[cfg(test)]
+            {
+                let mut import_definitions = pe_imports::definition_names(&imports);
+                import_definitions.extend(pe_imports::definition_names(&delay_imports));
+                live_import_references(
+                    objects,
+                    symbol_metadata,
+                    &contributions,
+                    &gc_roots,
+                    &import_definitions,
+                    runtime_resolution,
+                )?
+            }
+            #[cfg(not(test))]
+            {
+                return Err(error!(
+                    "production /OPT:REF import retention requires dense provider state"
+                ));
+            }
+        };
         pe_imports::retain_referenced(&mut imports, &live_imports);
         pe_imports::retain_referenced(&mut delay_imports, &live_imports);
         drop(import_selection_phase);
@@ -2060,6 +2115,7 @@ fn build_image_with_delay_loads(
         &layout,
         &locations,
         &comdat_redirects,
+        dense_gc.as_ref(),
         &definitions,
         &absolute_symbols,
         config.image_base,
@@ -2418,13 +2474,14 @@ fn collect_contributions(
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     let snapshot = selected_symbol_snapshot(objects)?;
     let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
-    collect_contributions_with_roots_metadata(
+    let (contributions, redirects, _) = collect_contributions_with_roots_metadata(
         objects,
         &metadata,
         args,
         &[],
         &args.runtime_resolution,
-    )
+    )?;
+    Ok((contributions, redirects))
 }
 
 #[cfg(test)]
@@ -2436,7 +2493,9 @@ fn collect_contributions_with_roots(
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     let snapshot = selected_symbol_snapshot(objects)?;
     let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
-    collect_contributions_with_roots_metadata(objects, &metadata, args, roots, runtime_resolution)
+    let (contributions, redirects, _) =
+        collect_contributions_with_roots_metadata(objects, &metadata, args, roots, runtime_resolution)?;
+    Ok((contributions, redirects))
 }
 
 fn collect_contributions_with_roots_metadata(
@@ -2444,24 +2503,48 @@ fn collect_contributions_with_roots_metadata(
     metadata: &SelectedObjectMetadata,
     args: &crate::args::coff::CoffArgs,
     roots: &[Vec<u8>],
-    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
-) -> Result<(Vec<Contribution>, SectionRedirects)> {
+    _runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<(
+    Vec<Contribution>,
+    SectionRedirects,
+    Option<pe_gc::GcOutput>,
+)> {
     if args.guard.control_flow == crate::args::coff::OptSetting::Enabled {
         return Err(error!(
             "explicit /GUARD:CF is not yet supported; refusing to emit incomplete CFG/load-config metadata"
         ));
     }
     let mut output = Vec::new();
+    #[allow(unused_mut)]
     let mut comdats = discarded_comdat_sections_with_metadata(objects, metadata)?;
-    if opt_ref_enabled(args) {
-        comdats.discarded.extend(unreferenced_comdat_sections(
-            objects,
-            metadata,
-            &comdats,
-            roots,
-            runtime_resolution,
-        )?);
-    }
+    let dense_gc = if opt_ref_enabled(args) {
+        if let Some(dense) = metadata.dense {
+            Some(collect_dense_gc(dense, &comdats, roots)?)
+        } else {
+            #[cfg(test)]
+            comdats.discarded.extend(unreferenced_comdat_sections(
+                objects,
+                metadata,
+                &comdats,
+                roots,
+                _runtime_resolution,
+            )?);
+            #[cfg(test)]
+            {
+                None
+            }
+            #[cfg(not(test))]
+            {
+                return Err(error!("production /OPT:REF requires dense PE state"));
+            }
+        }
+    } else {
+        None
+    };
+    let dense_gc_view = metadata
+        .dense
+        .zip(dense_gc.as_ref())
+        .map(|(dense, gc)| (&dense.ir, gc));
     let contributions_phase = crate::timing_guard!(PE_DETAIL_CONTRIBUTIONS);
     if rayon::current_num_threads() == 1 {
         // Avoid Rayon and retaining every per-object descriptor vector at once for the required
@@ -2472,6 +2555,7 @@ fn collect_contributions_with_roots_metadata(
                 input,
                 &comdats,
                 args,
+                dense_gc_view,
                 &mut output,
             )?;
         }
@@ -2484,7 +2568,13 @@ fn collect_contributions_with_roots_metadata(
             .par_iter()
             .enumerate()
             .map(|(object_index, input)| {
-                materialize_object_contributions(object_index, input, &comdats, args)
+                materialize_object_contributions(
+                    object_index,
+                    input,
+                    &comdats,
+                    args,
+                    dense_gc_view,
+                )
             })
             .collect::<Vec<_>>();
         let object_contributions = object_results
@@ -2529,7 +2619,7 @@ fn collect_contributions_with_roots_metadata(
         contribution.spec.id = ContributionId(index as u32);
     }
     drop(contributions_phase);
-    Ok((output, comdats.redirects))
+    Ok((output, comdats.redirects, dense_gc))
 }
 
 fn materialize_object_contributions(
@@ -2537,9 +2627,17 @@ fn materialize_object_contributions(
     input: &crate::coff::CoffObject<'_>,
     comdats: &ComdatResolution,
     args: &crate::args::coff::CoffArgs,
+    dense_gc: Option<(&pe_ir::PeIr<'_>, &pe_gc::GcOutput)>,
 ) -> Result<Vec<Contribution>> {
     let mut output = Vec::new();
-    materialize_object_contributions_into(object_index, input, comdats, args, &mut output)?;
+    materialize_object_contributions_into(
+        object_index,
+        input,
+        comdats,
+        args,
+        dense_gc,
+        &mut output,
+    )?;
     Ok(output)
 }
 
@@ -2548,6 +2646,7 @@ fn materialize_object_contributions_into(
     input: &crate::coff::CoffObject<'_>,
     comdats: &ComdatResolution,
     args: &crate::args::coff::CoffArgs,
+    dense_gc: Option<(&pe_ir::PeIr<'_>, &pe_gc::GcOutput)>,
     output: &mut Vec<Contribution>,
 ) -> Result<()> {
     for section in input.file().sections() {
@@ -2573,6 +2672,20 @@ fn materialize_object_contributions_into(
         }
         if comdats.discarded.contains(&(object_index, section.index())) {
             continue;
+        }
+        if let Some((ir, gc)) = dense_gc {
+            let dense = ir
+                .section_by_raw(
+                    pe_ir::ObjectId::from_u32(
+                        u32::try_from(object_index).context("PE object index exceeds u32")?,
+                    ),
+                    u32::try_from(section.index().0)
+                        .context("raw COFF section index exceeds u32")?,
+                )
+                .context("COFF contribution has no dense section")?;
+            if !gc.is_live(dense) {
+                continue;
+            }
         }
         let name = merged_name(raw_name, args)?;
         let size = u32::try_from(section.size()).context("COFF section too large")?;
@@ -2625,6 +2738,7 @@ fn opt_ref_enabled(args: &crate::args::coff::CoffArgs) -> bool {
     }
 }
 
+#[cfg(test)]
 fn live_import_references(
     objects: &[crate::coff::CoffObject<'_>],
     metadata: &SelectedObjectMetadata,
@@ -2647,6 +2761,7 @@ fn live_import_references(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn retain_live_import_reference(
     name: &[u8],
     object_definitions: &HashSet<&[u8]>,
@@ -2680,6 +2795,7 @@ fn retain_live_import_reference(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn collect_live_import_references(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
@@ -2722,6 +2838,7 @@ fn collect_live_import_references(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn live_import_references_with_resolution(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
@@ -3013,6 +3130,96 @@ struct ComdatResolution {
     discarded: HashSet<ObjectSectionKey>,
     redirects: SectionRedirects,
     analysis: CompactComdatAnalysis,
+}
+
+fn dense_section_id(ir: &pe_ir::PeIr<'_>, key: ObjectSectionKey) -> Result<pe_ir::SectionId> {
+    ir.section_by_raw(
+        pe_ir::ObjectId::from_u32(
+            u32::try_from(key.0).context("PE object index exceeds u32")?,
+        ),
+        u32::try_from(key.1.0).context("raw COFF section index exceeds u32")?,
+    )
+    .context("COFF section has no dense section record")
+}
+
+/// Convert the already-classified COMDAT result into the sole production REF graph. Selection
+/// events are emitted in dense input order; relocation edges remain in PeIr's CSR and are decoded
+/// only when their canonical source becomes live.
+fn collect_dense_gc(
+    dense: &DenseProductionState<'_>,
+    comdats: &ComdatResolution,
+    roots: &[Vec<u8>],
+) -> Result<pe_gc::GcOutput> {
+    let mut events = Vec::new();
+    for (node, &key) in comdats.analysis.keys.iter().enumerate() {
+        let section = dense_section_id(&dense.ir, key)?;
+        if comdats.discarded.contains(&key) {
+            events.push(pe_gc::GcEvent::Discard { section });
+        }
+        if let Some(&target) = comdats.redirects.get(&key) {
+            events.push(pe_gc::GcEvent::Redirect {
+                from: section,
+                to: dense_section_id(&dense.ir, target)?,
+            });
+        }
+        if !comdats.analysis.is_comdat[node] {
+            events.push(pe_gc::GcEvent::RootSection {
+                section,
+                reason: pe_gc::RootReason::NonComdat,
+            });
+        }
+    }
+    for (section_index, section) in dense.ir.sections.iter().enumerate() {
+        if let Some(parent) = section.associative_section.get() {
+            events.push(pe_gc::GcEvent::AssociativeEdge {
+                parent,
+                child: pe_ir::SectionId::from_u32(
+                    u32::try_from(section_index).context("dense section index exceeds u32")?,
+                ),
+            });
+        }
+    }
+    for root in roots {
+        let hash = crate::hash::hash_bytes(root);
+        if let Some(name) = dense.names.lookup_prehashed(root, hash) {
+            events.push(pe_gc::GcEvent::RootSymbol {
+                name,
+                reason: pe_gc::RootReason::CommandLine,
+            });
+        }
+    }
+
+    let mut groups = Vec::with_capacity(comdats.analysis.groups.len());
+    let mut group_members = Vec::new();
+    for group in &comdats.analysis.groups {
+        let start = u32::try_from(group_members.len()).context("too many COMDAT group members")?;
+        for &node in group {
+            group_members.push(dense_section_id(&dense.ir, comdats.analysis.keys[node])?);
+        }
+        let Some(&leader) = group_members.get(start as usize) else {
+            return Err(error!("empty COMDAT reachability group"));
+        };
+        groups.push(pe_gc::SectionGroup {
+            leader,
+            member_start: start,
+            member_len: u32::try_from(group.len()).context("COMDAT group is too large")?,
+        });
+    }
+
+    let section_count = u32::try_from(dense.ir.sections.len())
+        .context("dense PE section count exceeds u32")?;
+    let mut collector = pe_gc::DenseEventGc::new(&dense.ir, &dense.alternate_targets);
+    pe_gc::EventDrivenGc::collect(
+        &mut collector,
+        pe_gc::GcInput {
+            section_count,
+            events: &events,
+            groups: &groups,
+            group_members: &group_members,
+            relocations: &dense.ir.relocations,
+            symbols: &dense.symbols,
+        },
+    )
 }
 
 fn record_comdat_redirects(
@@ -3338,6 +3545,7 @@ fn discarded_comdat_sections_with_metadata(
 /// example a function's unwind record) follows its leader.  Non-COMDAT sections intentionally
 /// start live.  They contain PE/CRT conventions such as `.CRT$XCU`, TLS state and loader
 /// metadata that do not necessarily have a normal relocation edge from the entry point.
+#[cfg(test)]
 fn unreferenced_comdat_sections(
     objects: &[crate::coff::CoffObject<'_>],
     metadata: &SelectedObjectMetadata,
@@ -3953,6 +4161,7 @@ fn copy_and_apply_relocations(
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
+    dense_gc: Option<&pe_gc::GcOutput>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -3967,6 +4176,7 @@ fn copy_and_apply_relocations(
             layout,
             locations,
             redirects,
+            dense_gc,
             definitions,
             absolute_symbols,
             image_base,
@@ -4178,6 +4388,7 @@ fn copy_and_relocate_dense_contribution(
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
+    dense_gc: Option<&pe_gc::GcOutput>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -4239,6 +4450,7 @@ fn copy_and_relocate_dense_contribution(
             layout,
             locations,
             redirects,
+            dense_gc,
             definitions,
             absolute_symbols,
             image_base,
@@ -4261,6 +4473,7 @@ fn prepare_dense_relocation(
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
+    dense_gc: Option<&pe_gc::GcOutput>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -4288,34 +4501,59 @@ fn prepare_dense_relocation(
             (target, section, index, None)
         }
     } else if let Some(section) = symbol.section.get() {
-        let target_record = dense
-            .ir
-            .sections
-            .get(section.index())
-            .context("dense relocation target section is invalid")?;
-        let target_object = target_record.object.index();
-        let target_raw = object::SectionIndex(target_record.raw_index as usize);
-        let ((selected_object, selected_raw), id) = redirected_location(
-            locations,
-            redirects,
-            (target_object, target_raw),
-        )?
-        .ok_or_else(|| {
-            error!(
-                "relocation targets discarded section {target_object}:{target_raw:?} via symbol `{}`",
-                String::from_utf8_lossy(name)
-            )
-        })?;
-        let selected = dense
-            .ir
-            .section_by_raw(
-                pe_ir::ObjectId::from_u32(
-                    u32::try_from(selected_object).context("selected object exceeds u32")?,
-                ),
-                u32::try_from(selected_raw.0).context("selected section exceeds u32")?,
-            )
-            .and_then(|section| dense.ir.sections.get(section.index()))
-            .context("COMDAT redirect target has no dense section")?;
+        let (selected, id) = if let Some(gc) = dense_gc {
+            let canonical = gc
+                .canonical(section)
+                .context("dense GC has no canonical relocation target")?;
+            let selected = dense
+                .ir
+                .sections
+                .get(canonical.index())
+                .context("canonical dense relocation target is invalid")?;
+            let key = (
+                selected.object.index(),
+                object::SectionIndex(selected.raw_index as usize),
+            );
+            let id = *locations.get(&key).ok_or_else(|| {
+                error!(
+                    "relocation targets discarded canonical section {}:{:?} via symbol `{}`",
+                    key.0,
+                    key.1,
+                    String::from_utf8_lossy(name)
+                )
+            })?;
+            (selected, id)
+        } else {
+            let target_record = dense
+                .ir
+                .sections
+                .get(section.index())
+                .context("dense relocation target section is invalid")?;
+            let target_object = target_record.object.index();
+            let target_raw = object::SectionIndex(target_record.raw_index as usize);
+            let ((selected_object, selected_raw), id) = redirected_location(
+                locations,
+                redirects,
+                (target_object, target_raw),
+            )?
+            .ok_or_else(|| {
+                error!(
+                    "relocation targets discarded section {target_object}:{target_raw:?} via symbol `{}`",
+                    String::from_utf8_lossy(name)
+                )
+            })?;
+            let selected = dense
+                .ir
+                .section_by_raw(
+                    pe_ir::ObjectId::from_u32(
+                        u32::try_from(selected_object).context("selected object exceeds u32")?,
+                    ),
+                    u32::try_from(selected_raw.0).context("selected section exceeds u32")?,
+                )
+                .and_then(|section| dense.ir.sections.get(section.index()))
+                .context("COMDAT redirect target has no dense section")?;
+            (selected, id)
+        };
         ensure!(
             symbol.value <= u64::from(selected.size),
             "symbol offset exceeds selected COMDAT section"

@@ -61,6 +61,9 @@ pub(super) enum GcEvent {
         from: SectionId,
         to: SectionId,
     },
+    Discard {
+        section: SectionId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +108,7 @@ pub(super) struct GcOutput {
     pub(super) redirects: Box<[SectionRedirect]>,
     pub(super) visitation_order: Box<[SectionId]>,
     pub(super) referenced_imports: Box<[super::pe_ir::ImportId]>,
+    pub(super) referenced_import_names: Box<[NameId]>,
     pub(super) dir64_needs: Box<[Dir64Need]>,
 }
 
@@ -134,11 +138,15 @@ pub(super) trait EventDrivenGc {
 /// live; unlike the legacy collector, this never materializes a whole-program relocation graph.
 pub(super) struct DenseEventGc<'ir, 'data> {
     ir: &'ir PeIr<'data>,
+    alternate_targets: &'ir [u32],
 }
 
 impl<'ir, 'data> DenseEventGc<'ir, 'data> {
-    pub(super) fn new(ir: &'ir PeIr<'data>) -> Self {
-        Self { ir }
+    pub(super) fn new(ir: &'ir PeIr<'data>, alternate_targets: &'ir [u32]) -> Self {
+        Self {
+            ir,
+            alternate_targets,
+        }
     }
 
     fn resolve_name(&self, symbols: &SymbolDb, mut name: NameId) -> Result<ResolvedTarget> {
@@ -163,17 +171,20 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                         Ok(ResolvedTarget {
                             section: symbol.section.get(),
                             import: None,
+                            import_name: None,
                             absolute: false,
                         })
                     }
                     ProviderKind::Import => Ok(ResolvedTarget {
                         section: None,
                         import: Some(super::pe_ir::ImportId::from_u32(provider.subject)),
+                        import_name: Some(name),
                         absolute: false,
                     }),
                     ProviderKind::Absolute | ProviderKind::LinkerDefined => Ok(ResolvedTarget {
                         section: None,
                         import: None,
+                        import_name: None,
                         absolute: true,
                     }),
                     ProviderKind::ArchiveMember => Err(error!(
@@ -181,10 +192,19 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     )),
                 };
             }
-            let Some(fallback) = entry.weak_fallback() else {
+            if let Some(fallback) = entry.weak_fallback() {
+                name = fallback;
+                continue;
+            }
+            let alternate = self
+                .alternate_targets
+                .get(name.index())
+                .copied()
+                .unwrap_or(u32::MAX);
+            if alternate == u32::MAX {
                 return Ok(ResolvedTarget::default());
-            };
-            name = fallback;
+            }
+            name = NameId::from_u32(alternate);
         }
         Err(error!("cycle in weak symbol fallbacks"))
     }
@@ -201,6 +221,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             return Ok(ResolvedTarget {
                 section: Some(section),
                 import: None,
+                import_name: None,
                 absolute: false,
             });
         }
@@ -212,6 +233,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
 struct ResolvedTarget {
     section: Option<SectionId>,
     import: Option<super::pe_ir::ImportId>,
+    import_name: Option<NameId>,
     absolute: bool,
 }
 
@@ -234,7 +256,7 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
             "invalid relocation CSR"
         );
 
-        count_hot_allocations(7);
+        count_hot_allocations(8);
         let mut redirect_targets = (0..input.section_count)
             .map(SectionId::from_u32)
             .collect::<Vec<_>>();
@@ -243,6 +265,9 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
         let mut associative_tails = vec![u32::MAX; section_count];
         let mut associative_targets = Vec::new();
         let mut associative_next = Vec::new();
+        let mut discarded = vec![false; section_count];
+        let mut referenced_imports = BTreeSet::new();
+        let mut referenced_import_names = BTreeSet::new();
         for event in input.events {
             match *event {
                 GcEvent::Redirect { from, to } => {
@@ -276,6 +301,12 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                         associative_next[*tail as usize] = edge;
                     }
                     *tail = edge;
+                }
+                GcEvent::Discard { section } => {
+                    let slot = discarded
+                        .get_mut(section.index())
+                        .context("discarded COMDAT section is outside dense IR")?;
+                    *slot = true;
                 }
                 _ => {}
             }
@@ -338,6 +369,9 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
             let canonical = *redirect_targets
                 .get(section.index())
                 .context("live section is outside dense IR")?;
+            if discarded[canonical.index()] {
+                return Ok(());
+            }
             let word = canonical.index() / 64;
             let mask = 1u64 << (canonical.index() % 64);
             if live_bits[word] & mask == 0 {
@@ -354,7 +388,14 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                     mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
                 }
                 GcEvent::RootSymbol { name, .. } => {
-                    if let Some(section) = self.resolve_name(input.symbols, name)?.section {
+                    let target = self.resolve_name(input.symbols, name)?;
+                    if let Some(import) = target.import {
+                        referenced_imports.insert(import);
+                    }
+                    if let Some(name) = target.import_name {
+                        referenced_import_names.insert(name);
+                    }
+                    if let Some(section) = target.section {
                         mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
                     }
                 }
@@ -362,11 +403,11 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 // producers can preserve diagnostic event logs without building another graph.
                 GcEvent::RelocationEdge { .. }
                 | GcEvent::AssociativeEdge { .. }
-                | GcEvent::Redirect { .. } => {}
+                | GcEvent::Redirect { .. }
+                | GcEvent::Discard { .. } => {}
             }
         }
 
-        let mut referenced_imports = BTreeSet::new();
         let mut dir64_needs = Vec::new();
         while let Some(section) = pending.pop_front() {
             let group = group_by_section[section.index()];
@@ -405,6 +446,9 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 if let Some(import) = target.import {
                     referenced_imports.insert(import);
                 }
+                if let Some(name) = target.import_name {
+                    referenced_import_names.insert(name);
+                }
                 if let Some(target) = target.section {
                     mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
                 }
@@ -417,6 +461,7 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
             redirects: redirects.into_boxed_slice(),
             visitation_order: visitation_order.into_boxed_slice(),
             referenced_imports: referenced_imports.into_iter().collect(),
+            referenced_import_names: referenced_import_names.into_iter().collect(),
             dir64_needs: dir64_needs.into_boxed_slice(),
         })
     }
@@ -448,6 +493,7 @@ mod tests {
             redirects: Box::new([]),
             visitation_order: vec![SectionId::from_u32(3)].into_boxed_slice(),
             referenced_imports: Box::new([]),
+            referenced_import_names: Box::new([]),
             dir64_needs: Box::new([]),
         };
         assert!(output.is_live(SectionId::from_u32(3)));
@@ -625,7 +671,7 @@ mod tests {
             member_len: 2,
         }];
         let members = [SectionId::from_u32(1), SectionId::from_u32(2)];
-        let mut collector = DenseEventGc::new(&ir);
+        let mut collector = DenseEventGc::new(&ir, &[]);
         let output = collector
             .collect(GcInput {
                 section_count: 4,
@@ -646,6 +692,7 @@ mod tests {
             Some(SectionId::from_u32(1))
         );
         assert_eq!(&*output.referenced_imports, &[ImportId::from_u32(4)]);
+        assert_eq!(&*output.referenced_import_names, &[NameId::from_u32(1)]);
         assert_eq!(
             &*output.dir64_needs,
             &[Dir64Need {
@@ -728,7 +775,7 @@ mod tests {
                 reason: RootReason::NonComdat,
             },
         ];
-        let mut collector = DenseEventGc::new(&ir);
+        let mut collector = DenseEventGc::new(&ir, &[]);
         let output = collector
             .collect(GcInput {
                 section_count: 4,
@@ -822,7 +869,7 @@ mod tests {
             section: SectionId::from_u32(0),
             reason: RootReason::NonComdat,
         }];
-        DenseEventGc::new(&ir)
+        DenseEventGc::new(&ir, &[])
             .collect(GcInput {
                 section_count: 2,
                 events: &discarded_events,
@@ -837,7 +884,7 @@ mod tests {
             section: SectionId::from_u32(1),
             reason: RootReason::NonComdat,
         }];
-        let error = DenseEventGc::new(&ir)
+        let error = DenseEventGc::new(&ir, &[])
             .collect(GcInput {
                 section_count: 2,
                 events: &live_events,
