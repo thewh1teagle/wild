@@ -113,12 +113,9 @@ impl<'data> ResolverSession<'data> {
     /// to that symbol. The caller uses this query to add that conditional root
     /// without turning an absent optional symbol into an unresolved external.
     pub(super) fn has_archive_definition(&self, name: &[u8]) -> bool {
-        self.archives.iter().any(|archive| {
-            archive.members().iter().any(|member| {
-                matches!(member.kind(), CoffArchiveMemberKind::CoffObject { .. })
-                    && member.definitions().any(|definition| definition == name)
-            })
-        })
+        self.archives
+            .iter()
+            .any(|archive| archive.has_object_definition(name))
     }
 
     pub(super) fn define_linker_symbol(&mut self, name: &[u8]) {
@@ -265,10 +262,11 @@ fn extract_pass<'data>(
             );
             demands
         };
-        let plan =
-            archive.plan_with_defined_lookup(&demands, whole_archive[archive_index], |name| {
-                symbol_state.defined.contains(name)
-            });
+        let plan = archive.plan_shallow_with_defined_lookup(
+            &demands,
+            whole_archive[archive_index],
+            |name| symbol_state.defined.contains(name),
+        );
         for selected in plan.selected() {
             let member = selected.member();
             if !extracted.insert((archive_index, member.index())) {
