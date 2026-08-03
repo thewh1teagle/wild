@@ -13,6 +13,7 @@ pub mod pe_load_config;
 pub mod pe_resources;
 pub mod pe_sections;
 pub mod pe_tls;
+pub mod pe_unwind;
 pub mod ppc64;
 pub mod relaxation;
 pub mod riscv64;
