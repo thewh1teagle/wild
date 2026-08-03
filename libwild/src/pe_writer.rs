@@ -797,7 +797,7 @@ fn build_image(
     resources: &[ResourceRecord],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
-    let mut contributions = collect_contributions(objects, args)?;
+    let (mut contributions, comdat_redirects) = collect_contributions(objects, args)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
@@ -1025,6 +1025,7 @@ fn build_image(
                     find_local_symbol(
                         objects,
                         &locations,
+                        &comdat_redirects,
                         &layout,
                         name.as_bytes(),
                         config.image_base,
@@ -1051,6 +1052,7 @@ fn build_image(
                     export,
                     objects,
                     &locations,
+                    &comdat_redirects,
                     &layout,
                     &definitions,
                     config.image_base,
@@ -1090,6 +1092,7 @@ fn build_image(
         objects,
         &layout,
         &locations,
+        &comdat_redirects,
         &definitions,
         config.image_base,
         &mut image,
@@ -1357,6 +1360,7 @@ fn resolve_export_target<'a>(
     export: &'a crate::args::coff::ExportSpec,
     objects: &[crate::coff::CoffObject<'_>],
     locations: &LocationMap,
+    redirects: &SectionRedirects,
     layout: &SectionLayout,
     definitions: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -1365,7 +1369,7 @@ fn resolve_export_target<'a>(
     let address = if let Some(address) = definitions.get(name).copied() {
         Some(address)
     } else {
-        find_local_symbol(objects, locations, layout, name, image_base)?
+        find_local_symbol(objects, locations, redirects, layout, name, image_base)?
     };
     if let Some(address) = address {
         let rva = u32::try_from(
@@ -1388,14 +1392,14 @@ fn resolve_export_target<'a>(
 fn collect_contributions(
     objects: &[crate::coff::CoffObject<'_>],
     args: &crate::args::coff::CoffArgs,
-) -> Result<Vec<Contribution>> {
+) -> Result<(Vec<Contribution>, SectionRedirects)> {
     if args.guard.control_flow == crate::args::coff::OptSetting::Enabled {
         return Err(error!(
             "explicit /GUARD:CF is not yet supported; refusing to emit incomplete CFG/load-config metadata"
         ));
     }
     let mut output = Vec::new();
-    let discarded_comdats = discarded_comdat_sections(objects)?;
+    let comdats = discarded_comdat_sections(objects)?;
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
             let raw_name = section.name_bytes().context("invalid COFF section name")?;
@@ -1419,7 +1423,7 @@ fn collect_contributions(
             {
                 continue;
             }
-            if discarded_comdats.contains(&(object_index, section.index())) {
+            if comdats.discarded.contains(&(object_index, section.index())) {
                 continue;
             }
             let name = merged_name(raw_name, args)?;
@@ -1462,7 +1466,7 @@ fn collect_contributions(
             });
         }
     }
-    Ok(output)
+    Ok((output, comdats.redirects))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1503,6 +1507,7 @@ struct SelectedComdat {
     object: usize,
     primary: object::SectionIndex,
     sections: Vec<object::SectionIndex>,
+    parents: HashMap<object::SectionIndex, Option<object::SectionIndex>>,
     selection: linker_utils::coff_symbols::ComdatSelection,
     timestamp: u32,
 }
@@ -1515,13 +1520,19 @@ fn coff_timestamp(file: &object::File<'_>) -> u32 {
     }
 }
 
+#[derive(Debug)]
+struct CachedComdatGroup {
+    sections: Vec<object::SectionIndex>,
+    parents: HashMap<object::SectionIndex, Option<object::SectionIndex>>,
+}
+
 fn raw_comdat_sections<'data, Coff: object::read::coff::CoffHeader>(
     file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
-) -> Result<HashMap<object::SectionIndex, Vec<object::SectionIndex>>> {
+) -> Result<HashMap<object::SectionIndex, CachedComdatGroup>> {
     use object::read::coff::Symbol as _;
 
     let symbols = file.coff_symbol_table();
-    let mut groups = HashMap::<object::SectionIndex, Vec<object::SectionIndex>>::new();
+    let mut groups = HashMap::<object::SectionIndex, CachedComdatGroup>::new();
     let mut associations = Vec::<(object::SectionIndex, object::SectionIndex)>::new();
     let mut parent_by_child = HashMap::<object::SectionIndex, object::SectionIndex>::new();
     for (index, symbol) in symbols.iter() {
@@ -1552,7 +1563,10 @@ fn raw_comdat_sections<'data, Coff: object::read::coff::CoffHeader>(
             );
             associations.push((section, parent));
         } else {
-            groups.entry(section).or_insert_with(|| vec![section]);
+            groups.entry(section).or_insert_with(|| CachedComdatGroup {
+                sections: vec![section],
+                parents: HashMap::from([(section, None)]),
+            });
         }
     }
     // Associative groups may be nested. Resolve each child to the ultimate non-associative
@@ -1570,14 +1584,17 @@ fn raw_comdat_sections<'data, Coff: object::read::coff::CoffHeader>(
         let sections = groups
             .get_mut(&parent)
             .context("associative COMDAT refers to a missing parent")?;
-        sections.push(child);
+        sections.sections.push(child);
+        sections
+            .parents
+            .insert(child, Some(parent_by_child[&child]));
     }
     Ok(groups)
 }
 
 fn cached_comdat_sections(
     file: &object::File<'_>,
-) -> Result<HashMap<object::SectionIndex, Vec<object::SectionIndex>>> {
+) -> Result<HashMap<object::SectionIndex, CachedComdatGroup>> {
     match file {
         object::File::Coff(file) => raw_comdat_sections(file),
         object::File::CoffBig(file) => raw_comdat_sections(file),
@@ -1596,9 +1613,92 @@ fn section_is_comdat(file: &object::File<'_>, index: object::SectionIndex) -> bo
         })
 }
 
-fn discarded_comdat_sections(
+type ObjectSectionKey = (usize, object::SectionIndex);
+type SectionRedirects = HashMap<ObjectSectionKey, ObjectSectionKey>;
+
+#[derive(Debug, Default)]
+struct ComdatResolution {
+    discarded: HashSet<ObjectSectionKey>,
+    redirects: SectionRedirects,
+}
+
+fn record_comdat_redirects(
     objects: &[crate::coff::CoffObject<'_>],
-) -> Result<HashSet<(usize, object::SectionIndex)>> {
+    loser_object: usize,
+    loser_sections: &[object::SectionIndex],
+    loser_parents: &HashMap<object::SectionIndex, Option<object::SectionIndex>>,
+    winner_object: usize,
+    winner_sections: &[object::SectionIndex],
+    winner_parents: &HashMap<object::SectionIndex, Option<object::SectionIndex>>,
+    redirects: &mut SectionRedirects,
+) -> Result<()> {
+    let Some((&loser_primary, loser_children)) = loser_sections.split_first() else {
+        return Ok(());
+    };
+    let Some((&winner_primary, winner_children)) = winner_sections.split_first() else {
+        return Ok(());
+    };
+    redirects.insert(
+        (loser_object, loser_primary),
+        (winner_object, winner_primary),
+    );
+
+    // Match children by both section name and direct association parent. This preserves nested
+    // association topology even when two objects order same-named children differently.
+    let mut winner_used = vec![false; winner_children.len()];
+    let mut pending = loser_children.iter().copied().collect::<Vec<_>>();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|loser| {
+            let Some(Some(loser_parent)) = loser_parents.get(loser) else {
+                return false;
+            };
+            let Some(&(mapped_parent_object, mapped_parent)) =
+                redirects.get(&(loser_object, *loser_parent))
+            else {
+                return true;
+            };
+            if mapped_parent_object != winner_object {
+                return true;
+            }
+            let loser_name = objects[loser_object]
+                .file()
+                .section_by_index(*loser)
+                .ok()
+                .and_then(|section| section.name_bytes().ok());
+            let Some((position, winner)) =
+                winner_children
+                    .iter()
+                    .enumerate()
+                    .find(|(position, winner)| {
+                        !winner_used[*position]
+                            && winner_parents.get(winner) == Some(&Some(mapped_parent))
+                            && objects[winner_object]
+                                .file()
+                                .section_by_index(**winner)
+                                .ok()
+                                .and_then(|section| section.name_bytes().ok())
+                                == loser_name
+                    })
+            else {
+                return false;
+            };
+            winner_used[position] = true;
+            redirects.insert((loser_object, *loser), (winner_object, *winner));
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
+    ensure!(
+        pending.is_empty() && winner_used.iter().all(|used| *used),
+        "duplicate COMDAT associative structures do not match"
+    );
+    Ok(())
+}
+
+fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<ComdatResolution> {
     use linker_utils::coff_symbols::ComdatCandidate;
     use linker_utils::coff_symbols::ComdatDecision;
     use linker_utils::coff_symbols::ComdatSelection;
@@ -1621,7 +1721,7 @@ fn discarded_comdat_sections(
     }
 
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
-    let mut discarded = HashSet::new();
+    let mut resolution = ComdatResolution::default();
     for (object_index, input) in objects.iter().enumerate() {
         let timestamp = coff_timestamp(input.file());
         let mut section_groups = cached_comdat_sections(input.file())?;
@@ -1647,11 +1747,18 @@ fn discarded_comdat_sections(
             // Cache this mapping with one symbol-table pass. object's per-COMDAT iterator scans
             // the complete symbol table to find associative children, which is quadratic for
             // compiler output containing thousands of COMDATs.
-            let sections = section_groups
+            let group = section_groups
                 .remove(&primary)
-                .unwrap_or_else(|| vec![primary]);
+                .unwrap_or_else(|| CachedComdatGroup {
+                    sections: vec![primary],
+                    parents: HashMap::from([(primary, None)]),
+                });
+            let sections = group.sections;
+            let parents = group.parents;
             if strong_definitions.contains(&name) {
-                discarded.extend(sections.iter().map(|section| (object_index, *section)));
+                resolution
+                    .discarded
+                    .extend(sections.iter().map(|section| (object_index, *section)));
                 continue;
             }
             let selection = match comdat.kind() {
@@ -1739,21 +1846,44 @@ fn discarded_comdat_sections(
                 })?;
                 match decision {
                     ComdatDecision::KeepExisting => {
-                        discarded.extend(sections.iter().map(|section| (object_index, *section)));
+                        resolution
+                            .discarded
+                            .extend(sections.iter().map(|section| (object_index, *section)));
+                        record_comdat_redirects(
+                            objects,
+                            object_index,
+                            &sections,
+                            &parents,
+                            existing.object,
+                            &existing.sections,
+                            &existing.parents,
+                            &mut resolution.redirects,
+                        )?;
                     }
                     ComdatDecision::ReplaceExisting => {
-                        discarded.extend(
+                        resolution.discarded.extend(
                             existing
                                 .sections
                                 .iter()
                                 .map(|section| (existing.object, *section)),
                         );
+                        record_comdat_redirects(
+                            objects,
+                            existing.object,
+                            &existing.sections,
+                            &existing.parents,
+                            object_index,
+                            &sections,
+                            &parents,
+                            &mut resolution.redirects,
+                        )?;
                         selected.insert(
                             name,
                             SelectedComdat {
                                 object: object_index,
                                 primary,
                                 sections,
+                                parents,
                                 selection,
                                 timestamp,
                             },
@@ -1767,6 +1897,7 @@ fn discarded_comdat_sections(
                         object: object_index,
                         primary,
                         sections,
+                        parents,
                         selection,
                         timestamp,
                     },
@@ -1778,7 +1909,7 @@ fn discarded_comdat_sections(
             "COFF COMDAT section groups were not matched to leaders"
         );
     }
-    Ok(discarded)
+    Ok(resolution)
 }
 
 fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u8>> {
@@ -1919,6 +2050,23 @@ fn source_locations(
         .collect()
 }
 
+fn redirected_location(
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    mut section: ObjectSectionKey,
+) -> Result<Option<(ObjectSectionKey, ContributionId)>> {
+    for _ in 0..=redirects.len() {
+        if let Some(id) = locations.get(&section) {
+            return Ok(Some((section, *id)));
+        }
+        let Some(next) = redirects.get(&section) else {
+            return Ok(None);
+        };
+        section = *next;
+    }
+    Err(error!("cycle in COMDAT section redirects"))
+}
+
 fn dir64_rvas(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
@@ -1993,6 +2141,7 @@ fn definitions(
 fn find_local_symbol(
     objects: &[crate::coff::CoffObject<'_>],
     locations: &LocationMap,
+    redirects: &SectionRedirects,
     layout: &SectionLayout,
     name: &[u8],
     image_base: u64,
@@ -2003,10 +2152,11 @@ fn find_local_symbol(
                 continue;
             }
             if let Some(section) = symbol.section_index()
-                && let Some(id) = locations.get(&(object_index, section))
+                && let Some((_, id)) =
+                    redirected_location(locations, redirects, (object_index, section))?
             {
                 return Ok(Some(
-                    image_base + u64::from(layout.placements[id].rva) + symbol.address(),
+                    image_base + u64::from(layout.placements[&id].rva) + symbol.address(),
                 ));
             }
         }
@@ -2018,6 +2168,7 @@ fn apply_relocations(
     objects: &[crate::coff::CoffObject<'_>],
     layout: &SectionLayout,
     locations: &LocationMap,
+    redirects: &SectionRedirects,
     definitions: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     image: &mut [u8],
@@ -2050,10 +2201,23 @@ fn apply_relocations(
                         {
                             target_location(layout, image_base, *address)?
                         } else if let Some(section) = symbol.section_index() {
-                            let id = locations
-                                .get(&(object_index, section))
-                                .ok_or_else(|| error!("relocation targets discarded section"))?;
-                            let target_placement = &layout.placements[id];
+                            let ((target_object, target_section_index), id) =
+                                redirected_location(locations, redirects, (object_index, section))?
+                                    .ok_or_else(|| {
+                                        error!(
+                                            "relocation targets discarded section {object_index}:{section:?} via symbol `{}`",
+                                            String::from_utf8_lossy(name)
+                                        )
+                                    })?;
+                            let target_section = objects[target_object]
+                                .file()
+                                .section_by_index(target_section_index)
+                                .context("COMDAT redirect targets an invalid section")?;
+                            ensure!(
+                                symbol.address() <= target_section.size(),
+                                "symbol offset exceeds selected COMDAT section"
+                            );
+                            let target_placement = &layout.placements[&id];
                             let target = target_placement
                                 .rva
                                 .checked_add(
@@ -2075,10 +2239,17 @@ fn apply_relocations(
                         }
                     }
                     RelocationTarget::Section(section) => {
-                        let id = locations
-                            .get(&(object_index, section))
-                            .ok_or_else(|| error!("relocation targets discarded section"))?;
-                        let target_placement = &layout.placements[id];
+                        let (_, id) = redirected_location(
+                            locations,
+                            redirects,
+                            (object_index, section),
+                        )?
+                        .ok_or_else(|| {
+                            error!(
+                                "relocation targets discarded section {object_index}:{section:?}"
+                            )
+                        })?;
+                        let target_placement = &layout.placements[&id];
                         (
                             target_placement.rva,
                             layout.sections[target_placement.output_section].rva,
@@ -2795,6 +2966,63 @@ mod tests {
         bytes
     }
 
+    fn comdat_object_with_section_relocations(include_references: bool) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let primary = object.add_subsection(object::write::StandardSection::Text, b"redirect");
+        object.append_section_data(primary, &[0x90; 16], 1);
+        object.section_symbol(primary);
+        let leader = object.add_symbol(Symbol {
+            name: b"redirect".to_vec(),
+            value: 0,
+            size: 16,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(primary),
+            flags: object::SymbolFlags::None,
+        });
+        let local = object.add_symbol(Symbol {
+            name: b"redirect_local".to_vec(),
+            value: 4,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(primary),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: leader,
+            sections: vec![primary],
+        });
+        if include_references {
+            let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+            object.append_section_data(data, &[0; 8], 4);
+            for (offset, typ) in [
+                (0, object::pe::IMAGE_REL_AMD64_SECREL),
+                (4, object::pe::IMAGE_REL_AMD64_SECTION),
+            ] {
+                object
+                    .add_relocation(
+                        data,
+                        Relocation {
+                            offset,
+                            symbol: local,
+                            addend: 0,
+                            flags: object::RelocationFlags::Coff { typ },
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        object.write().unwrap()
+    }
+
     fn nested_associative_comdat_object() -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -3233,7 +3461,12 @@ mod tests {
             crate::coff::CoffObject::parse(&second).unwrap(),
         ];
 
-        assert!(discarded_comdat_sections(&objects).unwrap().is_empty());
+        assert!(
+            discarded_comdat_sections(&objects)
+                .unwrap()
+                .discarded
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3301,7 +3534,23 @@ mod tests {
             ];
 
             let discarded = discarded_comdat_sections(&objects).unwrap();
-            assert_eq!(discarded.len(), 2, "selection {kind:?}");
+            assert_eq!(discarded.discarded.len(), 2, "selection {kind:?}");
+            assert_eq!(discarded.redirects.len(), 2, "selection {kind:?}");
+            let (loser, winner) = if matches!(
+                kind,
+                object::ComdatKind::Largest | object::ComdatKind::Newest
+            ) {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
+            for section in [object::SectionIndex(1), object::SectionIndex(2)] {
+                assert_eq!(
+                    discarded.redirects[&(loser, section)],
+                    (winner, section),
+                    "selection {kind:?} section {section:?}"
+                );
+            }
         }
     }
 
@@ -3314,7 +3563,36 @@ mod tests {
             crate::coff::CoffObject::parse(&second).unwrap(),
         ];
 
-        assert_eq!(discarded_comdat_sections(&objects).unwrap().len(), 3);
+        let resolution = discarded_comdat_sections(&objects).unwrap();
+        assert_eq!(resolution.discarded.len(), 3);
+        assert_eq!(resolution.redirects.len(), 3);
+    }
+
+    #[test]
+    fn section_relocations_to_discarded_comdat_use_selected_section() {
+        let winner = comdat_object_with_section_relocations(false);
+        let loser = comdat_object_with_section_relocations(true);
+        let objects = [
+            crate::coff::CoffObject::parse(&winner).unwrap(),
+            crate::coff::CoffObject::parse(&loser).unwrap(),
+        ];
+
+        let image = build_image(
+            &objects,
+            &[],
+            &[],
+            b"redirect.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        let pe = object::File::parse(image.bytes.as_slice()).unwrap();
+        let data = pe.section_by_name(".data").unwrap().data().unwrap();
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(data[4..6].try_into().unwrap()), 1);
     }
 
     #[test]
@@ -3333,7 +3611,10 @@ mod tests {
             crate::coff::CoffObject::parse(&strong).unwrap(),
         ];
 
-        assert_eq!(discarded_comdat_sections(&objects).unwrap().len(), 2);
+        assert_eq!(
+            discarded_comdat_sections(&objects).unwrap().discarded.len(),
+            2
+        );
     }
 
     #[test]
@@ -3711,7 +3992,7 @@ mod tests {
     fn default_guard_policy_discards_guard_metadata_only() {
         let bytes = guard_metadata_object();
         let object = crate::coff::CoffObject::parse(&bytes).unwrap();
-        let contributions =
+        let (contributions, _) =
             collect_contributions(&[object], &crate::args::coff::CoffArgs::default()).unwrap();
         assert_eq!(
             contributions
@@ -3733,7 +4014,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let contributions = collect_contributions(&[object], &args).unwrap();
+        let (contributions, _) = collect_contributions(&[object], &args).unwrap();
         assert_eq!(
             contributions
                 .iter()
