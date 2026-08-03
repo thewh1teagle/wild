@@ -509,6 +509,12 @@ where
                 // the PE v1 scope, so accept a non-empty value without claiming to apply it.
                 let _ = required_value("/PDBALTPATH", inline_value, &mut input)?;
             }
+            "natvis" => {
+                // rustc forwards debugger visualizers to the linker for inclusion in the PDB.
+                // PDB emission is outside PE v1, so accept the path without treating it as a
+                // link input.
+                let _ = required_value("/NATVIS", inline_value, &mut input)?;
+            }
             "manifest" => args.manifest = parse_yes_no("/MANIFEST", inline_value)?,
             "merge" => args.merges.push(parse_merge(required_value(
                 "/MERGE",
@@ -1030,6 +1036,23 @@ mod tests {
         assert!(!args.debug);
 
         assert!(parse(&mut CoffArgs::default(), ["/PDBALTPATH:"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn accepts_ignored_natvis_paths_without_treating_them_as_inputs() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            [
+                "/NATVIS:visualizers\\std.natvis",
+                "/NATVIS",
+                "custom.natvis",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(args.common.inputs.is_empty());
+        assert!(parse(&mut CoffArgs::default(), ["/NATVIS:"].into_iter()).is_err());
     }
 
     #[test]
