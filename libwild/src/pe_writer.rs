@@ -17,6 +17,8 @@ use object::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+#[path = "pe_entry.rs"]
+mod pe_entry;
 #[path = "pe_imports.rs"]
 mod pe_imports;
 #[path = "pe_resolver.rs"]
@@ -99,11 +101,6 @@ pub(crate) fn link<F: FileSystem>(
     args: &crate::args::coff::CoffArgs,
 ) -> Result<crate::LinkerOutput<'static>> {
     ensure!(!args.common.inputs.is_empty(), "no COFF input files");
-    let entry_name = (!args.no_entry).then_some(args.entry.as_deref()).flatten();
-    ensure!(
-        args.is_dll || args.no_entry || entry_name.is_some(),
-        "PE executable output requires /ENTRY:<symbol>"
-    );
     ensure!(
         !(args.no_entry && args.entry.is_some()),
         "/ENTRY and /NOENTRY cannot be used together"
@@ -164,6 +161,7 @@ pub(crate) fn link<F: FileSystem>(
         }
     }
     let initial_directive_exports = directive_exports(&objects)?;
+    let entry_name = pe_entry::select(args, &objects)?;
     let mut exports = args.exports.clone();
     exports.extend(initial_directive_exports.iter().cloned());
     let mut roots = args
@@ -171,7 +169,7 @@ pub(crate) fn link<F: FileSystem>(
         .iter()
         .map(|s| s.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    if let Some(entry) = entry_name {
+    if let Some(entry) = entry_name.as_deref() {
         roots.push(entry.as_bytes().to_vec());
     }
     roots.extend(
@@ -201,7 +199,7 @@ pub(crate) fn link<F: FileSystem>(
         &imports,
         &exports,
         dll_name.as_bytes(),
-        entry_name,
+        entry_name.as_deref(),
         args,
         PeWriterConfig::from_args(args)?,
     )?;
@@ -627,6 +625,7 @@ fn build_image(
         args,
         config,
         entry_rva,
+        entry_name,
         emitted_imports.import_directory,
         emitted_imports.iat_directory,
         reloc_id.is_some() && !reloc_data.is_empty(),
@@ -1257,6 +1256,7 @@ fn write_headers(
     args: &crate::args::coff::CoffArgs,
     config: PeWriterConfig,
     entry_rva: u32,
+    entry_name: Option<&str>,
     import_directory: Option<(u32, u32)>,
     iat_directory: Option<(u32, u32)>,
     has_relocs: bool,
@@ -1353,7 +1353,7 @@ fn write_headers(
             config.file_alignment,
         ),
     );
-    put_u16(image, opt + 68, subsystem_value(args));
+    put_u16(image, opt + 68, subsystem_value(args, entry_name));
     let mut dll_chars = 0;
     if args.nx_compat {
         dll_chars |= object::pe::IMAGE_DLLCHARACTERISTICS_NX_COMPAT.0;
@@ -1444,7 +1444,7 @@ fn section_attributes(
     flags
 }
 
-fn subsystem_value(args: &crate::args::coff::CoffArgs) -> u16 {
+fn subsystem_value(args: &crate::args::coff::CoffArgs, entry_name: Option<&str>) -> u16 {
     use crate::args::coff::Subsystem;
     match args.subsystem.as_ref().map(|s| &s.kind) {
         Some(Subsystem::Windows) => 2,
@@ -1454,7 +1454,9 @@ fn subsystem_value(args: &crate::args::coff::CoffArgs) -> u16 {
         Some(Subsystem::EfiBootServiceDriver) => 11,
         Some(Subsystem::EfiRuntimeDriver) => 12,
         Some(Subsystem::EfiRom) => 13,
-        Some(Subsystem::Console) | None => 3,
+        Some(Subsystem::Console) => 3,
+        None if matches!(entry_name, Some("WinMainCRTStartup" | "wWinMainCRTStartup")) => 2,
+        None => 3,
     }
 }
 fn output_characteristics(input: u32) -> u32 {
@@ -1581,6 +1583,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merged_name(b".foo$z", &args).unwrap(), b".data$z");
+    }
+
+    #[test]
+    fn inferred_windows_entry_selects_gui_subsystem() {
+        let args = crate::args::coff::CoffArgs::default();
+        assert_eq!(subsystem_value(&args, Some("mainCRTStartup")), 3);
+        assert_eq!(subsystem_value(&args, Some("WinMainCRTStartup")), 2);
+        assert_eq!(subsystem_value(&args, Some("wWinMainCRTStartup")), 2);
     }
 
     #[test]
