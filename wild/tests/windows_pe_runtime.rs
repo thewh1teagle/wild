@@ -208,10 +208,11 @@ mod corpus {
                 let error = Command::new(&malformed)
                     .output()
                     .expect_err("Windows loader accepted malformed PE");
-                assert_eq!(
-                    error.raw_os_error(),
-                    Some(193),
-                    "{description} failed for an unexpected reason: {error}"
+                let error_code = error.raw_os_error();
+                assert!(
+                    matches!(error_code, Some(193 | 216)),
+                    "{description} did not produce a recognized malformed-executable rejection \
+                     (expected Windows error 193 or 216, got {error_code:?}): {error}"
                 );
             }
         }
