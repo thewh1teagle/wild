@@ -10,6 +10,7 @@ pub mod loongarch64;
 pub mod pe_base_relocs;
 pub mod pe_exports;
 pub mod pe_load_config;
+pub mod pe_resources;
 pub mod pe_sections;
 pub mod pe_tls;
 pub mod ppc64;
