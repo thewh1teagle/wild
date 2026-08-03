@@ -228,6 +228,7 @@ impl Args {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlatformKind {
     Elf,
     Coff,
@@ -237,9 +238,18 @@ enum PlatformKind {
 
 impl PlatformKind {
     fn host() -> Self {
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "windows")]
+        {
+            PlatformKind::Coff
+        }
+
+        #[cfg(target_os = "macos")]
+        {
             PlatformKind::MachO
-        } else {
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
             PlatformKind::Elf
         }
     }
@@ -251,7 +261,7 @@ impl PlatformKind {
             "link" => Ok(PlatformKind::Coff),
             "wasm" | "ld-wasm" => Ok(PlatformKind::Wasm),
             _ => bail!(
-                "Unknown flavor '{}'. Valid flavors: gnu, darwin, link",
+                "Unknown flavor '{}'. Valid flavors: gnu, darwin, link, wasm",
                 flavor
             ),
         }
@@ -402,7 +412,7 @@ impl CommonArgs {
     /// Returns a string that identifies this linker. This is written into the .comment
     /// section which usually also contains the versions of compilers that were used.
     pub(crate) fn linker_identity(&self) -> String {
-        format!("Wild {} (compatible with GNU linkers)", self.version)
+        format!("Wild {}", self.version)
     }
 
     /// Adds a linker script to our outputs. Note, this is only called for scripts specified via
@@ -1520,5 +1530,50 @@ mod tests {
 
         assert!(Args::new(|| ["ld.wild", "-flavor", "invalid"].into_iter()).is_err());
         assert!(Args::new(|| ["ld.wild", "-flavor"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn explicit_driver_names_are_cross_platform() {
+        assert_eq!(
+            PlatformKind::from_executable_name("/toolchain/bin/ld"),
+            Some(PlatformKind::Elf)
+        );
+        assert_eq!(
+            PlatformKind::from_executable_name("lld-link.exe"),
+            Some(PlatformKind::Coff)
+        );
+        assert_eq!(
+            PlatformKind::from_executable_name("/toolchain/bin/ld64"),
+            Some(PlatformKind::MachO)
+        );
+        assert_eq!(
+            PlatformKind::from_executable_name("/toolchain/bin/wasm-ld"),
+            Some(PlatformKind::Wasm)
+        );
+    }
+
+    #[test]
+    fn generic_driver_uses_host_platform() {
+        let args = Args::new(|| ["wild"].into_iter()).unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert!(matches!(args, Args::Coff(_)));
+
+        #[cfg(target_os = "macos")]
+        assert!(matches!(args, Args::MachO(_)));
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert!(matches!(args, Args::Elf(_)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_exe_name_accepts_link_arguments_by_default() {
+        let mut args = Args::new(|| ["wild.exe", "/NOLOGO", "/OUT:test.exe"].into_iter()).unwrap();
+        assert!(matches!(args, Args::Coff(_)));
+
+        args.parse(|| ["wild.exe", "/NOLOGO", "/OUT:test.exe"].into_iter())
+            .unwrap();
+        assert_eq!(args.common().output.as_ref(), Path::new("test.exe"));
     }
 }
