@@ -798,6 +798,7 @@ fn build_image(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
     let mut contributions = collect_contributions(objects, args)?;
+    let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
         (0, 0)
@@ -1093,6 +1094,16 @@ fn build_image(
         config.image_base,
         &mut image,
     )?;
+    let tls_directory = prepare_tls_directory(
+        objects,
+        &contributions,
+        &layout,
+        &definitions,
+        config.image_base,
+        dynamic_base,
+        has_tls_inputs,
+        &mut image,
+    )?;
     let exception_directory = canonicalize_exception_directory(&mut image, &layout, args)?;
     let debug_directory = if let Some(id) = debug_id {
         let placement = &layout.placements[&id];
@@ -1126,7 +1137,7 @@ fn build_image(
             .map(|directory| (directory.rva, directory.size)),
         resource_directory,
         exception_directory,
-        None,
+        tls_directory,
         debug_directory,
         load_config_directory,
     );
@@ -1399,7 +1410,6 @@ fn collect_contributions(
             {
                 continue;
             }
-            reject_unsupported_metadata_section(raw_name)?;
             if class.discardable
                 || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
                 || matches!(
@@ -1453,22 +1463,6 @@ fn collect_contributions(
         }
     }
     Ok(output)
-}
-
-fn reject_unsupported_metadata_section(name: &[u8]) -> Result<()> {
-    if name == b".tls" || name.starts_with(b".tls$") {
-        return Err(error!(
-            "TLS input section `{}` is not yet supported: emitting the TLS directory requires resolver-owned synthetic symbols",
-            String::from_utf8_lossy(name)
-        ));
-    }
-    if name.starts_with(b".CRT$XL") {
-        return Err(error!(
-            "TLS callback section `{}` is not yet supported: callback targets must be resolved before PE TLS emission",
-            String::from_utf8_lossy(name)
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1613,10 +1607,8 @@ fn discarded_comdat_sections(
 }
 
 fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u8>> {
-    let (base, suffix) = input
-        .iter()
-        .position(|byte| *byte == b'$')
-        .map_or((input, &[][..]), |at| (&input[..at], &input[at + 1..]));
+    let separator = input.iter().position(|byte| *byte == b'$');
+    let (base, suffix) = separator.map_or((input, &[][..]), |at| (&input[..at], &input[at + 1..]));
     let mut name = String::from_utf8(base.to_vec()).context("non-UTF-8 COFF section name")?;
     // Windows unwind payload is conventionally folded into read-only data.
     // `.pdata` stays separate because it is named by the exception directory.
@@ -1638,7 +1630,7 @@ fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u
         name.clone_from(&merge.to);
     }
     ensure!(name.len() <= 8, "PE section name `{name}` exceeds 8 bytes");
-    if suffix.is_empty() {
+    if separator.is_none() {
         Ok(name.into_bytes())
     } else {
         let mut bytes = name.into_bytes();
@@ -1982,6 +1974,261 @@ fn target_location(
         section.rva,
         u16::try_from(index + 1).context("PE section index exceeds u16")?,
     ))
+}
+
+fn rva_file_offset(layout: &SectionLayout, rva: u32, size: u32) -> Result<usize> {
+    let end = rva.checked_add(size).context("PE RVA range overflow")?;
+    let section = layout
+        .sections
+        .iter()
+        .find(|section| {
+            rva >= section.rva
+                && end <= section.rva.saturating_add(section.raw_size)
+                && section.file_offset.is_some()
+        })
+        .context("PE RVA range has no file-backed section")?;
+    let file = section
+        .file_offset
+        .context("PE RVA range lies in an uninitialized section")?
+        .checked_add(rva - section.rva)
+        .context("PE file offset overflow")?;
+    let file_end = file.checked_add(size).context("PE file range overflow")?;
+    ensure!(
+        file_end <= layout.file_size,
+        "PE RVA range extends past the file"
+    );
+    usize::try_from(file).context("PE file offset exceeds usize")
+}
+
+fn has_tls_contributions(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+) -> Result<bool> {
+    for contribution in contributions {
+        let Source::Object { object, section } = contribution.source else {
+            continue;
+        };
+        let name = objects[object]
+            .file()
+            .section_by_index(section)?
+            .name_bytes()
+            .context("invalid COFF TLS section name")?;
+        if name == b".tls" || name.starts_with(b".tls$") || name.starts_with(b".CRT$XL") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_tls_directory(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    layout: &SectionLayout,
+    definitions: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+    dynamic_base: bool,
+    has_tls_inputs: bool,
+    image: &mut [u8],
+) -> Result<Option<(u32, u32)>> {
+    if !has_tls_inputs {
+        return Ok(None);
+    }
+
+    let directory_rva = tls_definition_rva(definitions, b"_tls_used", image_base)
+        .context("TLS input requires the `_tls_used` IMAGE_TLS_DIRECTORY64 symbol")?;
+    let index_rva = tls_definition_rva(definitions, b"_tls_index", image_base)
+        .context("TLS input requires the loader-written `_tls_index` symbol")?;
+    let tls_start_rva = tls_definition_rva(definitions, b"_tls_start", image_base)
+        .context("TLS input requires the CRT `_tls_start` symbol")?;
+    let tls_end_rva = tls_definition_rva(definitions, b"_tls_end", image_base)
+        .context("TLS input requires the CRT `_tls_end` symbol")?;
+    ensure!(
+        tls_start_rva <= tls_end_rva,
+        "TLS `_tls_start` lies after `_tls_end`"
+    );
+
+    let directory_size = linker_utils::pe_tls::IMAGE_TLS_DIRECTORY64_SIZE;
+    let directory_offset = rva_file_offset(layout, directory_rva, directory_size)
+        .context("`_tls_used` is not backed by a complete IMAGE_TLS_DIRECTORY64")?;
+    let original = image
+        .get(directory_offset..directory_offset + directory_size as usize)
+        .context("`_tls_used` extends past the PE file")?
+        .to_vec();
+    let raw_start = tls_rva_from_va(read_tls_u64(&original, 0), image_base, "raw-data start")?;
+    let raw_end = tls_rva_from_va(read_tls_u64(&original, 8), image_base, "raw-data end")?;
+    let encoded_index = tls_rva_from_va(read_tls_u64(&original, 16), image_base, "index")?;
+    let callbacks_rva = tls_rva_from_va(read_tls_u64(&original, 24), image_base, "callbacks")?;
+    ensure!(
+        raw_start == tls_start_rva && raw_end == tls_end_rva,
+        "`_tls_used` raw-data range does not match `_tls_start`/`_tls_end`"
+    );
+    ensure!(
+        encoded_index == index_rva,
+        "`_tls_used` AddressOfIndex does not reference `_tls_index`"
+    );
+
+    let template_size = raw_end
+        .checked_sub(raw_start)
+        .context("TLS raw-data start is after its end")?;
+    let template_offset = rva_file_offset(layout, raw_start, template_size)
+        .context("TLS template is not fully file-backed")?;
+    let template = image
+        .get(template_offset..template_offset + template_size as usize)
+        .context("TLS template extends past the PE file")?;
+    let alignment = tls_template_alignment(objects, contributions)?;
+    let zero_fill = u32::from_le_bytes(original[32..36].try_into().unwrap());
+    let template_virtual_end = raw_end
+        .checked_add(zero_fill)
+        .context("TLS zero-fill range overflow")?;
+    ensure!(
+        layout.sections.iter().any(|section| {
+            raw_start >= section.rva
+                && template_virtual_end <= section.rva.saturating_add(section.virtual_size)
+        }),
+        "TLS template and zero-fill range is not contained in one mapped section"
+    );
+    let tls = linker_utils::pe_tls::build_amd64_tls_image(
+        linker_utils::pe_tls::TlsLayout {
+            image_base,
+            raw_data_rva: raw_start,
+            index_rva,
+            callbacks_rva,
+            directory_rva,
+            size_of_image: layout.size_of_image,
+        },
+        &[linker_utils::pe_tls::TlsContribution {
+            section_name: b".tls",
+            data: template,
+            zero_fill,
+            alignment,
+            order: 0,
+        }],
+        &[],
+    )
+    .context("failed to construct AMD64 PE TLS metadata")?;
+    ensure!(
+        tls.raw_data_virtual_size
+            == template_size
+                .checked_add(zero_fill)
+                .context("TLS template size overflow")?,
+        "TLS template size changed during metadata construction"
+    );
+
+    let dir64 = dir64_rvas(objects, contributions, layout)?;
+    if dynamic_base {
+        for rva in &tls.dir64_relocation_rvas {
+            ensure!(
+                dir64.contains(rva),
+                "TLS directory field at RVA {rva:#x} lacks an AMD64 DIR64 base relocation"
+            );
+        }
+    }
+    validate_tls_callbacks(
+        image,
+        layout,
+        image_base,
+        callbacks_rva,
+        dynamic_base,
+        &dir64,
+    )?;
+
+    image[directory_offset..directory_offset + directory_size as usize]
+        .copy_from_slice(&tls.directory);
+    linker_utils::pe_tls::parse_amd64_tls_directory(
+        &image[directory_offset..directory_offset + directory_size as usize],
+        image_base,
+        layout.size_of_image,
+    )
+    .context("malformed `_tls_used` IMAGE_TLS_DIRECTORY64")?;
+    Ok(Some((directory_rva, directory_size)))
+}
+
+fn tls_template_alignment(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+) -> Result<u32> {
+    let mut alignment = 1;
+    for contribution in contributions {
+        let Source::Object { object, section } = contribution.source else {
+            continue;
+        };
+        let section = objects[object].file().section_by_index(section)?;
+        let name = section
+            .name_bytes()
+            .context("invalid COFF TLS section name")?;
+        if name == b".tls" || name.starts_with(b".tls$") {
+            alignment = alignment.max(contribution.spec.alignment);
+        }
+    }
+    Ok(alignment)
+}
+
+fn validate_tls_callbacks(
+    image: &[u8],
+    layout: &SectionLayout,
+    image_base: u64,
+    callbacks_rva: u32,
+    dynamic_base: bool,
+    dir64_rvas: &[u32],
+) -> Result<()> {
+    let mut field_rva = callbacks_rva;
+    loop {
+        let offset = rva_file_offset(layout, field_rva, 8)
+            .context("TLS callback array is not null-terminated in file-backed image data")?;
+        let callback = read_tls_u64(image, offset);
+        if callback == 0 {
+            return Ok(());
+        }
+        let callback_rva = tls_rva_from_va(callback, image_base, "callback target")?;
+        ensure!(
+            callback_rva < layout.size_of_image,
+            "TLS callback target RVA {callback_rva:#x} lies outside the image"
+        );
+        if dynamic_base {
+            ensure!(
+                dir64_rvas.contains(&field_rva),
+                "TLS callback pointer at RVA {field_rva:#x} lacks an AMD64 DIR64 base relocation"
+            );
+        }
+        field_rva = field_rva
+            .checked_add(8)
+            .context("TLS callback array RVA overflow")?;
+    }
+}
+
+fn tls_definition_rva(
+    definitions: &HashMap<Vec<u8>, u64>,
+    name: &[u8],
+    image_base: u64,
+) -> Result<u32> {
+    let address = definitions
+        .get(name)
+        .copied()
+        .with_context(|| format!("undefined TLS symbol `{}`", String::from_utf8_lossy(name)))?;
+    let rva = address.checked_sub(image_base).with_context(|| {
+        format!(
+            "TLS symbol `{}` precedes the image base",
+            String::from_utf8_lossy(name)
+        )
+    })?;
+    u32::try_from(rva).with_context(|| {
+        format!(
+            "TLS symbol `{}` has an RVA wider than 32 bits",
+            String::from_utf8_lossy(name)
+        )
+    })
+}
+
+fn tls_rva_from_va(value: u64, image_base: u64, description: &str) -> Result<u32> {
+    let rva = value
+        .checked_sub(image_base)
+        .with_context(|| format!("TLS {description} VA lies below the image base"))?;
+    u32::try_from(rva).with_context(|| format!("TLS {description} RVA exceeds 32 bits"))
+}
+
+fn read_tls_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 fn write_headers(
@@ -2606,6 +2853,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merged_name(b".foo$z", &args).unwrap(), b".data$z");
+        assert_eq!(merged_name(b".foo$", &args).unwrap(), b".data$");
     }
 
     #[test]
@@ -3015,19 +3263,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tls_metadata_until_resolver_support_exists() {
-        assert!(
-            reject_unsupported_metadata_section(b".tls$AAA")
-                .unwrap_err()
-                .to_string()
-                .contains("TLS input section")
-        );
-        assert!(
-            reject_unsupported_metadata_section(b".CRT$XLB")
-                .unwrap_err()
-                .to_string()
-                .contains("TLS callback")
-        );
+    fn diagnoses_missing_tls_runtime_symbols() {
+        let layout = SectionLayout {
+            sections: Vec::new(),
+            placements: BTreeMap::new(),
+            file_size: 0,
+            size_of_image: 0x1000,
+        };
+        let error = prepare_tls_directory(
+            &[],
+            &[],
+            &layout,
+            &HashMap::new(),
+            PeWriterConfig::default().image_base,
+            true,
+            true,
+            &mut [],
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("_tls_used"));
+    }
+
+    #[test]
+    fn diagnoses_unterminated_tls_callback_array() {
+        let image_base = PeWriterConfig::default().image_base;
+        let layout = SectionLayout {
+            sections: vec![linker_utils::pe_sections::OutputSection {
+                name: b".CRT".to_vec(),
+                characteristics: readonly_data_characteristics(),
+                rva: 0x1000,
+                virtual_size: 8,
+                file_offset: Some(0),
+                raw_size: 8,
+                contributions: Vec::new(),
+            }],
+            placements: BTreeMap::new(),
+            file_size: 8,
+            size_of_image: 0x2000,
+        };
+        let image = (image_base + 0x1100).to_le_bytes();
+        let error = validate_tls_callbacks(&image, &layout, image_base, 0x1000, true, &[0x1000])
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("not null-terminated"));
     }
 
     #[test]

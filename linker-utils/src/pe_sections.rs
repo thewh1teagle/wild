@@ -178,9 +178,14 @@ pub fn layout_sections(
         group
             .contributions
             .sort_by(|(left_index, left), (right_index, right)| {
-                split_name(&left.name)
-                    .1
-                    .cmp(split_name(&right.name).1)
+                let (_, left_suffix) = split_name(&left.name);
+                let (_, right_suffix) = split_name(&right.name);
+                left_suffix
+                    .cmp(right_suffix)
+                    // An exact base name sorts before a `$` subsection with an
+                    // empty suffix. This distinction is significant for the
+                    // CRT's `.tls` sentinel versus compiler-emitted `.tls$`.
+                    .then_with(|| left.name.contains(&b'$').cmp(&right.name.contains(&b'$')))
                     .then(left_index.cmp(right_index))
             });
         let characteristics = merged_characteristics(&group)?;
@@ -482,18 +487,21 @@ mod tests {
             contribution(2, b".text$a", ContributionKind::Data, 5, 4),
             contribution(3, b".text$a", ContributionKind::Data, 2, 8),
             contribution(4, b".text", ContributionKind::Data, 1, 1),
+            contribution(5, b".text$", ContributionKind::Data, 1, 1),
         ];
         let layout = layout_sections(&inputs, options()).unwrap();
         assert_eq!(
             layout.sections[0].contributions,
             [
                 ContributionId(4),
+                ContributionId(5),
                 ContributionId(2),
                 ContributionId(3),
                 ContributionId(1)
             ]
         );
         assert_eq!(layout.placements[&ContributionId(4)].offset, 0);
+        assert_eq!(layout.placements[&ContributionId(5)].offset, 1);
         assert_eq!(layout.placements[&ContributionId(2)].offset, 4);
         assert_eq!(layout.placements[&ContributionId(3)].offset, 16);
         assert_eq!(layout.placements[&ContributionId(1)].offset, 18);
