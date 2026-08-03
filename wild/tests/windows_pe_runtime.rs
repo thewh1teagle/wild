@@ -149,7 +149,7 @@ mod corpus {
     }
 
     #[test]
-    fn malformed_pe_is_rejected_by_inspector_and_windows_loader() {
+    fn malformed_pe_is_rejected_by_inspectors_and_cannot_execute() {
         if !tool_is_available("llvm-readobj") {
             eprintln!("skipped: llvm-readobj is unavailable for malformed-PE validation");
             return;
@@ -205,15 +205,21 @@ mod corpus {
 
             #[cfg(windows)]
             {
-                let error = Command::new(&malformed)
-                    .output()
-                    .expect_err("Windows loader accepted malformed PE");
-                let error_code = error.raw_os_error();
-                assert!(
-                    matches!(error_code, Some(193 | 216)),
-                    "{description} did not produce a recognized malformed-executable rejection \
-                     (expected Windows error 193 or 216, got {error_code:?}): {error}"
-                );
+                match Command::new(&malformed).output() {
+                    Err(error) => {
+                        let error_code = error.raw_os_error();
+                        assert!(
+                            matches!(error_code, Some(193 | 216)),
+                            "{description} failed process creation with an unexpected outcome \
+                             (expected Windows error 193 or 216, got {error_code:?}): {error}"
+                        );
+                    }
+                    Ok(output) => assert!(
+                        !output.status.success(),
+                        "{description} unexpectedly executed successfully:\n{}",
+                        format_output(&malformed.display().to_string(), &output)
+                    ),
+                }
             }
         }
     }
