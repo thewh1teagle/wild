@@ -142,9 +142,11 @@ enum Block {
 
 /// Parses a complete Microsoft module-definition file.
 pub fn parse_definition_file(input: &str) -> Result<DefinitionFile> {
+    let (input, mut offset) = input
+        .strip_prefix('\u{feff}')
+        .map_or((input, 0), |input| (input, '\u{feff}'.len_utf8()));
     let mut output = DefinitionFile::default();
     let mut block = Block::None;
-    let mut offset = 0;
 
     for (line_index, raw_line) in input.split_inclusive('\n').enumerate() {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
@@ -163,8 +165,8 @@ pub fn parse_definition_file(input: &str) -> Result<DefinitionFile> {
         }
 
         let (word, rest) = take_word(text, location)?;
-        let directive = word.to_ascii_uppercase();
-        if is_directive(&directive) {
+        let directive = word.value.to_ascii_uppercase();
+        if !word.quoted && is_directive(&directive) {
             block = Block::None;
             parse_directive(&mut output, &directive, rest.trim(), location, &mut block)?;
         } else {
@@ -180,7 +182,7 @@ pub fn parse_definition_file(input: &str) -> Result<DefinitionFile> {
                 Block::None => {
                     return Err(DefError::new(
                         location,
-                        format!("unknown module-definition directive `{word}`"),
+                        format!("unknown module-definition directive `{}`", word.value),
                     ));
                 }
             }
@@ -206,7 +208,7 @@ pub fn parse_export_argument(value: &str) -> Result<ExportSpec> {
 /// options. Call this after concatenating all sources.
 pub fn validate_exports(exports: &[ExportSpec]) -> Result<()> {
     let mut names = BTreeMap::<&str, SourceLocation>::new();
-    let mut ordinals = BTreeMap::<u16, (&str, bool, SourceLocation)>::new();
+    let mut ordinals = BTreeMap::<u16, SourceLocation>::new();
     for export in exports {
         if export.name.is_empty() {
             return Err(DefError::new(export.location, "export name is empty"));
@@ -239,19 +241,14 @@ pub fn validate_exports(exports: &[ExportSpec]) -> Result<()> {
                     format!("export `{}` uses reserved ordinal zero", export.name),
                 ));
             }
-            let target = export.target.as_deref().unwrap_or(&export.name);
-            if let Some((previous_target, previous_data, previous)) = ordinals.get(&ordinal) {
-                if *previous_target != target || *previous_data != export.flags.data {
-                    return Err(DefError::new(
-                        export.location,
-                        format!(
-                            "ordinal {ordinal} conflicts with its declaration at {}:{}",
-                            previous.line, previous.column
-                        ),
-                    ));
-                }
-            } else {
-                ordinals.insert(ordinal, (target, export.flags.data, export.location));
+            if let Some(previous) = ordinals.insert(ordinal, export.location) {
+                return Err(DefError::new(
+                    export.location,
+                    format!(
+                        "duplicate export ordinal {ordinal} (first declared at {}:{})",
+                        previous.line, previous.column
+                    ),
+                ));
             }
         }
     }
@@ -276,6 +273,7 @@ fn parse_directive(
             let mut name = None;
             let mut base = None;
             for token in words(rest, location)? {
+                let token = token.value;
                 if token
                     .get(..5)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BASE="))
@@ -399,14 +397,14 @@ fn parse_export(text: &str, location: SourceLocation, origin: ExportOrigin) -> R
     let mut core = String::new();
     let mut tail = Vec::new();
     for word in head_words {
-        if is_export_attribute(&word) || word.starts_with('@') {
-            tail.push(word);
+        if !word.quoted && (is_export_attribute(&word.value) || word.value.starts_with('@')) {
+            tail.push(word.value);
         } else if tail.is_empty() {
-            core.push_str(&word);
+            core.push_str(&word.value);
         } else {
             return Err(DefError::new(
                 location,
-                format!("unexpected export token `{word}`"),
+                format!("unexpected export token `{}`", word.value),
             ));
         }
     }
@@ -484,7 +482,7 @@ fn parse_section(text: &str, location: SourceLocation) -> Result<SectionSpec> {
         .ok_or_else(|| DefError::new(location, "missing section name"))?;
     let mut flags = SectionFlags::default();
     for attribute in attributes {
-        for attribute in attribute.split(',').filter(|item| !item.is_empty()) {
+        for attribute in attribute.value.split(',').filter(|item| !item.is_empty()) {
             match attribute.to_ascii_uppercase().as_str() {
                 "READ" if !flags.read => flags.read = true,
                 "WRITE" if !flags.write => flags.write = true,
@@ -507,7 +505,7 @@ fn parse_section(text: &str, location: SourceLocation) -> Result<SectionSpec> {
         }
     }
     Ok(SectionSpec {
-        name: name.clone(),
+        name: name.value.clone(),
         flags,
         location,
     })
@@ -549,13 +547,8 @@ fn is_export_attribute(word: &str) -> bool {
 
 fn strip_comment(line: &str) -> &str {
     let mut quoted = false;
-    let mut escaped = false;
     for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' && quoted {
-            escaped = true;
-        } else if character == '"' {
+        if character == '"' {
             quoted = !quoted;
         } else if character == ';' && !quoted {
             return &line[..index];
@@ -564,55 +557,62 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn take_word(text: &str, location: SourceLocation) -> Result<(String, &str)> {
+fn take_word(text: &str, location: SourceLocation) -> Result<(Word, &str)> {
     let mut tokens = words_with_ends(text, location)?;
     if tokens.is_empty() {
         return Err(DefError::new(location, "missing token"));
     }
-    let (word, end) = tokens.remove(0);
+    let word = tokens.remove(0);
+    let end = word.end;
     Ok((word, &text[end..]))
 }
 
-fn words(text: &str, location: SourceLocation) -> Result<Vec<String>> {
-    Ok(words_with_ends(text, location)?
-        .into_iter()
-        .map(|(word, _)| word)
-        .collect())
+fn words(text: &str, location: SourceLocation) -> Result<Vec<Word>> {
+    words_with_ends(text, location)
 }
 
-fn words_with_ends(text: &str, location: SourceLocation) -> Result<Vec<(String, usize)>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Word {
+    value: String,
+    end: usize,
+    quoted: bool,
+}
+
+fn words_with_ends(text: &str, location: SourceLocation) -> Result<Vec<Word>> {
     let mut output = Vec::new();
     let mut value = String::new();
     let mut quoted = false;
-    let mut escaped = false;
+    let mut contains_quotes = false;
     let mut active = false;
     for (index, character) in text.char_indices() {
-        if escaped {
-            value.push(character);
-            escaped = false;
-            continue;
-        }
-        if quoted && character == '\\' {
-            escaped = true;
-            active = true;
-        } else if character == '"' {
+        if character == '"' {
             quoted = !quoted;
+            contains_quotes = true;
             active = true;
         } else if character.is_whitespace() && !quoted {
             if active {
-                output.push((std::mem::take(&mut value), index));
+                output.push(Word {
+                    value: std::mem::take(&mut value),
+                    end: index,
+                    quoted: contains_quotes,
+                });
                 active = false;
+                contains_quotes = false;
             }
         } else {
             value.push(character);
             active = true;
         }
     }
-    if quoted || escaped {
+    if quoted {
         return Err(DefError::new(location, "unterminated quoted identifier"));
     }
     if active {
-        output.push((value, text.len()));
+        output.push(Word {
+            value,
+            end: text.len(),
+            quoted: contains_quotes,
+        });
     }
     Ok(output)
 }
@@ -621,15 +621,8 @@ fn split_delimited(text: &str, delimiter: char, location: SourceLocation) -> Res
     let mut output = Vec::new();
     let mut value = String::new();
     let mut quoted = false;
-    let mut escaped = false;
     for character in text.chars() {
-        if escaped {
-            value.push(character);
-            escaped = false;
-        } else if quoted && character == '\\' {
-            value.push(character);
-            escaped = true;
-        } else if character == '"' {
+        if character == '"' {
             quoted = !quoted;
             value.push(character);
         } else if character == delimiter && !quoted {
@@ -639,7 +632,7 @@ fn split_delimited(text: &str, delimiter: char, location: SourceLocation) -> Res
             value.push(character);
         }
     }
-    if quoted || escaped {
+    if quoted {
         return Err(DefError::new(location, "unterminated quoted identifier"));
     }
     output.push(value.trim().to_owned());
@@ -752,13 +745,12 @@ SECTIONS
         let mut exports = parse_definition_file("EXPORTS\n foo @1\n").unwrap().exports;
         exports.push(parse_export_argument("bar,@1").unwrap());
         let error = validate_exports(&exports).unwrap_err();
-        assert!(error.message.contains("ordinal 1 conflicts"));
+        assert!(error.message.contains("duplicate export ordinal 1"));
         assert_eq!(error.location, SourceLocation::command_line());
 
-        let aliases = parse_definition_file("EXPORTS\n foo=target @1\n bar=target @1\n")
-            .unwrap()
-            .exports;
-        validate_exports(&aliases).unwrap();
+        let aliases =
+            parse_definition_file("EXPORTS\n foo=target @1\n bar=target @1\n").unwrap_err();
+        assert!(aliases.message.contains("duplicate export ordinal 1"));
     }
 
     #[test]
@@ -770,5 +762,56 @@ SECTIONS
         assert_eq!(parsed.exports[0].name, "one");
         assert_eq!(parsed.version, Some(VersionSpec { major: 2, minor: 0 }));
         assert_eq!(parsed.heap_size.unwrap().reserve, 32);
+    }
+
+    #[test]
+    fn quoted_keywords_and_ordinal_like_names_remain_identifiers() {
+        let parsed = parse_definition_file(
+            "EXPORTS\n  \"DATA\"\n  \"EXPORTS\"\n  \"NONAME\"\n  \"PRIVATE\"\n  \"@named\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .exports
+                .iter()
+                .map(|export| export.name.as_str())
+                .collect::<Vec<_>>(),
+            ["DATA", "EXPORTS", "NONAME", "PRIVATE", "@named"]
+        );
+    }
+
+    #[test]
+    fn quoted_backslashes_are_literal_and_utf8_bom_is_accepted() {
+        let parsed = parse_definition_file(
+            "\u{feff}LIBRARY \"C:\\build\\example.dll\"\nEXPORTS\n  public=\"C:\\symbols\\target\" DATA\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.image.as_ref().unwrap().name.as_deref(),
+            Some("C:\\build\\example.dll")
+        );
+        assert_eq!(
+            parsed.exports[0].target.as_deref(),
+            Some("C:\\symbols\\target")
+        );
+    }
+
+    #[test]
+    fn parses_rustc_proc_macro_definition_file() {
+        let parsed = parse_definition_file(
+            "LIBRARY\nEXPORTS\n  __rustc_proc_macro_decls_42a2b693c51fe47a__ DATA\n  rust_metadata_example_42a2b693c51fe47a DATA\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.image.as_ref().unwrap().name, None);
+        assert_eq!(parsed.exports.len(), 2);
+        assert!(parsed.exports.iter().all(|export| export.flags.data));
+        assert_eq!(
+            parsed.exports[0].name,
+            "__rustc_proc_macro_decls_42a2b693c51fe47a__"
+        );
+        assert_eq!(
+            parsed.exports[1].name,
+            "rust_metadata_example_42a2b693c51fe47a"
+        );
     }
 }
