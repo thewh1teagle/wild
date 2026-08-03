@@ -6,6 +6,7 @@ use crate::error::{Context, Result};
 use crate::fs::{FileReplacementMode, FileSystem, InputFileData, OutputFileData, OutputOptions};
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
 use linker_utils::pe_exports::{Export, ExportTarget, ResolvedExport};
+use linker_utils::pe_resources::ResourceRecord;
 use linker_utils::pe_sections::{
     ContributionId, ContributionKind, DataDirectoryKind, SectionContribution, SectionLayout,
     SectionLayoutOptions, directory_range_for_section, layout_sections,
@@ -16,6 +17,8 @@ use object::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+const LOAD_CONFIG_SECURITY_COOKIE_OFFSET: u32 = 88;
 
 #[path = "pe_entry.rs"]
 mod pe_entry;
@@ -132,9 +135,20 @@ pub(crate) fn link<F: FileSystem>(
     add_directive_libraries(fs, args, &mut inputs)?;
 
     let mut objects = Vec::new();
+    let mut resources = Vec::new();
     let mut archive_bytes = Vec::new();
     let mut archive_whole = Vec::new();
     for (path, data) in &inputs {
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
+        {
+            resources.extend(
+                linker_utils::pe_resources::parse_res(data.bytes())
+                    .with_context(|| format!("while reading `{}`", path.display()))?,
+            );
+            continue;
+        }
         match object::FileKind::parse(data.bytes())
             .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
         {
@@ -202,6 +216,7 @@ pub(crate) fn link<F: FileSystem>(
         entry_name.as_deref(),
         args,
         PeWriterConfig::from_args(args)?,
+        &resources,
     )?;
     let mut output = fs.create_output(
         args.common.output.clone(),
@@ -416,6 +431,7 @@ fn build_image(
     entry_name: Option<&str>,
     args: &crate::args::coff::CoffArgs,
     config: PeWriterConfig,
+    resources: &[ResourceRecord],
 ) -> Result<BuiltImage> {
     let mut contributions = collect_contributions(objects, args)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
@@ -443,6 +459,43 @@ fn build_image(
         edata_size,
         readonly_data_characteristics(),
     )?;
+    let resource_size = if resources.is_empty() {
+        0
+    } else {
+        linker_utils::pe_resources::build_resource_section(resources, 1)
+            .context("failed to size PE resources")?
+            .bytes
+            .len()
+    };
+    let resource_id = add_synthetic(
+        &mut contributions,
+        b".rsrc",
+        resource_size,
+        readonly_data_characteristics(),
+    )?;
+    let debug_id = add_synthetic(
+        &mut contributions,
+        b".debug",
+        if args.debug {
+            linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE
+                + linker_utils::pe_debug::REPRO_BUILD_ID_SIZE
+        } else {
+            0
+        },
+        debug_characteristics(),
+    )?;
+    let has_security_cookie =
+        has_live_defined_symbol(objects, &contributions, b"__security_cookie")?;
+    let load_config_id = add_synthetic(
+        &mut contributions,
+        b".loadcfg",
+        if has_security_cookie {
+            linker_utils::pe_load_config::IMAGE_LOAD_CONFIG_DIRECTORY64_COMPAT_SIZE as usize
+        } else {
+            0
+        },
+        readonly_data_characteristics(),
+    )?;
 
     let dynamic_base = args.dynamic_base && !args.fixed;
     let mut reloc_id = None;
@@ -450,7 +503,8 @@ fn build_image(
     let mut layout = make_layout(&contributions, config)?;
     if dynamic_base {
         for _ in 0..3 {
-            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            let mut dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            add_load_config_relocation(&mut dir64, load_config_id, &layout)?;
             let next = build_amd64_base_relocation_table(dir64, layout.size_of_image)
                 .context("failed to build PE base relocation table")?;
             if next.is_empty() {
@@ -481,7 +535,8 @@ fn build_image(
             layout = next_layout;
         }
         if let Some(id) = reloc_id {
-            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            let mut dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            add_load_config_relocation(&mut dir64, load_config_id, &layout)?;
             reloc_data = build_amd64_base_relocation_table(dir64, layout.size_of_image)?;
             let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
             contribution.spec.size = reloc_data.len() as u32;
@@ -523,6 +578,22 @@ fn build_image(
             .unwrap()
             .data = emitted_imports.thunks.clone();
     }
+    let resource_directory = if let Some(id) = resource_id {
+        let section = linker_utils::pe_resources::build_resource_section(
+            resources,
+            layout.placements[&id].rva,
+        )
+        .context("failed to build PE resource directory")?;
+        let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
+        ensure!(
+            section.bytes.len() == contribution.data.len(),
+            "PE resource section changed size after layout"
+        );
+        contribution.data.copy_from_slice(&section.bytes);
+        Some((section.data_directory.rva, section.data_directory.size))
+    } else {
+        None
+    };
 
     let (locations, mut definitions) = definitions(
         objects,
@@ -541,6 +612,42 @@ fn build_image(
             .entry(name.clone())
             .or_insert(config.image_base + u64::from(*rva));
     }
+    let load_config_directory = if let Some(id) = load_config_id {
+        let cookie_va = definitions
+            .get(b"__security_cookie".as_slice())
+            .copied()
+            .context("__security_cookie disappeared during PE symbol resolution")?;
+        let cookie_rva = u32::try_from(
+            cookie_va
+                .checked_sub(config.image_base)
+                .context("__security_cookie precedes the image base")?,
+        )
+        .context("__security_cookie RVA exceeds u32")?;
+        let placement = &layout.placements[&id];
+        let encoded = linker_utils::pe_load_config::encode_pe_load_config64(
+            &linker_utils::pe_load_config::PeLoadConfig64 {
+                image_base: config.image_base,
+                directory_rva: placement.rva,
+                size_of_image: layout.size_of_image,
+                security_cookie_rva: Some(cookie_rva),
+                guard_cf_check_function_pointer_rva: None,
+                guard_cf_dispatch_function_pointer_rva: None,
+                guard_cf_function_rvas: Vec::new(),
+                guard_eh_continuation_rvas: Vec::new(),
+                guard_flags: 0,
+            },
+        )
+        .context("failed to build PE load-config directory")?;
+        let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
+        ensure!(
+            encoded.bytes.len() == contribution.data.len(),
+            "PE load-config section changed size after layout"
+        );
+        contribution.data.copy_from_slice(&encoded.bytes);
+        Some((encoded.data_directory_rva, encoded.data_directory_size))
+    } else {
+        None
+    };
     let entry_rva = match entry_name {
         Some(name) => {
             let va = definitions
@@ -619,6 +726,24 @@ fn build_image(
         config.image_base,
         &mut image,
     )?;
+    let exception_directory = canonicalize_exception_directory(&mut image, &layout, args)?;
+    let debug_directory = if let Some(id) = debug_id {
+        let placement = &layout.placements[&id];
+        let file_offset = placement
+            .file_offset
+            .context("synthetic debug directory has no file contents")?;
+        let encoded = linker_utils::pe_debug::encode_debug_directory(
+            &[linker_utils::pe_debug::DebugRecord::Repro { build_id: [0; 32] }],
+            placement.rva,
+            file_offset,
+        )
+        .context("failed to create reproducible PE debug directory")?;
+        let start = usize::try_from(file_offset).context("debug file offset exceeds usize")?;
+        image[start..start + encoded.bytes.len()].copy_from_slice(&encoded.bytes);
+        Some((placement.rva, encoded.directory_size))
+    } else {
+        None
+    };
     write_headers(
         &mut image,
         &layout,
@@ -632,11 +757,131 @@ fn build_image(
         export_directory
             .as_ref()
             .map(|directory| (directory.rva, directory.size)),
+        resource_directory,
+        exception_directory,
+        None,
+        debug_directory,
+        load_config_directory,
     );
+    if let Some(id) = debug_id {
+        let placement = &layout.placements[&id];
+        let file_offset = placement.file_offset.unwrap();
+        let start = usize::try_from(file_offset).context("debug file offset exceeds usize")?;
+        let payload_start = start + linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE;
+        let payload_end = payload_start + linker_utils::pe_debug::REPRO_BUILD_ID_SIZE;
+        let excluded_build_id = payload_start..payload_end;
+        let build_id = linker_utils::pe_debug::stable_build_id(
+            &image,
+            Some(0x80 + 4 + 20 + 64),
+            std::slice::from_ref(&excluded_build_id),
+        )
+        .context("failed to compute reproducible PE build id")?;
+        let encoded = linker_utils::pe_debug::encode_debug_directory(
+            &[linker_utils::pe_debug::DebugRecord::Repro { build_id }],
+            placement.rva,
+            file_offset,
+        )?;
+        image[start..start + encoded.bytes.len()].copy_from_slice(&encoded.bytes);
+    }
     Ok(BuiltImage {
         bytes: image,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
     })
+}
+
+fn canonicalize_exception_directory(
+    image: &mut [u8],
+    layout: &SectionLayout,
+    args: &crate::args::coff::CoffArgs,
+) -> Result<Option<(u32, u32)>> {
+    let Some(pdata) = layout
+        .sections
+        .iter()
+        .find(|section| section.name == b".pdata")
+    else {
+        return Ok(None);
+    };
+    let canonical_pdata_name = merged_name(b".pdata", args)?;
+    ensure!(
+        canonical_pdata_name == b".pdata",
+        "/MERGE of .pdata is not yet supported because the exception directory requires an exact range"
+    );
+    let xdata_name = merged_name(b".xdata", args)?;
+    let xdata_base = xdata_name
+        .split(|byte| *byte == b'$')
+        .next()
+        .unwrap_or(&xdata_name);
+    let xdata = layout
+        .sections
+        .iter()
+        .find(|section| section.name == xdata_base)
+        .context(".pdata is present but its merged .xdata output section is missing")?;
+    let pdata_file = pdata
+        .file_offset
+        .context(".pdata unexpectedly has no file contents")? as usize;
+    let pdata_size = usize::try_from(pdata.virtual_size).context(".pdata size exceeds usize")?;
+    let xdata_file = xdata
+        .file_offset
+        .context(".xdata unexpectedly has no file contents")? as usize;
+    let xdata_size = usize::try_from(xdata.virtual_size).context(".xdata size exceeds usize")?;
+    let pdata_bytes = image
+        .get(pdata_file..pdata_file + pdata_size)
+        .context(".pdata lies outside the PE file")?
+        .to_vec();
+    let xdata_bytes = image
+        .get(xdata_file..xdata_file + xdata_size)
+        .context(".xdata lies outside the PE file")?;
+    let table = linker_utils::pe_unwind::build_amd64_exception_table(
+        &pdata_bytes,
+        pdata.rva,
+        xdata_bytes,
+        xdata.rva,
+        layout.size_of_image,
+    )
+    .context("invalid AMD64 exception metadata")?;
+    let output = image
+        .get_mut(pdata_file..pdata_file + pdata_size)
+        .context(".pdata lies outside the PE file")?;
+    output.fill(0);
+    output[..table.pdata.len()].copy_from_slice(&table.pdata);
+    Ok(Some((table.directory.rva, table.directory.size)))
+}
+
+fn has_live_defined_symbol(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    name: &[u8],
+) -> Result<bool> {
+    let locations = source_locations(contributions);
+    for (object_index, object) in objects.iter().enumerate() {
+        for symbol in object.file().symbols() {
+            if symbol.name_bytes()? == name
+                && (symbol.is_common()
+                    || symbol
+                        .section_index()
+                        .is_some_and(|section| locations.contains_key(&(object_index, section))))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn add_load_config_relocation(
+    rvas: &mut Vec<u32>,
+    load_config_id: Option<ContributionId>,
+    layout: &SectionLayout,
+) -> Result<()> {
+    if let Some(id) = load_config_id {
+        rvas.push(
+            layout.placements[&id]
+                .rva
+                .checked_add(LOAD_CONFIG_SECURITY_COOKIE_OFFSET)
+                .context("load-config relocation RVA overflow")?,
+        );
+    }
+    Ok(())
 }
 
 fn estimated_export_size(
@@ -716,12 +961,14 @@ fn collect_contributions(
     let discarded_comdats = discarded_comdat_sections(objects)?;
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
+            let raw_name = section.name_bytes().context("invalid COFF section name")?;
             let flags = match section.flags() {
                 SectionFlags::Coff { characteristics } => characteristics.0,
                 _ => 0,
             };
             let class = linker_utils::coff_symbols::classify_section(flags)
                 .context("invalid COFF section flags")?;
+            reject_unsupported_metadata_section(raw_name)?;
             if class.discardable
                 || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
                 || matches!(
@@ -734,7 +981,6 @@ fn collect_contributions(
             if discarded_comdats.contains(&(object_index, section.index())) {
                 continue;
             }
-            let raw_name = section.name_bytes().context("invalid COFF section name")?;
             let name = merged_name(raw_name, args)?;
             let size = u32::try_from(section.size()).context("COFF section too large")?;
             if size == 0 {
@@ -776,6 +1022,31 @@ fn collect_contributions(
         }
     }
     Ok(output)
+}
+
+fn reject_unsupported_metadata_section(name: &[u8]) -> Result<()> {
+    if name == b".tls" || name.starts_with(b".tls$") {
+        return Err(error!(
+            "TLS input section `{}` is not yet supported: emitting the TLS directory requires resolver-owned synthetic symbols",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    if name.starts_with(b".CRT$XL") {
+        return Err(error!(
+            "TLS callback section `{}` is not yet supported: callback targets must be resolved before PE TLS emission",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    if [b".gfids".as_slice(), b".giats", b".gljmp", b".gehcont"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return Err(error!(
+            "Guard metadata section `{}` is not yet supported; refusing to emit an incomplete load-config directory",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1261,6 +1532,11 @@ fn write_headers(
     iat_directory: Option<(u32, u32)>,
     has_relocs: bool,
     export_directory: Option<(u32, u32)>,
+    resource_directory: Option<(u32, u32)>,
+    exception_directory: Option<(u32, u32)>,
+    tls_directory: Option<(u32, u32)>,
+    debug_directory: Option<(u32, u32)>,
+    load_config_directory: Option<(u32, u32)>,
 ) {
     image[..2].copy_from_slice(b"MZ");
     put_u32(image, 0x3c, 0x80);
@@ -1385,13 +1661,32 @@ fn write_headers(
         put_u32(image, opt + 120, rva);
         put_u32(image, opt + 124, size);
     }
-    set_directory_from_section(image, opt + 136, layout, DataDirectoryKind::Exception);
+    if let Some((rva, size)) = resource_directory {
+        put_u32(image, opt + 128, rva);
+        put_u32(image, opt + 132, size);
+    }
+    if let Some((rva, size)) = exception_directory {
+        put_u32(image, opt + 136, rva);
+        put_u32(image, opt + 140, size);
+    }
     if has_relocs {
         set_directory_from_section(image, opt + 152, layout, DataDirectoryKind::BaseRelocation);
     }
     if let Some((rva, size)) = iat_directory {
         put_u32(image, opt + 208, rva);
         put_u32(image, opt + 212, size);
+    }
+    if let Some((rva, size)) = tls_directory {
+        put_u32(image, opt + 184, rva);
+        put_u32(image, opt + 188, size);
+    }
+    if let Some((rva, size)) = debug_directory {
+        put_u32(image, opt + 160, rva);
+        put_u32(image, opt + 164, size);
+    }
+    if let Some((rva, size)) = load_config_directory {
+        put_u32(image, opt + 200, rva);
+        put_u32(image, opt + 204, size);
     }
     let table = opt + 240;
     for (index, section) in layout.sections.iter().enumerate() {
@@ -1498,6 +1793,12 @@ fn reloc_characteristics() -> u32 {
         | object::pe::IMAGE_SCN_MEM_DISCARDABLE)
         .0
 }
+fn debug_characteristics() -> u32 {
+    (object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+        | object::pe::IMAGE_SCN_MEM_READ
+        | object::pe::IMAGE_SCN_MEM_DISCARDABLE)
+        .0
+}
 fn align_plain(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -1554,6 +1855,27 @@ mod tests {
             );
             object.append_section_data(section, directives, 1);
         }
+        object.write().unwrap()
+    }
+
+    fn security_cookie_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        object.append_section_data(data, &0x2b99_2ddf_a232u64.to_le_bytes(), 8);
+        object.add_symbol(Symbol {
+            name: b"__security_cookie".to_vec(),
+            value: 0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(data),
+            flags: object::SymbolFlags::None,
+        });
         object.write().unwrap()
     }
 
@@ -1628,6 +1950,7 @@ mod tests {
             None,
             &args,
             PeWriterConfig::default(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1661,5 +1984,178 @@ mod tests {
         assert!(!exports[0].data);
         assert_eq!(exports[1].name, "value");
         assert!(exports[1].data);
+    }
+
+    #[test]
+    fn emits_resources_and_repro_debug_directory_deterministically() {
+        use linker_utils::pe_resources::{ResourceId, ResourceRecord};
+
+        let args = crate::args::coff::CoffArgs {
+            debug: true,
+            ..Default::default()
+        };
+        let resources = [ResourceRecord {
+            resource_type: ResourceId::Id(24),
+            name: ResourceId::Id(1),
+            language: 0x409,
+            data_version: 0,
+            memory_flags: 0x1030,
+            version: 0,
+            characteristics: 0,
+            data: b"<assembly/>".to_vec(),
+        }];
+        let build = || {
+            build_image(
+                &[],
+                &[],
+                &[],
+                b"metadata.exe",
+                None,
+                &args,
+                PeWriterConfig::default(),
+                &resources,
+            )
+            .unwrap()
+            .bytes
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first, second);
+        assert_ne!(
+            u32::from_le_bytes(first[0x118..0x11c].try_into().unwrap()),
+            0
+        );
+        assert_ne!(
+            u32::from_le_bytes(first[0x11c..0x120].try_into().unwrap()),
+            0
+        );
+        assert_ne!(
+            u32::from_le_bytes(first[0x138..0x13c].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(first[0x13c..0x140].try_into().unwrap()),
+            linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE as u32
+        );
+        let file = object::File::parse(first.as_slice()).unwrap();
+        let debug = file.section_by_name(".debug").unwrap();
+        let (offset, _) = debug.file_range().unwrap();
+        let records = linker_utils::pe_debug::parse_debug_directory(
+            &first,
+            offset as usize,
+            linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE,
+        )
+        .unwrap();
+        assert!(matches!(
+            records.as_slice(),
+            [linker_utils::pe_debug::DebugRecord::Repro { .. }]
+        ));
+    }
+
+    #[test]
+    fn rejects_tls_and_guard_metadata_until_resolver_support_exists() {
+        assert!(
+            reject_unsupported_metadata_section(b".tls$AAA")
+                .unwrap_err()
+                .to_string()
+                .contains("TLS input section")
+        );
+        assert!(
+            reject_unsupported_metadata_section(b".CRT$XLB")
+                .unwrap_err()
+                .to_string()
+                .contains("TLS callback")
+        );
+        assert!(
+            reject_unsupported_metadata_section(b".gfids$y")
+                .unwrap_err()
+                .to_string()
+                .contains("Guard metadata")
+        );
+    }
+
+    #[test]
+    fn emits_security_cookie_load_config_and_relocation() {
+        let bytes = security_cookie_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"cookie.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+        )
+        .unwrap()
+        .bytes;
+        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
+        assert_ne!(directory_rva, 0);
+        assert_eq!(
+            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            linker_utils::pe_load_config::IMAGE_LOAD_CONFIG_DIRECTORY64_COMPAT_SIZE
+        );
+        assert_ne!(
+            u32::from_le_bytes(image[0x130..0x134].try_into().unwrap()),
+            0
+        );
+        let file = object::File::parse(image.as_slice()).unwrap();
+        let section = file.section_by_name(".loadcfg").unwrap();
+        let parsed = linker_utils::pe_load_config::parse_pe_load_config64(
+            section.data().unwrap(),
+            directory_rva,
+            PeWriterConfig::default().image_base,
+            u32::from_le_bytes(image[0xd0..0xd4].try_into().unwrap()),
+        )
+        .unwrap();
+        assert!(parsed.security_cookie_rva.is_some());
+    }
+
+    #[test]
+    fn validates_and_publishes_exact_exception_directory() {
+        use linker_utils::pe_sections::{OutputSection, SectionLayout};
+
+        let mut image = vec![0; 0x600];
+        image[0x200..0x204].copy_from_slice(&[1, 0, 0, 0]);
+        let pdata = [0x1000u32, 0x1010, 0x2000]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        image[0x400..0x40c].copy_from_slice(&pdata);
+        let layout = SectionLayout {
+            sections: vec![
+                OutputSection {
+                    name: b".rdata".to_vec(),
+                    characteristics: readonly_data_characteristics(),
+                    rva: 0x2000,
+                    virtual_size: 4,
+                    file_offset: Some(0x200),
+                    raw_size: 0x200,
+                    contributions: Vec::new(),
+                },
+                OutputSection {
+                    name: b".pdata".to_vec(),
+                    characteristics: readonly_data_characteristics(),
+                    rva: 0x3000,
+                    virtual_size: 12,
+                    file_offset: Some(0x400),
+                    raw_size: 0x200,
+                    contributions: Vec::new(),
+                },
+            ],
+            placements: BTreeMap::new(),
+            file_size: 0x600,
+            size_of_image: 0x4000,
+        };
+        assert_eq!(
+            canonicalize_exception_directory(
+                &mut image,
+                &layout,
+                &crate::args::coff::CoffArgs::default()
+            )
+            .unwrap(),
+            Some((0x3000, 12))
+        );
     }
 }
