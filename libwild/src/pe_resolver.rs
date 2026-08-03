@@ -5,6 +5,8 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
+use foldhash::HashSet;
+use foldhash::HashSetExt;
 use linker_utils::coff_archives::CoffArchive;
 use linker_utils::coff_archives::CoffArchiveMember;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
@@ -18,7 +20,6 @@ use object::Object;
 use object::ObjectSymbol;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::sync::OnceLock;
 
 #[cfg(test)]
@@ -42,8 +43,12 @@ impl IncrementalSymbolState {
     }
 
     fn add_roots(&mut self, roots: &[Vec<u8>]) {
-        self.unresolved.extend(roots.iter().cloned());
-        self.unresolved.retain(|name| !self.defined.contains(name));
+        for root in roots {
+            if !self.defined.contains(root.as_slice()) && !self.unresolved.contains(root.as_slice())
+            {
+                self.unresolved.insert(root.clone());
+            }
+        }
     }
 
     fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>, index: usize) -> Result<()> {
@@ -58,12 +63,16 @@ impl IncrementalSymbolState {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
-                self.unresolved.insert(name.to_vec());
+                if !self.defined.contains(name) && !self.unresolved.contains(name) {
+                    self.unresolved.insert(name.to_vec());
+                }
             } else if symbol.is_definition() || symbol.is_common() {
-                self.defined.insert(name.to_vec());
+                if !self.defined.contains(name) {
+                    self.defined.insert(name.to_vec());
+                }
+                self.unresolved.remove(name);
             }
         }
-        self.unresolved.retain(|name| !self.defined.contains(name));
         Ok(())
     }
 
