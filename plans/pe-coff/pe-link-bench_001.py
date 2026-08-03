@@ -22,6 +22,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 SCHEMA_VERSION = 1
 AMD64_MACHINE = 0x8664
@@ -44,6 +45,15 @@ class Sample:
     elapsed_seconds: float
     user_seconds: float
     system_seconds: float
+
+
+@dataclass(frozen=True)
+class ThreadPair:
+    wild: int
+    lld_link: int
+
+    def metadata(self) -> dict[str, int]:
+        return {"wild": self.wild, "lld-link": self.lld_link}
 
 
 def log(message: str) -> None:
@@ -147,6 +157,19 @@ def parse_cpu_list(value: str) -> tuple[int, ...]:
     return tuple(sorted(cpus))
 
 
+def parse_thread_pair(value: str) -> ThreadPair:
+    try:
+        wild_text, lld_text = value.split(":")
+        wild, lld_link = int(wild_text), int(lld_text)
+        if wild <= 0 or lld_link <= 0:
+            raise ValueError
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid thread pair {value!r}; expected positive WILD:LLD counts"
+        ) from error
+    return ThreadPair(wild=wild, lld_link=lld_link)
+
+
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     if len(ordered) == 1:
@@ -170,6 +193,21 @@ def summarize(values: list[float]) -> dict[str, float | int]:
         "median": median,
         "mad": statistics.median(deviations),
         "p95": percentile(values, 0.95),
+    }
+
+
+def paired_comparison(wild_samples: list[Sample], lld_samples: list[Sample]) -> dict[str, Any]:
+    paired_deltas = [
+        wild.elapsed_seconds - lld.elapsed_seconds
+        for wild, lld in zip(wild_samples, lld_samples, strict=True)
+    ]
+    paired_summary = summarize(paired_deltas)
+    paired_summary["raw_samples"] = paired_deltas
+    return {
+        "delta_definition": "wild elapsed seconds minus lld-link elapsed seconds",
+        "wild_minus_lld_seconds": paired_summary,
+        "wild_faster_pairs": sum(delta < 0 for delta in paired_deltas),
+        "pair_count": len(paired_deltas),
     }
 
 
@@ -341,11 +379,22 @@ def benchmark_configuration(
     gnu_time: Path | None,
     timeout: float,
     rng: random.Random,
+    thread_pair: ThreadPair | None = None,
 ) -> dict[str, Any]:
     samples: dict[str, list[Sample]] = {tool.name: [] for tool in tools}
     execution_order: list[list[str]] = []
+    if thread_pair is None:
+        tool_threads = {tool.name: threads for tool in tools}
+        configuration_label = f"threads={threads}"
+        output_label = str(threads)
+    else:
+        tool_threads = {"wild": thread_pair.wild, "lld-link": thread_pair.lld_link}
+        configuration_label = (
+            f"wild_threads={thread_pair.wild},lld_threads={thread_pair.lld_link}"
+        )
+        output_label = f"wild-{thread_pair.wild}-lld-{thread_pair.lld_link}"
     outputs = {
-        tool.name: work / f"sample-{mode}-{threads}-{tool.name}.exe" for tool in tools
+        tool.name: work / f"sample-{mode}-{output_label}-{tool.name}.exe" for tool in tools
     }
     eviction: dict[str, int] | None = None
 
@@ -356,10 +405,12 @@ def benchmark_configuration(
         output = outputs[tool.name]
         unlink_output(output)
         sample = run_sample(
-            command_for(tool, response, output, threads, taskset, cpu_list),
+            command_for(
+                tool, response, output, tool_threads[tool.name], taskset, cpu_list
+            ),
             response.parent,
             timeout,
-            f"{tool.name} {mode} threads={threads}",
+            f"{tool.name} {mode} {configuration_label}",
         )
         if measured:
             samples[tool.name].append(sample)
@@ -381,7 +432,7 @@ def benchmark_configuration(
         if any(len(values) >= max_samples for values in samples.values()):
             raise BenchError(
                 f"max samples ({max_samples}) reached before min accumulated seconds "
-                f"({min_seconds}) for {mode}, threads={threads}"
+                f"({min_seconds}) for {mode}, {configuration_label}"
             )
         order = tools.copy()
         rng.shuffle(order)
@@ -389,12 +440,12 @@ def benchmark_configuration(
         for tool in order:
             invoke(tool, True)
 
-    result: dict[str, Any] = {
-        "mode": mode,
-        "threads": threads,
-        "execution_order": execution_order,
-        "tools": {},
-    }
+    result: dict[str, Any] = {"mode": mode, "execution_order": execution_order, "tools": {}}
+    if thread_pair is None:
+        result["threads"] = threads
+    else:
+        result["configuration"] = "direct-thread-pair"
+        result["thread_pair"] = thread_pair.metadata()
     if eviction is not None:
         result["cache_advice"] = {
             **eviction,
@@ -420,9 +471,14 @@ def benchmark_configuration(
             for index in range(rss_samples):
                 if mode == "cold-input-cache":
                     eviction = evict_input_cache(cache_paths)
-                output = work / f"rss-{mode}-{threads}-{tool.name}-{index}.exe"
+                output = work / f"rss-{mode}-{output_label}-{tool.name}-{index}.exe"
                 command = command_for(
-                    tool, response, output, threads, taskset, cpu_list
+                    tool,
+                    response,
+                    output,
+                    tool_threads[tool.name],
+                    taskset,
+                    cpu_list,
                 )
                 rss_values.append(
                     gnu_time_rss(gnu_time, command, response.parent, output, timeout)
@@ -432,9 +488,15 @@ def benchmark_configuration(
             )
             tool_result["maximum_rss_kib"]["raw_samples"] = rss_values
         result["tools"][tool.name] = tool_result
+        if thread_pair is not None:
+            tool_result["threads"] = tool_threads[tool.name]
     wild_median = result["tools"]["wild"]["elapsed_seconds"]["median"]
     lld_median = result["tools"]["lld-link"]["elapsed_seconds"]["median"]
     result["wild_over_lld_median_ratio"] = wild_median / lld_median
+    if thread_pair is not None:
+        result["paired_comparison"] = paired_comparison(
+            samples["wild"], samples["lld-link"]
+        )
     return result
 
 
@@ -444,11 +506,16 @@ def thread_scaling(configurations: list[dict[str, Any]]) -> dict[str, Any]:
         by_threads = {
             configuration["threads"]: configuration
             for configuration in configurations
-            if configuration["mode"] == mode
+            if configuration["mode"] == mode and "threads" in configuration
         }
         baseline = by_threads.get(1)
         if baseline is None:
-            scaling[mode] = {"available": False, "reason": "threads=1 was not measured"}
+            reason = (
+                "direct thread-pair confirmation does not measure thread scaling"
+                if not by_threads
+                else "threads=1 was not measured"
+            )
+            scaling[mode] = {"available": False, "reason": reason}
             continue
         tools: dict[str, Any] = {}
         for tool in ("wild", "lld-link"):
@@ -521,46 +588,102 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         },
         "configurations": [],
     }
+    if args.thread_pair:
+        report["settings"]["thread_pairs"] = [
+            thread_pair.metadata() for thread_pair in args.thread_pair
+        ]
     with tempfile.TemporaryDirectory(prefix="wild-pe-link-bench-") as directory:
         work = Path(directory)
         for mode in args.mode:
-            for threads in args.threads:
-                log(f"benchmarking mode={mode}, threads={threads}")
-                report["configurations"].append(
-                    benchmark_configuration(
-                        tools,
-                        response,
-                        work,
-                        mode,
-                        threads,
-                        cache_paths,
-                        taskset,
-                        args.cpu_list,
-                        args.warmups,
-                        args.min_samples,
-                        args.min_seconds,
-                        args.max_samples,
-                        args.rss_samples,
-                        gnu_time,
-                        args.timeout,
-                        rng,
+            if args.thread_pair:
+                for thread_pair in args.thread_pair:
+                    log(
+                        f"benchmarking mode={mode}, wild_threads={thread_pair.wild}, "
+                        f"lld_threads={thread_pair.lld_link}"
                     )
-                )
+                    report["configurations"].append(
+                        benchmark_configuration(
+                            tools,
+                            response,
+                            work,
+                            mode,
+                            thread_pair.wild,
+                            cache_paths,
+                            taskset,
+                            args.cpu_list,
+                            args.warmups,
+                            args.min_samples,
+                            args.min_seconds,
+                            args.max_samples,
+                            args.rss_samples,
+                            gnu_time,
+                            args.timeout,
+                            rng,
+                            thread_pair,
+                        )
+                    )
+            else:
+                for threads in args.threads:
+                    log(f"benchmarking mode={mode}, threads={threads}")
+                    report["configurations"].append(
+                        benchmark_configuration(
+                            tools,
+                            response,
+                            work,
+                            mode,
+                            threads,
+                            cache_paths,
+                            taskset,
+                            args.cpu_list,
+                            args.warmups,
+                            args.min_samples,
+                            args.min_seconds,
+                            args.max_samples,
+                            args.rss_samples,
+                            gnu_time,
+                            args.timeout,
+                            rng,
+                        )
+                    )
         report["thread_scaling"] = thread_scaling(report["configurations"])
         validations: dict[str, Any] = {}
-        for threads in args.threads:
-            validations[str(threads)] = {
-                tool.name: validate_outputs(
-                    tool,
-                    response,
-                    work,
-                    threads,
-                    taskset,
-                    args.cpu_list,
-                    args.timeout,
-                )
-                for tool in tools
-            }
+        if args.thread_pair:
+            for thread_pair in args.thread_pair:
+                key = f"wild-{thread_pair.wild}-lld-{thread_pair.lld_link}"
+                validations[key] = {
+                    "configuration": "direct-thread-pair",
+                    "thread_pair": thread_pair.metadata(),
+                    "tools": {},
+                }
+                for tool in tools:
+                    threads = (
+                        thread_pair.wild if tool.name == "wild" else thread_pair.lld_link
+                    )
+                    validation = validate_outputs(
+                        tool,
+                        response,
+                        work,
+                        threads,
+                        taskset,
+                        args.cpu_list,
+                        args.timeout,
+                    )
+                    validation["threads"] = threads
+                    validations[key]["tools"][tool.name] = validation
+        else:
+            for threads in args.threads:
+                validations[str(threads)] = {
+                    tool.name: validate_outputs(
+                        tool,
+                        response,
+                        work,
+                        threads,
+                        taskset,
+                        args.cpu_list,
+                        args.timeout,
+                    )
+                    for tool in tools
+                }
         report["validation"] = validations
     report["status"] = "pass"
     return report
@@ -611,11 +734,20 @@ def parser() -> argparse.ArgumentParser:
         choices=("warm", "cold-input-cache"),
         help="repeatable; defaults to warm and cold-input-cache",
     )
-    result.add_argument(
+    thread_selection = result.add_mutually_exclusive_group()
+    thread_selection.add_argument(
         "--threads",
         type=lambda value: [positive_int(item) for item in value.split(",")],
-        default=[1, 2, 4, 8],
         help="comma-separated thread counts",
+    )
+    thread_selection.add_argument(
+        "--thread-pair",
+        action="append",
+        type=parse_thread_pair,
+        help=(
+            "repeatable direct comparison as WILD:LLD thread counts; use after a sweep "
+            "when the linkers have different independently optimal counts"
+        ),
     )
     result.add_argument(
         "--cpu-list", type=lambda value: ",".join(map(str, parse_cpu_list(value)))
@@ -654,10 +786,78 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(summary["mad"], 1.0)
         self.assertEqual(summary["min"], 1.0)
 
+    def test_paired_comparison(self) -> None:
+        wild = [Sample(1.0, 0.0, 0.0), Sample(3.0, 0.0, 0.0)]
+        lld = [Sample(2.0, 0.0, 0.0), Sample(2.5, 0.0, 0.0)]
+        comparison = paired_comparison(wild, lld)
+        self.assertEqual(comparison["pair_count"], 2)
+        self.assertEqual(comparison["wild_faster_pairs"], 1)
+        self.assertEqual(
+            comparison["wild_minus_lld_seconds"]["raw_samples"], [-1.0, 0.5]
+        )
+
     def test_cpu_list(self) -> None:
         self.assertEqual(parse_cpu_list("1-3,5"), (1, 2, 3, 5))
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_cpu_list("3-1")
+
+    def test_thread_pair(self) -> None:
+        self.assertEqual(parse_thread_pair("10:1"), ThreadPair(wild=10, lld_link=1))
+        for invalid in ("10", "1:2:3", "0:1", "1:-2", "wild:1"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    parse_thread_pair(invalid)
+
+    def test_thread_pair_cli_is_mutually_exclusive_with_sweep(self) -> None:
+        parsed = parser().parse_args(["--thread-pair", "10:1"])
+        self.assertEqual(parsed.thread_pair, [ThreadPair(wild=10, lld_link=1)])
+        self.assertIsNone(parsed.threads)
+
+    def test_direct_pair_passes_distinct_threads_and_records_them(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run_sample(
+            command: list[str], cwd: Path, timeout: float, label: str
+        ) -> Sample:
+            del cwd, timeout, label
+            commands.append(command)
+            elapsed = 1.0 if command[0] == "/bin/wild" else 2.0
+            return Sample(elapsed, 0.0, 0.0)
+
+        tools = [
+            Tool("wild", Path("/bin/wild"), ("-flavor", "link")),
+            Tool("lld-link", Path("/bin/lld-link"), ()),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch(f"{__name__}.run_sample", side_effect=fake_run_sample):
+                result = benchmark_configuration(
+                    tools=tools,
+                    response=Path(directory) / "response.txt",
+                    work=Path(directory),
+                    mode="warm",
+                    threads=10,
+                    cache_paths=[],
+                    taskset=None,
+                    cpu_list=None,
+                    warmups=0,
+                    min_samples=2,
+                    min_seconds=0.0,
+                    max_samples=2,
+                    rss_samples=0,
+                    gnu_time=None,
+                    timeout=1.0,
+                    rng=random.Random(1),
+                    thread_pair=ThreadPair(wild=10, lld_link=1),
+                )
+
+        wild_commands = [command for command in commands if command[0] == "/bin/wild"]
+        lld_commands = [command for command in commands if command[0] == "/bin/lld-link"]
+        self.assertTrue(all("/threads:10" in command for command in wild_commands))
+        self.assertTrue(all("/threads:1" in command for command in lld_commands))
+        self.assertEqual(result["thread_pair"], {"wild": 10, "lld-link": 1})
+        self.assertEqual(result["tools"]["wild"]["threads"], 10)
+        self.assertEqual(result["tools"]["lld-link"]["threads"], 1)
+        self.assertEqual(result["paired_comparison"]["pair_count"], 2)
 
     def test_pe_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -704,6 +904,18 @@ class HarnessTests(unittest.TestCase):
             2.0,
         )
 
+    def test_direct_pair_does_not_claim_thread_scaling(self) -> None:
+        scaling = thread_scaling(
+            [{"mode": "warm", "configuration": "direct-thread-pair"}]
+        )
+        self.assertEqual(
+            scaling["warm"],
+            {
+                "available": False,
+                "reason": "direct thread-pair confirmation does not measure thread scaling",
+            },
+        )
+
 
 def main() -> int:
     args = parser().parse_args()
@@ -716,10 +928,14 @@ def main() -> int:
         parser().error("--corpus is required unless --self-test is used")
     if args.mode is None:
         args.mode = ["warm", "cold-input-cache"]
+    if args.threads is None:
+        args.threads = [] if args.thread_pair else [1, 2, 4, 8]
     if len(set(args.mode)) != len(args.mode):
         parser().error("--mode values must be unique")
     if len(set(args.threads)) != len(args.threads):
         parser().error("--threads values must be unique")
+    if args.thread_pair and len(set(args.thread_pair)) != len(args.thread_pair):
+        parser().error("--thread-pair values must be unique")
     if args.max_samples < args.min_samples:
         parser().error("--max-samples must be at least --min-samples")
     destination = args.output.expanduser().resolve() if args.output else None

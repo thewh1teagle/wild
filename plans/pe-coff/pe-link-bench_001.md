@@ -3,7 +3,9 @@
 `pe-link-bench_001.py` replays an extracted `lld-link /reproduce` corpus through
 release builds of Wild and `lld-link`. Compilation and corpus preparation are
 never part of a timed sample. Both linkers receive the response file captured by
-lld, followed only by their output path and the same `/threads:N` value.
+lld, followed only by their output path and the requested `/threads:N` value.
+Ordinary sweeps pass the same value to both linkers; the optional direct-pair
+confirmation described below can pass independently selected values.
 
 ## Prepare a corpus
 
@@ -51,6 +53,34 @@ order, and all settings.
 Use a stable machine with other load minimized. CPU affinity is optional, but
 recommended. On heterogeneous CPUs, choose a homogeneous CPU set for the main
 comparison and report any all-core result separately.
+
+## Direct best-vs-best confirmation
+
+First run a complete `--threads` sweep and independently select each linker's
+lowest-median configuration. If those thread counts differ, confirm that direct
+best-vs-best comparison without wrappers by replacing `--threads` with one or
+more repeatable `--thread-pair WILD:LLD` values:
+
+```console
+uv run plans/pe-coff/pe-link-bench_001.py \
+  --corpus /tmp/vibe-repro/repro \
+  --wild target/release/wild \
+  --lld-link /usr/lib/llvm-18/bin/lld-link \
+  --mode warm \
+  --thread-pair 10:1 \
+  --cpu-list 5-9,15-19 \
+  --output /tmp/pe-link-best-vs-best.json
+```
+
+`--thread-pair` is mutually exclusive with `--threads`; its left side is
+Wild's count and its right side is `lld-link`'s. Each randomized block still
+runs each tool exactly once. The configuration JSON records
+`configuration: direct-thread-pair`, the two counts at both configuration and
+tool level, raw samples, execution order, median ratio, paired Wild-minus-lld
+deltas, paired-win count, RSS, and per-tool validation using the selected
+count. Tool and corpus provenance is unchanged. This confirmation does not
+measure thread scaling and should not replace the full sweep used to select
+the two configurations.
 
 ## Cache modes
 
