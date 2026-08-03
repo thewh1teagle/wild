@@ -1,0 +1,14 @@
+[package]
+name = "wild-pe-tauri-acceptance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
+
+[workspace]
+resolver = "2"
