@@ -215,6 +215,44 @@ jobs:
           "VIBE_LINK_REPRO=$($candidate.FullName)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Replay Vibe link with lld-link
+        shell: pwsh
+        working-directory: vibe-source
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          if (-not $env:VIBE_LINK_REPRO -or -not (Test-Path $env:VIBE_LINK_REPRO)) {
+            throw "The successful Wild build did not produce a Vibe link replay"
+          }
+
+          $runWith = Join-Path $env:VIBE_LINK_REPRO 'run-with'
+          $bash = (Get-Command bash.exe -ErrorAction Stop).Source
+          $lld = (Get-Command lld-link.exe -ErrorAction Stop).Source
+          $lldDirectory = Join-Path $env:RUNNER_TEMP "vibe-lld-$env:VIBE_PROFILE"
+          New-Item -ItemType Directory -Force $lldDirectory | Out-Null
+          "VIBE_LLD_DIRECTORY=$lldDirectory" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $lldExecutable = Join-Path $lldDirectory 'vibe.exe'
+          $lldPdb = Join-Path $lldDirectory 'vibe.pdb'
+          $replayLog = Join-Path $lldDirectory 'lld-link-replay.txt'
+
+          # The replay script accepts the linker before `--` and extra linker
+          # arguments after it. Keep MSYS from rewriting lld-link's /out path.
+          $env:MSYS2_ARG_CONV_EXCL = '/out:;/pdb:'
+          & $bash $runWith $lld '--' "/out:$lldExecutable" "/pdb:$lldPdb" 2>&1 |
+            Tee-Object -FilePath $replayLog
+          if ($LASTEXITCODE -ne 0) {
+            throw "lld-link replay failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path $lldExecutable)) {
+            throw "lld-link replay did not produce $lldExecutable"
+          }
+
+          $wildDirectory = Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
+          foreach ($sidecar in @('sona.exe', 'ffmpeg.exe')) {
+            Copy-Item (Join-Path $wildDirectory $sidecar) $lldDirectory
+          }
+
       - name: Configure scoped Vibe crash dumps
         shell: pwsh
         env:
@@ -246,73 +284,239 @@ jobs:
         env:
           VIBE_PROFILE: ${{ matrix.profile }}
         run: |
-          $directory = Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
-          $executable = Join-Path $directory 'vibe.exe'
-          if (-not (Test-Path $executable)) {
-            throw "Missing Vibe $env:VIBE_PROFILE executable: $executable"
-          }
-          foreach ($sidecar in @('sona.exe', 'ffmpeg.exe')) {
-            $sidecarPath = Join-Path $directory $sidecar
-            if (-not (Test-Path $sidecarPath)) {
-              throw "Missing Vibe $env:VIBE_PROFILE sidecar: $sidecarPath"
-            }
-          }
-
-          $resolvedExecutable = (Resolve-Path $executable).Path
-          $stream = [System.IO.File]::OpenRead($resolvedExecutable)
-          $reader = $null
-          try {
-            if ($stream.Length -lt 64) {
-              throw "Vibe $env:VIBE_PROFILE PE is only $($stream.Length) bytes"
-            }
-            $reader = [System.IO.BinaryReader]::new($stream)
-            $dosMagic = $reader.ReadUInt16()
-            if ($dosMagic -ne 0x5a4d) {
-              throw ('Vibe {0} has DOS magic 0x{1:x4}, expected 0x5a4d' -f `
-                $env:VIBE_PROFILE, $dosMagic)
-            }
-
-            $stream.Position = 0x3c
-            [uint32]$peOffset = $reader.ReadUInt32()
-            if ([uint64]$peOffset + 6 -gt [uint64]$stream.Length) {
-              throw ('Vibe {0} has out-of-bounds PE offset 0x{1:x8} for {2} bytes' -f `
-                $env:VIBE_PROFILE, $peOffset, $stream.Length)
-            }
-
-            $stream.Position = $peOffset
-            $peSignature = $reader.ReadUInt32()
-            $machine = $reader.ReadUInt16()
-            if ($peSignature -ne 0x00004550 -or $machine -ne 0x8664) {
-              throw ('Vibe {0} has PE signature 0x{1:x8} and machine 0x{2:x4}; expected PE\0\0 and AMD64 (0x8664)' -f `
-                $env:VIBE_PROFILE, $peSignature, $machine)
-            }
-            Write-Host ('Verified Vibe {0}: PE offset 0x{1:x8}, machine 0x{2:x4}, {3} bytes' -f `
-              $env:VIBE_PROFILE, $peOffset, $machine, $stream.Length)
-          } finally {
-            if ($null -ne $reader) {
-              $reader.Dispose()
-            } else {
-              $stream.Dispose()
-            }
-          }
-
-          $stdout = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stdout.txt"
-          $stderr = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stderr.txt"
+          $ErrorActionPreference = 'Stop'
+          $failures = [System.Collections.Generic.List[string]]::new()
+          $diagnostics = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE-diagnostics"
+          New-Item -ItemType Directory -Force $diagnostics | Out-Null
+          "VIBE_DIAGNOSTIC_DIRECTORY=$diagnostics" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           [DateTime]::UtcNow.ToString('o') |
             Set-Content -Path $env:VIBE_RUNTIME_START_FILE -Encoding utf8
-          $process = Start-Process -FilePath $resolvedExecutable `
-            -ArgumentList '--help' -PassThru `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 
-          if (-not $process.WaitForExit(30000)) {
-            & taskkill.exe /PID $process.Id /T /F | Out-Host
-            $process.WaitForExit(10000) | Out-Null
-            throw "Vibe $env:VIBE_PROFILE did not finish its --help smoke test within 30 seconds"
+          function Add-Failure([string]$Message) {
+            $script:failures.Add($Message)
+            Write-Error $Message -ErrorAction Continue
           }
-          $process.Refresh()
-          if ($process.ExitCode -ne 0) {
-            Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | Out-Host
-            throw "Vibe $env:VIBE_PROFILE exited with code $($process.ExitCode)"
+
+          function Format-ExitCode([int]$Code) {
+            $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$Code), 0)
+            return '{0} (0x{1:x8})' -f $Code, $unsigned
+          }
+
+          function Invoke-Probe(
+            [string]$Label,
+            [string]$Executable,
+            [string[]]$Arguments,
+            [int]$TimeoutMilliseconds
+          ) {
+            $safeLabel = $Label -replace '[^A-Za-z0-9_.-]', '-'
+            $stdout = Join-Path $diagnostics "$safeLabel.stdout.txt"
+            $stderr = Join-Path $diagnostics "$safeLabel.stderr.txt"
+            $parameters = @{
+              FilePath = $Executable
+              PassThru = $true
+              RedirectStandardOutput = $stdout
+              RedirectStandardError = $stderr
+              WorkingDirectory = Split-Path $Executable
+            }
+            if ($Arguments.Count -gt 0) {
+              $parameters.ArgumentList = $Arguments
+            }
+            $process = Start-Process @parameters
+            $timedOut = -not $process.WaitForExit($TimeoutMilliseconds)
+            if ($timedOut) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Host
+              $process.WaitForExit(10000) | Out-Null
+            } else {
+              $process.WaitForExit()
+            }
+            $process.Refresh()
+            $exitCode = if ($timedOut) { $null } else { $process.ExitCode }
+            $result = [pscustomobject]@{
+              Label = $Label
+              TimedOut = $timedOut
+              ExitCode = $exitCode
+              Stdout = $stdout
+              Stderr = $stderr
+            }
+            $result | Format-List | Out-File `
+              (Join-Path $diagnostics "$safeLabel.result.txt") -Encoding utf8
+            return $result
+          }
+
+          function Test-Pe([string]$Label, [string]$Executable) {
+            $stream = [System.IO.File]::OpenRead($Executable)
+            $reader = $null
+            try {
+              if ($stream.Length -lt 64) {
+                Add-Failure "$Label PE is only $($stream.Length) bytes"
+                return $false
+              }
+              $reader = [System.IO.BinaryReader]::new($stream)
+              $dosMagic = $reader.ReadUInt16()
+              if ($dosMagic -ne 0x5a4d) {
+                Add-Failure ('{0} has DOS magic 0x{1:x4}, expected 0x5a4d' -f `
+                  $Label, $dosMagic)
+                return $false
+              }
+              $stream.Position = 0x3c
+              [uint32]$peOffset = $reader.ReadUInt32()
+              if ([uint64]$peOffset + 6 -gt [uint64]$stream.Length) {
+                Add-Failure ('{0} has out-of-bounds PE offset 0x{1:x8} for {2} bytes' -f `
+                  $Label, $peOffset, $stream.Length)
+                return $false
+              }
+              $stream.Position = $peOffset
+              $signature = $reader.ReadUInt32()
+              $machine = $reader.ReadUInt16()
+              if ($signature -ne 0x00004550 -or $machine -ne 0x8664) {
+                Add-Failure ('{0} has PE signature 0x{1:x8} and machine 0x{2:x4}' -f `
+                  $Label, $signature, $machine)
+                return $false
+              }
+              Write-Host ('Verified {0}: PE offset 0x{1:x8}, machine 0x{2:x4}, {3} bytes' -f `
+                $Label, $peOffset, $machine, $stream.Length)
+              return $true
+            } finally {
+              if ($null -ne $reader) {
+                $reader.Dispose()
+              } else {
+                $stream.Dispose()
+              }
+            }
+          }
+
+          function Test-Gui([string]$Label, [string]$Executable) {
+            $safeLabel = $Label -replace '[^A-Za-z0-9_.-]', '-'
+            $stdout = Join-Path $diagnostics "$safeLabel-gui.stdout.txt"
+            $stderr = Join-Path $diagnostics "$safeLabel-gui.stderr.txt"
+            $profileRoot = Join-Path $env:RUNNER_TEMP "$safeLabel-gui-profile"
+            $appData = Join-Path $profileRoot 'roaming'
+            $localAppData = Join-Path $profileRoot 'local'
+            New-Item -ItemType Directory -Force -Path @($appData, $localAppData) | Out-Null
+            $savedAppData = $env:APPDATA
+            $savedLocalAppData = $env:LOCALAPPDATA
+            $process = $null
+            try {
+              $env:APPDATA = $appData
+              $env:LOCALAPPDATA = $localAppData
+              $process = Start-Process -FilePath $Executable -PassThru `
+                -WorkingDirectory (Split-Path $Executable) `
+                -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+              $deadline = [DateTime]::UtcNow.AddSeconds(20)
+              $windowHandle = [IntPtr]::Zero
+              while ([DateTime]::UtcNow -lt $deadline) {
+                if ($process.HasExited) {
+                  break
+                }
+                $process.Refresh()
+                $windowHandle = $process.MainWindowHandle
+                if ($windowHandle -ne [IntPtr]::Zero) {
+                  break
+                }
+                Start-Sleep -Milliseconds 250
+              }
+              if ($process.HasExited) {
+                $process.Refresh()
+                Add-Failure "$Label GUI exited early with $(Format-ExitCode $process.ExitCode)"
+                return
+              }
+              if ($windowHandle -eq [IntPtr]::Zero) {
+                Add-Failure "$Label GUI stayed alive but did not create a top-level window within 20 seconds"
+                return
+              }
+              Start-Sleep -Seconds 5
+              if ($process.HasExited) {
+                $process.Refresh()
+                Add-Failure "$Label GUI exited after creating its window with $(Format-ExitCode $process.ExitCode)"
+                return
+              }
+              "window_handle=0x$($windowHandle.ToInt64().ToString('x'))" |
+                Set-Content (Join-Path $diagnostics "$safeLabel-gui.result.txt") -Encoding utf8
+              Write-Host "$Label GUI created a window and remained alive"
+            } finally {
+              if ($null -ne $process -and -not $process.HasExited) {
+                & taskkill.exe /PID $process.Id /T /F | Out-Host
+                $process.WaitForExit(10000) | Out-Null
+              }
+              $env:APPDATA = $savedAppData
+              $env:LOCALAPPDATA = $savedLocalAppData
+            }
+          }
+
+          $wildDirectory = (Resolve-Path `
+            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE)).Path
+          if (-not $env:VIBE_LLD_DIRECTORY -or -not (Test-Path $env:VIBE_LLD_DIRECTORY)) {
+            throw "Missing lld-link replay directory"
+          }
+          $lldDirectory = (Resolve-Path $env:VIBE_LLD_DIRECTORY).Path
+          $variants = @(
+            [pscustomobject]@{ Name = 'wild'; Directory = $wildDirectory },
+            [pscustomobject]@{ Name = 'lld'; Directory = $lldDirectory }
+          )
+
+          # This pinned Vibe revision treats any argv[1] as CLI mode and
+          # forwards it to sona. Baseline the sidecars before testing that
+          # wrapper, then test the actual GUI separately with no arguments.
+          $sona = Invoke-Probe 'sidecar-sona-help' `
+            (Join-Path $wildDirectory 'sona.exe') @('--help') 30000
+          if ($sona.TimedOut) {
+            Add-Failure 'sona.exe --help timed out after 30 seconds'
+          } elseif ($sona.ExitCode -ne 0) {
+            Add-Failure "sona.exe --help exited with $(Format-ExitCode $sona.ExitCode)"
+          }
+          $ffmpeg = Invoke-Probe 'sidecar-ffmpeg-version' `
+            (Join-Path $wildDirectory 'ffmpeg.exe') @('-version') 30000
+          $ffmpegOutput = Get-Content $ffmpeg.Stdout, $ffmpeg.Stderr `
+            -Raw -ErrorAction SilentlyContinue
+          if ($ffmpeg.TimedOut) {
+            Add-Failure 'ffmpeg.exe -version timed out after 30 seconds'
+          } elseif ($ffmpeg.ExitCode -ne 0 -or $ffmpegOutput -notmatch '(?i)ffmpeg version') {
+            Add-Failure "ffmpeg.exe -version did not return a valid version response"
+          }
+
+          $llvmReadObj = (Get-Command llvm-readobj.exe -ErrorAction Stop).Source
+          foreach ($variant in $variants) {
+            $label = "Vibe $env:VIBE_PROFILE ($($variant.Name))"
+            $executable = Join-Path $variant.Directory 'vibe.exe'
+            if (-not (Test-Path $executable)) {
+              Add-Failure "Missing $label executable: $executable"
+              continue
+            }
+            $peValid = Test-Pe $label $executable
+            $report = Join-Path $diagnostics "$($variant.Name)-llvm-readobj.txt"
+            & $llvmReadObj --file-headers --sections --coff-imports `
+              --coff-basereloc --unwind $executable 2>&1 |
+              Out-File $report -Encoding utf8 -Width 4096
+            if ($LASTEXITCODE -ne 0) {
+              Add-Failure "llvm-readobj rejected $label"
+            }
+            if (-not $peValid) {
+              continue
+            }
+
+            $cli = Invoke-Probe "$($variant.Name)-vibe-help" `
+              $executable @('--help') 30000
+            if ($cli.TimedOut) {
+              Add-Failure "$label CLI wrapper timed out after 30 seconds"
+            } elseif (-not $sona.TimedOut -and $cli.ExitCode -ne $sona.ExitCode) {
+              Add-Failure "$label CLI wrapper exited with $(Format-ExitCode $cli.ExitCode); sona baseline was $(Format-ExitCode $sona.ExitCode)"
+            }
+            Test-Gui $label $executable
+          }
+
+          @(
+            "profile=$env:VIBE_PROFILE"
+            "sona_timed_out=$($sona.TimedOut)"
+            "sona_exit=$($sona.ExitCode)"
+            "ffmpeg_timed_out=$($ffmpeg.TimedOut)"
+            "ffmpeg_exit=$($ffmpeg.ExitCode)"
+            "failures=$($failures.Count)"
+            $failures
+          ) | Set-Content (Join-Path $diagnostics 'acceptance-summary.txt') -Encoding utf8
+
+          if ($failures.Count -ne 0) {
+            throw "Vibe acceptance failed:`n$($failures -join "`n")"
           }
 
       - name: Capture Vibe ${{ matrix.profile }} failure evidence
@@ -342,6 +546,13 @@ jobs:
 
           if ($env:VIBE_DUMP_DIRECTORY -and (Test-Path $env:VIBE_DUMP_DIRECTORY)) {
             Copy-Item $env:VIBE_DUMP_DIRECTORY (Join-Path $evidence 'crash-dumps') -Recurse
+          }
+          if ($env:VIBE_DIAGNOSTIC_DIRECTORY -and (Test-Path $env:VIBE_DIAGNOSTIC_DIRECTORY)) {
+            Copy-Item $env:VIBE_DIAGNOSTIC_DIRECTORY `
+              (Join-Path $evidence 'acceptance-diagnostics') -Recurse
+          }
+          if ($env:VIBE_LLD_DIRECTORY -and (Test-Path $env:VIBE_LLD_DIRECTORY)) {
+            Copy-Item $env:VIBE_LLD_DIRECTORY (Join-Path $evidence 'lld-output') -Recurse
           }
           if ($env:VIBE_LINK_REPRO -and (Test-Path $env:VIBE_LINK_REPRO)) {
             Copy-Item $env:VIBE_LINK_REPRO (Join-Path $evidence 'link-repro') -Recurse
@@ -386,6 +597,8 @@ jobs:
             "captured_utc=$([DateTime]::UtcNow.ToString('o'))"
             "link_repro=$env:VIBE_LINK_REPRO"
             "dump_directory=$env:VIBE_DUMP_DIRECTORY"
+            "diagnostic_directory=$env:VIBE_DIAGNOSTIC_DIRECTORY"
+            "lld_directory=$env:VIBE_LLD_DIRECTORY"
           ) | Set-Content $manifest -Encoding utf8
           Get-ChildItem $evidence -File -Recurse |
             Where-Object FullName -ne $manifest |
