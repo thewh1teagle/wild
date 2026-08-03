@@ -1,0 +1,70 @@
+name: PE/COFF runtime acceptance
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: pe-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  windows-runtime:
+    name: C, C++, DLL, and Rust std (Windows x86-64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Add LLVM tools to PATH
+        shell: pwsh
+        run: |
+          $llvm = Join-Path $env:ProgramFiles 'LLVM/bin'
+          if (-not (Test-Path $llvm)) {
+            throw "LLVM installation is unavailable at $llvm"
+          }
+          $llvm | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify PE toolchain
+        shell: pwsh
+        run: |
+          clang-cl.exe --version
+          lld-link.exe --version
+          llvm-readobj.exe --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Wild and runtime corpus
+        run: >-
+          cargo test --profile ci -p wild-linker --test windows_pe_runtime
+          --no-default-features --features pe --no-run
+
+      - name: Select Wild as link.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/pe-linker | Out-Null
+          Copy-Item target/ci/wild.exe target/pe-linker/link.exe
+          $linker = (Resolve-Path target/pe-linker/link.exe).Path
+          "WILD_PE_LINKER_FULL=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Execute lld-link and Wild runtime corpus
+        run: >-
+          cargo test --profile ci -p wild-linker --test windows_pe_runtime
+          --no-default-features --features pe -- --nocapture
