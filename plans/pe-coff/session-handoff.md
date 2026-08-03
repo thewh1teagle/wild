@@ -452,3 +452,32 @@ Then:
   been done.
 - Run format/actionlint checks for any changed workflow or Markdown-adjacent config.
 - Commit only intended tracked files, push the feature branch, and do not open a PR.
+
+## Update 2026-08-03 (later session): new host, new goal structure
+
+This section supersedes the paths, priorities, and "remaining work" above
+where they conflict.
+
+- Development moved from the macOS M4 to a Linux aarch64 workstation at
+  `/home/yakov/Documents/wild` (20 cores, 121 GB RAM). Setup, quirks
+  (clang-cl/lld-link wrapper scripts, rustup override, clang-format), and full
+  gate verification are in `host-tooling.md`. All local quality gates pass on
+  this host at `f2392c1a`; only the xwin-backed
+  `wild/tests/windows_pe_runtime.rs` remains cfg-gated to Windows/macOS.
+- `quality-gate.md` now records the paired Vibe control run `30801348499`
+  (the item 1 recommended above) and the Linux host verification.
+- `GOAL.md` was restructured into two sequential goals plus deferred phases:
+  Goal 1 = production-usable and stable release-mode linking on the current
+  branch (option compatibility sweep, real `/OPT:REF`, delay imports,
+  stability/fuzz hardening, manifest embedding — in that order); Goal 2 =
+  performance/parallelism on a new branch, profile-first; deferred to
+  separate final phases: PDB, full CFG/security metadata, LTO, incremental
+  linking, niche compatibility.
+- A four-subagent codebase audit produced `goal1-gaps.md` with file:line
+  evidence for each gap. Headline corrections to intuition: `/OPT:REF`/`ICF`
+  are pure no-ops (explains the Wild-versus-lld size gap); unknown options
+  are fatal so stock CMake/MSBuild builds cannot link yet; delay imports have
+  a finished, tested format layer awaiting only driver/resolver/writer
+  plumbing; PDB and full CFG are large and deliberately deferred.
+- Reading order for a new session: `GOAL.md` → `goal1-gaps.md` →
+  `host-tooling.md` → this file → `quality-gate.md` → `feature-matrix.md`.
