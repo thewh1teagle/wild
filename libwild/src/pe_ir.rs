@@ -6,10 +6,11 @@
 
 #![allow(dead_code)]
 
-use crate::coff::CoffObject;
+use super::pe_symbol_db::{
+    DeferredInvalidName, OrderedNameInterner, OrderedNameOccurrence, finalize_ordered_names_with,
+};
+use crate::coff::{CoffDeferredNameError, CoffObject};
 use crate::error::Result;
-use foldhash::HashMap;
-use foldhash::HashMapExt;
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -273,15 +274,25 @@ pub(super) struct PeIr<'data> {
     pub(super) relocations: RelocationCsr,
 }
 
+/// The selected-object IR and the one canonical namespace that assigned every name in it.
+/// `occurrence_names` is flat in object order and then `CoffInputIndex::names` order.
+pub(super) struct SelectedObjectFinalization<'data> {
+    pub(super) ir: PeIr<'data>,
+    pub(super) names: OrderedNameInterner<'data>,
+    pub(super) occurrence_names: Box<[NameId]>,
+}
+
 impl<'data> PeIr<'data> {
     /// Finalize selected objects in input order. The only allocations contain records, CSR starts,
     /// hash collision lists, and dense-ID maps; input payload and name bytes remain borrowed.
-    pub(super) fn from_selected_objects(objects: &[CoffObject<'data>]) -> Result<Self> {
+    pub(super) fn finalize_selected_objects(
+        objects: &[CoffObject<'data>],
+        seed: OrderedNameInterner<'data>,
+    ) -> Result<SelectedObjectFinalization<'data>> {
         let sources = SourceFiles::new(objects.iter().map(CoffObject::bytes).collect());
-        let FinalizedNames {
-            records: names,
-            object_maps: object_names,
-        } = finalize_names(objects)?;
+        let ordered_occurrences = ordered_name_occurrences(objects)?;
+        let finalized = finalize_ordered_names_with(seed, ordered_occurrences);
+        let names = name_records(objects, &finalized.names, &finalized.occurrence_names)?;
         let section_count = objects
             .iter()
             .try_fold(0usize, |count, object| {
@@ -302,12 +313,20 @@ impl<'data> PeIr<'data> {
         let mut relocations = Vec::new();
         starts.push(0);
 
+        let mut occurrence_start = 0usize;
         for (object_index, object) in objects.iter().enumerate() {
             let object_id = ObjectId::from_u32(as_u32(object_index, "selected object")?);
             let section_start = as_u32(sections.len(), "selected section")?;
             let symbol_start = as_u32(symbols.len(), "selected symbol")?;
-            let local_names = &object_names[object_index];
             let index = object.index();
+            let occurrence_end = occurrence_start
+                .checked_add(index.names().len())
+                .ok_or_else(|| crate::error!("Selected COFF name occurrence count overflow"))?;
+            let local_names = finalized
+                .occurrence_names
+                .get(occurrence_start..occurrence_end)
+                .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
+            occurrence_start = occurrence_end;
 
             for section in index.sections() {
                 let data = section.data_range.map(|range| SourceRange {
@@ -410,13 +429,18 @@ impl<'data> PeIr<'data> {
             starts: starts.into_boxed_slice(),
             records: relocations.into_boxed_slice(),
         };
-        Ok(Self {
+        let ir = Self {
             sources,
-            names,
+            names: names.into_boxed_slice(),
             objects: object_records.into_boxed_slice(),
             sections: sections.into_boxed_slice(),
             symbols: symbols.into_boxed_slice(),
             relocations,
+        };
+        Ok(SelectedObjectFinalization {
+            ir,
+            names: finalized.names,
+            occurrence_names: finalized.occurrence_names,
         })
     }
 
@@ -452,74 +476,81 @@ impl<'data> PeIr<'data> {
     }
 }
 
-struct FinalizedNames {
-    records: Box<[NameRecord]>,
-    object_maps: Vec<Box<[NameId]>>,
+fn ordered_name_occurrences<'data>(
+    objects: &[CoffObject<'data>],
+) -> Result<Vec<OrderedNameOccurrence<'data>>> {
+    let occurrence_count = objects
+        .iter()
+        .try_fold(0usize, |count, object| {
+            count.checked_add(object.index().names().len())
+        })
+        .ok_or_else(|| crate::error!("Selected COFF name occurrence count overflow"))?;
+    let mut ordered = Vec::with_capacity(occurrence_count);
+    for object in objects {
+        for occurrence in object.index().names() {
+            if let Some(source) = occurrence.source() {
+                let end = source
+                    .start
+                    .checked_add(source.len)
+                    .ok_or_else(|| crate::error!("Object-local COFF name range overflow"))?;
+                let bytes = object
+                    .bytes()
+                    .get(source.start as usize..end as usize)
+                    .ok_or_else(|| crate::error!("Invalid object-local COFF name range"))?;
+                ordered.push(OrderedNameOccurrence::valid(bytes, occurrence.hash()));
+            } else {
+                let diagnostic = match occurrence.deferred_error() {
+                    Some(CoffDeferredNameError::InvalidNameOffset) => {
+                        DeferredInvalidName::CoffNameOffset
+                    }
+                    Some(CoffDeferredNameError::InvalidRelocationSymbol) => {
+                        DeferredInvalidName::RelocationSymbol
+                    }
+                    None => return Err(crate::error!("Missing deferred COFF name diagnostic")),
+                };
+                ordered.push(OrderedNameOccurrence::invalid(diagnostic));
+            }
+        }
+    }
+    Ok(ordered)
 }
 
-fn finalize_names<'data>(objects: &[CoffObject<'data>]) -> Result<FinalizedNames> {
-    let mut records = Vec::<NameRecord>::new();
-    let mut by_hash = HashMap::<u64, Vec<NameId>>::new();
-    let mut object_maps = Vec::with_capacity(objects.len());
+fn name_records<'data>(
+    objects: &[CoffObject<'data>],
+    interner: &OrderedNameInterner<'data>,
+    occurrence_names: &[NameId],
+) -> Result<Vec<NameRecord>> {
+    let mut records = (0..interner.len())
+        .map(|index| {
+            let id = NameId::from_u32(index as u32);
+            NameRecord {
+                source: None,
+                hash: interner.hash(id).unwrap_or(0),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut mapped = occurrence_names.iter().copied();
     for (object_index, object) in objects.iter().enumerate() {
         let file = FileId::from_u32(as_u32(object_index, "source file")?);
-        let mut local = Vec::with_capacity(object.index().names().len());
         for occurrence in object.index().names() {
-            let Some(local_source) = occurrence.source() else {
-                let id = NameId::from_u32(as_u32(records.len(), "canonical name")?);
-                records.push(NameRecord {
-                    source: None,
-                    hash: occurrence.hash(),
+            let id = mapped
+                .next()
+                .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
+            if records[id.index()].source.is_none() {
+                records[id.index()].source = occurrence.source().map(|source| SourceRange {
+                    file,
+                    start: source.start,
+                    len: source.len,
                 });
-                local.push(id);
-                continue;
-            };
-            let source = SourceRange {
-                file,
-                start: local_source.start,
-                len: local_source.len,
-            };
-            let local_end = local_source
-                .start
-                .checked_add(local_source.len)
-                .ok_or_else(|| crate::error!("Object-local COFF name range overflow"))?;
-            let bytes = object
-                .bytes()
-                .get(local_source.start as usize..local_end as usize)
-                .ok_or_else(|| crate::error!("Invalid object-local COFF name range"))?;
-            let existing = by_hash.get(&occurrence.hash()).and_then(|candidates| {
-                candidates.iter().copied().find(|candidate| {
-                    records[candidate.index()]
-                        .source
-                        .and_then(|range| source_bytes(objects, range))
-                        == Some(bytes)
-                })
-            });
-            let id = if let Some(existing) = existing {
-                existing
-            } else {
-                let id = NameId::from_u32(as_u32(records.len(), "canonical name")?);
-                records.push(NameRecord {
-                    source: Some(source),
-                    hash: occurrence.hash(),
-                });
-                by_hash.entry(occurrence.hash()).or_default().push(id);
-                id
-            };
-            local.push(id);
+            }
         }
-        object_maps.push(local.into_boxed_slice());
     }
-    Ok(FinalizedNames {
-        records: records.into_boxed_slice(),
-        object_maps,
-    })
-}
-
-fn source_bytes<'data>(objects: &[CoffObject<'data>], source: SourceRange) -> Option<&'data [u8]> {
-    let bytes = objects.get(source.file.index())?.bytes();
-    let end = source.start.checked_add(source.len)?;
-    bytes.get(source.start as usize..end as usize)
+    if mapped.next().is_some() {
+        return Err(crate::error!(
+            "Excess selected COFF name occurrence mapping"
+        ));
+    }
+    Ok(records)
 }
 
 fn section_from_raw(start: u32, raw: object::SectionIndex) -> Result<SectionId> {
@@ -639,7 +670,9 @@ mod tests {
             CoffObject::parse(&first).unwrap(),
             CoffObject::parse(&second).unwrap(),
         ];
-        let ir = PeIr::from_selected_objects(&objects).unwrap();
+        let finalized =
+            PeIr::finalize_selected_objects(&objects, OrderedNameInterner::new()).unwrap();
+        let ir = &finalized.ir;
         assert_eq!(ir.objects.len(), 2);
         assert_eq!(ir.sections.len(), 2);
         assert_eq!(ir.symbols.len(), 4);
@@ -663,6 +696,27 @@ mod tests {
             b"shared_long_target_name"
         );
         assert_eq!(ir.symbols[1].name, ir.symbols[3].name);
+        let mut occurrence_start = 0;
+        for (object_index, object) in objects.iter().enumerate() {
+            let index = object.index();
+            let local = &finalized.occurrence_names
+                [occurrence_start..occurrence_start + index.names().len()];
+            let object_record = ir.objects[object_index];
+            for (local_symbol, symbol) in index.symbols().iter().enumerate() {
+                assert_eq!(
+                    ir.symbols[object_record.symbols.start() as usize + local_symbol].name,
+                    local[symbol.name.0 as usize]
+                );
+            }
+            for (local_section, section) in index.sections().iter().enumerate() {
+                assert_eq!(
+                    ir.sections[object_record.sections.start() as usize + local_section].name,
+                    local[section.name.0 as usize]
+                );
+            }
+            occurrence_start += index.names().len();
+        }
+        assert_eq!(occurrence_start, finalized.occurrence_names.len());
         let data = ir.sections[0].data.unwrap();
         assert_eq!(
             ir.sources.bytes(data).unwrap(),
@@ -679,12 +733,38 @@ mod tests {
     }
 
     #[test]
+    fn selected_objects_append_to_seed_without_renumbering_roots() {
+        let bytes = selected_fixture();
+        let objects = [CoffObject::parse(&bytes).unwrap()];
+        let target = b"shared_long_target_name";
+        let target_hash = crate::hash::hash_bytes(target);
+        let mut seed = OrderedNameInterner::new();
+        let target_id = seed.intern_borrowed_prehashed(target, target_hash);
+        let root_id = seed.intern_borrowed_prehashed(b"command-line-root", 17);
+
+        let finalized = PeIr::finalize_selected_objects(&objects, seed).unwrap();
+        assert_eq!(target_id, NameId::from_u32(0));
+        assert_eq!(root_id, NameId::from_u32(1));
+        assert_eq!(finalized.ir.symbols[1].name, target_id);
+        assert_eq!(
+            finalized.names.lookup_prehashed(target, target_hash),
+            Some(target_id)
+        );
+        assert_eq!(
+            finalized.names.bytes(root_id),
+            Some(b"command-line-root".as_slice())
+        );
+    }
+
+    #[test]
     fn discarded_malformed_edge_stays_deferred_until_live_target_lookup() {
         let mut bytes = selected_fixture();
         let relocation = first_relocation_offset(&bytes);
         bytes[relocation + 4..relocation + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         let objects = [CoffObject::parse(&bytes).unwrap()];
-        let ir = PeIr::from_selected_objects(&objects).unwrap();
+        let finalized =
+            PeIr::finalize_selected_objects(&objects, OrderedNameInterner::new()).unwrap();
+        let ir = &finalized.ir;
         let malformed = ir.relocations.records[0];
 
         // A discarded source never asks for its target, so construction alone is the non-error

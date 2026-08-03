@@ -51,7 +51,7 @@ pub(super) struct CoffSourceRange {
 pub(super) struct CoffNameId(pub(super) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoffDeferredNameError {
+pub(super) enum CoffDeferredNameError {
     InvalidNameOffset,
     InvalidRelocationSymbol,
 }
@@ -408,6 +408,10 @@ impl CoffNameOccurrence {
     pub(super) fn hash(self) -> u64 {
         self.hash
     }
+
+    pub(super) fn deferred_error(self) -> Option<CoffDeferredNameError> {
+        self.error
+    }
 }
 
 fn push_name_occurrence(
@@ -424,7 +428,7 @@ fn push_name_occurrence(
             let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
             names.push(CoffNameOccurrence {
                 source: Some(source),
-                hash: hash_name(name),
+                hash: crate::hash::hash_bytes(name),
                 error: None,
             });
             Ok(id)
@@ -452,14 +456,6 @@ fn source_range(bytes: &[u8], source: &[u8]) -> Option<CoffSourceRange> {
     (end <= bytes.len()).then_some(CoffSourceRange {
         start: u32::try_from(start).ok()?,
         len: u32::try_from(source.len()).ok()?,
-    })
-}
-
-fn hash_name(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x100_0000_01b3;
-    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
     })
 }
 
@@ -772,9 +768,11 @@ mod tests {
         assert_eq!(first, second);
         let symbol = index.symbol(first);
         assert!(symbol.shape.is_some());
-        assert!(index.names[symbol.name.0 as usize].source.is_some());
+        let occurrence = index.names[symbol.name.0 as usize];
+        assert!(occurrence.source.is_some());
         assert!(symbol.shape(&object).unwrap().is_global);
         assert_eq!(symbol.name(&object).unwrap(), b"target");
+        assert_eq!(occurrence.hash(), crate::hash::hash_bytes(b"target"));
     }
 
     #[test]

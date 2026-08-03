@@ -203,24 +203,43 @@ impl SymbolEntry {
     }
 }
 
-/// A name occurrence whose hash was computed by the one-pass PE input indexer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeferredInvalidName {
+    CoffNameOffset,
+    RelocationSymbol,
+}
+
+/// A name occurrence whose hash was computed by the one-pass PE input indexer. Invalid
+/// occurrences are deliberately un-hashed and always receive a fresh ID.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct OrderedNameOccurrence<'data> {
-    pub(super) bytes: &'data [u8],
-    pub(super) hash: u64,
+pub(super) enum OrderedNameOccurrence<'data> {
+    Valid { bytes: &'data [u8], hash: u64 },
+    Invalid(DeferredInvalidName),
+}
+
+impl<'data> OrderedNameOccurrence<'data> {
+    pub(super) const fn valid(bytes: &'data [u8], hash: u64) -> Self {
+        Self::Valid { bytes, hash }
+    }
+
+    pub(super) const fn invalid(diagnostic: DeferredInvalidName) -> Self {
+        Self::Invalid(diagnostic)
+    }
 }
 
 enum NameStorage<'data> {
     Borrowed(&'data [u8]),
     /// Textual command-line names have no input-file lifetime and are copied once at ingress.
     Owned(Box<[u8]>),
+    Invalid(DeferredInvalidName),
 }
 
 impl NameStorage<'_> {
-    fn bytes(&self) -> &[u8] {
+    fn bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Borrowed(bytes) => bytes,
-            Self::Owned(bytes) => bytes,
+            Self::Borrowed(bytes) => Some(bytes),
+            Self::Owned(bytes) => Some(bytes),
+            Self::Invalid(_) => None,
         }
     }
 }
@@ -257,7 +276,7 @@ impl<'data> OrderedNameInterner<'data> {
     }
 
     pub(super) fn bytes(&self, id: NameId) -> Option<&[u8]> {
-        self.names.get(id.index()).map(NameStorage::bytes)
+        self.names.get(id.index()).and_then(NameStorage::bytes)
     }
 
     pub(super) fn hash(&self, id: NameId) -> Option<u64> {
@@ -267,17 +286,10 @@ impl<'data> OrderedNameInterner<'data> {
     pub(super) fn lookup_prehashed(&self, bytes: &[u8], hash: u64) -> Option<NameId> {
         let mut current = self.by_hash.get(&hash).copied();
         while let Some(id) = current {
-            if self
-                .bytes(id)
-                .expect("collision chains contain valid NameIds")
-                == bytes
-            {
+            if self.bytes(id) == Some(bytes) {
                 return Some(id);
             }
-            let next = *self
-                .collision_next
-                .get(id.index())
-                .expect("collision chains contain valid NameIds");
+            let next = *self.collision_next.get(id.index())?;
             current = (next != NONE_U32).then(|| NameId::from_u32(next));
         }
         None
@@ -287,7 +299,7 @@ impl<'data> OrderedNameInterner<'data> {
         if let Some(id) = self.lookup_prehashed(bytes, hash) {
             return id;
         }
-        self.push(NameStorage::Borrowed(bytes), hash)
+        self.push_valid(NameStorage::Borrowed(bytes), hash)
     }
 
     pub(super) fn intern_owned_prehashed(&mut self, bytes: &[u8], hash: u64) -> NameId {
@@ -299,24 +311,42 @@ impl<'data> OrderedNameInterner<'data> {
         if !bytes.is_empty() {
             crate::perf::removal_counters::increment_hot_phase_allocations();
         }
-        self.push(NameStorage::Owned(bytes.into()), hash)
+        self.push_valid(NameStorage::Owned(bytes.into()), hash)
     }
 
-    fn push(&mut self, name: NameStorage<'data>, hash: u64) -> NameId {
-        let raw = u32::try_from(self.names.len()).expect("PE canonical name count exceeds u32");
-        let id = NameId::from_u32(raw);
+    pub(super) fn intern_invalid(&mut self, diagnostic: DeferredInvalidName) -> NameId {
+        let id = self.push_unhashed(NameStorage::Invalid(diagnostic), 0);
+        self.collision_next.push(NONE_U32);
+        id
+    }
+
+    pub(super) fn invalid_diagnostic(&self, id: NameId) -> Option<DeferredInvalidName> {
+        match self.names.get(id.index())? {
+            NameStorage::Invalid(diagnostic) => Some(*diagnostic),
+            NameStorage::Borrowed(_) | NameStorage::Owned(_) => None,
+        }
+    }
+
+    fn push_valid(&mut self, name: NameStorage<'data>, hash: u64) -> NameId {
+        let id = self.push_unhashed(name, hash);
         let previous = self.by_hash.get(&hash).copied();
-        note_vec_push(&self.names);
-        self.names.push(name);
-        note_vec_push(&self.hashes);
-        self.hashes.push(hash);
-        note_vec_push(&self.collision_next);
         self.collision_next
             .push(previous.map_or(NONE_U32, NameId::get));
         if previous.is_none() && self.by_hash.len() == self.by_hash.capacity() {
             crate::perf::removal_counters::increment_hot_phase_allocations();
         }
         self.by_hash.insert(hash, id);
+        id
+    }
+
+    fn push_unhashed(&mut self, name: NameStorage<'data>, hash: u64) -> NameId {
+        let raw = u32::try_from(self.names.len()).expect("PE canonical name count exceeds u32");
+        let id = NameId::from_u32(raw);
+        note_vec_push(&self.names);
+        self.names.push(name);
+        note_vec_push(&self.hashes);
+        self.hashes.push(hash);
+        note_vec_push(&self.collision_next);
         id
     }
 }
@@ -341,10 +371,21 @@ pub(super) struct OrderedNameFinalization<'data> {
 pub(super) fn finalize_ordered_names<'data>(
     occurrences: impl IntoIterator<Item = OrderedNameOccurrence<'data>>,
 ) -> OrderedNameFinalization<'data> {
-    let mut names = OrderedNameInterner::new();
+    finalize_ordered_names_with(OrderedNameInterner::new(), occurrences)
+}
+
+pub(super) fn finalize_ordered_names_with<'data>(
+    mut names: OrderedNameInterner<'data>,
+    occurrences: impl IntoIterator<Item = OrderedNameOccurrence<'data>>,
+) -> OrderedNameFinalization<'data> {
     let mut occurrence_names = Vec::new();
     for occurrence in occurrences {
-        let name = names.intern_borrowed_prehashed(occurrence.bytes, occurrence.hash);
+        let name = match occurrence {
+            OrderedNameOccurrence::Valid { bytes, hash } => {
+                names.intern_borrowed_prehashed(bytes, hash)
+            }
+            OrderedNameOccurrence::Invalid(diagnostic) => names.intern_invalid(diagnostic),
+        };
         note_vec_push(&occurrence_names);
         occurrence_names.push(name);
     }
@@ -567,7 +608,7 @@ mod tests {
     use super::*;
 
     fn occurrence(bytes: &'static [u8], hash: u64) -> OrderedNameOccurrence<'static> {
-        OrderedNameOccurrence { bytes, hash }
+        OrderedNameOccurrence::valid(bytes, hash)
     }
 
     #[test]
@@ -597,17 +638,64 @@ mod tests {
     }
 
     #[test]
+    fn invalid_occurrences_never_alias_valid_empty_names() {
+        let empty_hash = crate::hash::hash_bytes(b"");
+        let finalized = finalize_ordered_names([
+            OrderedNameOccurrence::valid(b"", empty_hash),
+            OrderedNameOccurrence::invalid(DeferredInvalidName::CoffNameOffset),
+            OrderedNameOccurrence::invalid(DeferredInvalidName::CoffNameOffset),
+        ]);
+        assert_eq!(
+            finalized.occurrence_names.as_ref(),
+            [
+                NameId::from_u32(0),
+                NameId::from_u32(1),
+                NameId::from_u32(2),
+            ]
+        );
+        assert_eq!(finalized.names.bytes(NameId::from_u32(0)), Some(&[][..]));
+        assert_eq!(finalized.names.bytes(NameId::from_u32(1)), None);
+        assert_eq!(
+            finalized.names.invalid_diagnostic(NameId::from_u32(1)),
+            Some(DeferredInvalidName::CoffNameOffset)
+        );
+    }
+
+    #[test]
+    fn seeded_finalization_preserves_existing_ids() {
+        let root_hash = crate::hash::hash_bytes(b"root");
+        let object_hash = crate::hash::hash_bytes(b"object");
+        let mut seed = OrderedNameInterner::new();
+        let root = seed.intern_borrowed_prehashed(b"root", root_hash);
+        let finalized = finalize_ordered_names_with(
+            seed,
+            [
+                OrderedNameOccurrence::valid(b"object", object_hash),
+                OrderedNameOccurrence::valid(b"root", root_hash),
+            ],
+        );
+        assert_eq!(root, NameId::from_u32(0));
+        assert_eq!(
+            finalized.occurrence_names.as_ref(),
+            [NameId::from_u32(1), root]
+        );
+        assert_eq!(
+            finalized.names.lookup_prehashed(b"root", root_hash),
+            Some(root)
+        );
+    }
+
+    #[test]
     fn interner_handles_many_unique_names_and_one_large_collision_chain() {
         let unique_bytes = (0..2048)
             .map(|index| format!("unique-{index}").into_bytes())
             .collect::<Vec<_>>();
-        let unique =
-            finalize_ordered_names(unique_bytes.iter().enumerate().map(|(index, bytes)| {
-                OrderedNameOccurrence {
-                    bytes,
-                    hash: index as u64,
-                }
-            }));
+        let unique = finalize_ordered_names(
+            unique_bytes
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| OrderedNameOccurrence::valid(bytes, index as u64)),
+        );
         assert_eq!(unique.names.len(), 2048);
         assert_eq!(unique.names.by_hash.len(), 2048);
         assert_eq!(unique.names.collision_next.len(), 2048);
@@ -615,11 +703,11 @@ mod tests {
         let collision_bytes = (0..1024)
             .map(|index| format!("collision-{index}").into_bytes())
             .collect::<Vec<_>>();
-        let collision =
-            finalize_ordered_names(collision_bytes.iter().map(|bytes| OrderedNameOccurrence {
-                bytes,
-                hash: 0xdead_beef,
-            }));
+        let collision = finalize_ordered_names(
+            collision_bytes
+                .iter()
+                .map(|bytes| OrderedNameOccurrence::valid(bytes, 0xdead_beef)),
+        );
         assert_eq!(collision.names.by_hash.len(), 1);
         for (index, bytes) in collision_bytes.iter().enumerate() {
             assert_eq!(
@@ -695,12 +783,12 @@ mod tests {
         let names = (0..NAME_COUNT)
             .map(|index| format!("name-{index}").into_bytes())
             .collect::<Vec<_>>();
-        let finalized = finalize_ordered_names(names.iter().enumerate().map(|(index, bytes)| {
-            OrderedNameOccurrence {
-                bytes,
-                hash: index as u64,
-            }
-        }));
+        let finalized = finalize_ordered_names(
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| OrderedNameOccurrence::valid(bytes, index as u64)),
+        );
         let mut builder = SymbolDbBuilder::new(finalized.names);
         for name in 0..NAME_COUNT {
             for provider in 0..PROVIDERS_PER_NAME {
