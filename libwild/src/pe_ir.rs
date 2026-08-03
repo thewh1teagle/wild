@@ -6,10 +6,11 @@
 
 #![allow(dead_code)]
 
-use super::pe_symbol_db::{
-    DeferredInvalidName, OrderedNameInterner, OrderedNameOccurrence, finalize_ordered_names_with,
-};
-use crate::coff::{CoffDeferredNameError, CoffObject};
+use super::pe_resolver::SelectedGlobalSymbol;
+use super::pe_symbol_db::DeferredInvalidName;
+use super::pe_symbol_db::OrderedNameInterner;
+use crate::coff::CoffDeferredNameError;
+use crate::coff::CoffObject;
 use crate::error::Result;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -313,10 +314,17 @@ impl<'data> PeIr<'data> {
         objects: &[CoffObject<'data>],
         seed: OrderedNameInterner<'data>,
     ) -> Result<SelectedObjectFinalization<'data>> {
+        Self::finalize_selected_objects_with_globals(objects, seed, &[])
+    }
+
+    pub(super) fn finalize_selected_objects_with_globals(
+        objects: &[CoffObject<'data>],
+        seed: OrderedNameInterner<'data>,
+        globals: &[SelectedGlobalSymbol],
+    ) -> Result<SelectedObjectFinalization<'data>> {
         let sources = SourceFiles::new(objects.iter().map(CoffObject::bytes).collect());
-        let ordered_occurrences = ordered_name_occurrences(objects)?;
-        let finalized = finalize_ordered_names_with(seed, ordered_occurrences);
-        let names = name_records(objects, &finalized.names, &finalized.occurrence_names)?;
+        let (canonical_names, occurrence_names) = finalize_selected_names(objects, seed, globals)?;
+        let names = name_records(objects, &canonical_names, &occurrence_names)?;
         let section_count = objects
             .iter()
             .try_fold(0usize, |count, object| {
@@ -346,8 +354,7 @@ impl<'data> PeIr<'data> {
             let occurrence_end = occurrence_start
                 .checked_add(index.names().len())
                 .ok_or_else(|| crate::error!("Selected COFF name occurrence count overflow"))?;
-            let local_names = finalized
-                .occurrence_names
+            let local_names = occurrence_names
                 .get(occurrence_start..occurrence_end)
                 .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
             occurrence_start = occurrence_end;
@@ -463,8 +470,8 @@ impl<'data> PeIr<'data> {
         };
         Ok(SelectedObjectFinalization {
             ir,
-            names: finalized.names,
-            occurrence_names: finalized.occurrence_names,
+            names: canonical_names,
+            occurrence_names,
         })
     }
 
@@ -500,19 +507,45 @@ impl<'data> PeIr<'data> {
     }
 }
 
-fn ordered_name_occurrences<'data>(
+fn finalize_selected_names<'data>(
     objects: &[CoffObject<'data>],
-) -> Result<Vec<OrderedNameOccurrence<'data>>> {
+    mut names: OrderedNameInterner<'data>,
+    globals: &[SelectedGlobalSymbol],
+) -> Result<(OrderedNameInterner<'data>, Box<[NameId]>)> {
     let occurrence_count = objects
         .iter()
         .try_fold(0usize, |count, object| {
             count.checked_add(object.index().names().len())
         })
         .ok_or_else(|| crate::error!("Selected COFF name occurrence count overflow"))?;
-    let mut ordered = Vec::with_capacity(occurrence_count);
-    for object in objects {
-        for occurrence in object.index().names() {
-            if let Some(source) = occurrence.source() {
+    let mut occurrence_names = Vec::with_capacity(occurrence_count);
+    let mut global_position = 0usize;
+    let mut known = Vec::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        let index = object.index();
+        known.clear();
+        while let Some(global) = globals.get(global_position) {
+            if global.object != object_index {
+                break;
+            }
+            let raw_symbol = u32::try_from(global.index.0)
+                .map_err(|_| crate::error!("Raw COFF symbol index exceeds u32"))?;
+            let symbol = index
+                .symbols()
+                .binary_search_by_key(&raw_symbol, |symbol| symbol.raw_index)
+                .ok()
+                .and_then(|position| index.symbols().get(position))
+                .ok_or_else(|| crate::error!("Resolver global has no indexed COFF symbol"))?;
+            known.push((symbol.name.0 as usize, global.name_id));
+            global_position += 1;
+        }
+        let mut known = known.iter().copied().peekable();
+        for (local_name, occurrence) in index.names().iter().copied().enumerate() {
+            if let Some((_, name)) = known.next_if(|(occurrence, _)| *occurrence == local_name) {
+                occurrence_names.push(name);
+                continue;
+            }
+            let name = if let Some(source) = occurrence.source() {
                 let end = source
                     .start
                     .checked_add(source.len)
@@ -521,7 +554,7 @@ fn ordered_name_occurrences<'data>(
                     .bytes()
                     .get(source.start as usize..end as usize)
                     .ok_or_else(|| crate::error!("Invalid object-local COFF name range"))?;
-                ordered.push(OrderedNameOccurrence::valid(bytes, occurrence.hash()));
+                names.intern_borrowed_prehashed(bytes, occurrence.hash_or_compute(bytes))
             } else {
                 let diagnostic = match occurrence.deferred_error() {
                     Some(CoffDeferredNameError::InvalidNameOffset) => {
@@ -532,11 +565,17 @@ fn ordered_name_occurrences<'data>(
                     }
                     None => return Err(crate::error!("Missing deferred COFF name diagnostic")),
                 };
-                ordered.push(OrderedNameOccurrence::invalid(diagnostic));
-            }
+                names.intern_invalid(diagnostic)
+            };
+            occurrence_names.push(name);
         }
     }
-    Ok(ordered)
+    if global_position != globals.len() {
+        return Err(crate::error!(
+            "Resolver globals are not ordered by selected COFF object"
+        ));
+    }
+    Ok((names, occurrence_names.into_boxed_slice()))
 }
 
 fn name_records<'data>(

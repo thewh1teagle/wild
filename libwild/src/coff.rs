@@ -1,9 +1,10 @@
 //! PE/COFF input primitives.
 //!
-//! `CoffObject::parse` validates the container and immediately builds one immutable, source-backed
-//! index. Generic `object` iterators are confined to that indexing boundary. Malformed symbol-name
-//! offsets and relocation symbol indices are recorded, not diagnosed: the consumer that first
-//! needs a live name or target remains the final diagnostic boundary.
+//! `CoffObject::parse` only validates the container. Once archive selection has reached its
+//! fixpoint, selected objects build one immutable, source-backed index in parallel. Generic
+//! `object` iterators are confined to that indexing boundary. Malformed symbol-name offsets and
+//! relocation symbol indices are recorded, not diagnosed: the consumer that first needs a live
+//! name or target remains the final diagnostic boundary.
 
 #![allow(dead_code)]
 
@@ -15,6 +16,7 @@ use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 use object::read::coff::CoffHeader;
 use object::read::coff::Symbol as _;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -27,7 +29,7 @@ pub(crate) struct Pe;
 pub(crate) struct CoffObject<'data> {
     file: object::File<'data>,
     bytes: &'data [u8],
-    index: CoffRelocationIndex,
+    index: OnceLock<CoffRelocationIndex>,
     legacy_relocation_index_accessed: AtomicBool,
 }
 
@@ -57,12 +59,14 @@ pub(super) enum CoffDeferredNameError {
 }
 
 /// One occurrence, in primary-symbol then section/relocation input order. Equal byte strings
-/// intentionally remain separate here so global NameId assignment can be finalized deterministically
-/// across objects.
+/// intentionally remain separate here so global NameId assignment can be finalized
+/// deterministically across objects.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CoffNameOccurrence {
     pub(super) source: Option<CoffSourceRange>,
-    pub(super) hash: u64,
+    /// Global symbol names were already hashed by archive resolution. Their canonical NameIds are
+    /// reused during dense finalization, so the full index deliberately leaves the hash absent.
+    pub(super) hash: Option<u64>,
     error: Option<CoffDeferredNameError>,
 }
 
@@ -129,21 +133,20 @@ impl<'data> CoffObject<'data> {
             file.kind() == object::ObjectKind::Relocatable,
             "Only relocatable COFF objects are currently supported"
         );
-        let index = CoffRelocationIndex::new(&file, bytes)?;
         Ok(Self {
             file,
             bytes,
-            index,
+            index: OnceLock::new(),
             legacy_relocation_index_accessed: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn section_count(&self) -> usize {
-        self.index.sections.len()
+        self.index().sections.len()
     }
 
     pub(crate) fn symbol_count(&self) -> usize {
-        self.index.symbols.len()
+        self.index().symbols.len()
     }
 
     pub(crate) fn file(&self) -> &object::File<'data> {
@@ -157,17 +160,38 @@ impl<'data> CoffObject<'data> {
     pub(crate) fn relocation_index(&self) -> &CoffRelocationIndex {
         self.legacy_relocation_index_accessed
             .store(true, Ordering::Relaxed);
-        &self.index
+        self.index()
     }
 
     pub(super) fn index(&self) -> &CoffRelocationIndex {
-        &self.index
+        self.materialize_full_index()
+            .expect("valid selected COFF object must have a materializable index")
+    }
+
+    /// Build the full section/symbol/relocation index on demand. Archive extraction deliberately
+    /// uses `file()` instead, so unselected members never pay this cost. The writer calls this for
+    /// every selected object in parallel before dense finalization, which also keeps construction
+    /// errors on the normal `Result` path rather than the infallible accessor above.
+    pub(crate) fn materialize_full_index(&self) -> Result<&CoffRelocationIndex> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let index = CoffRelocationIndex::new(&self.file, self.bytes)?;
+        // Each selected object occupies one deterministic parallel slot. Retain correctness if a
+        // future caller races on the same object: either identical immutable index may win.
+        let _ = self.index.set(index);
+        Ok(self.index.get().expect("COFF index was just initialized"))
     }
 
     #[cfg(test)]
     pub(crate) fn relocation_index_initialized(&self) -> bool {
         self.legacy_relocation_index_accessed
             .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn full_index_initialized(&self) -> bool {
+        self.index.get().is_some()
     }
 }
 
@@ -206,15 +230,15 @@ impl CoffRelocationIndex {
             } else {
                 raw_symbol.name(file.coff_symbol_table().strings())
             };
-            let name = push_name_occurrence(&mut names, bytes, name_bytes)?;
-            let symbol_id = CoffRelocationSymbolId(dense_u32(symbols.len(), "COFF symbol")?);
-            raw_to_dense[raw_index.0] = Some(symbol_id);
             let storage_class = raw_symbol.storage_class();
             let section_number = raw_symbol.section_number();
             let is_global = matches!(
                 storage_class,
                 object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
             );
+            let name = push_name_occurrence(&mut names, bytes, name_bytes, !is_global)?;
+            let symbol_id = CoffRelocationSymbolId(dense_u32(symbols.len(), "COFF symbol")?);
+            raw_to_dense[raw_index.0] = Some(symbol_id);
             symbols.push(CoffSymbolRecord {
                 raw_index: dense_u32(raw_index.0, "raw COFF symbol index")?,
                 name,
@@ -266,7 +290,7 @@ impl CoffRelocationIndex {
         }
 
         for (section_ordinal, section) in file.sections().enumerate() {
-            let name = push_name_occurrence(&mut names, bytes, section.name_bytes())?;
+            let name = push_name_occurrence(&mut names, bytes, section.name_bytes(), true)?;
             let relocation_start = dense_u32(relocations.len(), "COFF relocation")?;
             for (offset, relocation) in section.relocations() {
                 // Both standard and bigobj COFF readers always expose a raw COFF relocation as a
@@ -396,7 +420,7 @@ impl CoffSymbolRecord {
     }
 
     pub(crate) fn name<'data>(&self, object: &'data CoffObject<'data>) -> Result<&'data [u8]> {
-        object.index.name_bytes(object.bytes, self.name)
+        object.index().name_bytes(object.bytes, self.name)
     }
 }
 
@@ -405,8 +429,15 @@ impl CoffNameOccurrence {
         self.source
     }
 
-    pub(super) fn hash(self) -> u64 {
+    pub(super) fn hash(self) -> Option<u64> {
         self.hash
+    }
+
+    pub(super) fn hash_or_compute(self, bytes: &[u8]) -> u64 {
+        self.hash.unwrap_or_else(|| {
+            count_name_hash();
+            crate::hash::hash_bytes(bytes)
+        })
     }
 
     pub(super) fn deferred_error(self) -> Option<CoffDeferredNameError> {
@@ -418,17 +449,20 @@ fn push_name_occurrence(
     names: &mut Vec<CoffNameOccurrence>,
     bytes: &[u8],
     name: object::read::Result<&[u8]>,
+    prehash: bool,
 ) -> Result<CoffNameId> {
     match name
         .ok()
         .and_then(|name| source_range(bytes, name).map(|source| (source, name)))
     {
         Some((source, name)) => {
-            count_name_hash();
             let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
             names.push(CoffNameOccurrence {
                 source: Some(source),
-                hash: crate::hash::hash_bytes(name),
+                hash: prehash.then(|| {
+                    count_name_hash();
+                    crate::hash::hash_bytes(name)
+                }),
                 error: None,
             });
             Ok(id)
@@ -444,7 +478,7 @@ fn push_invalid_name(
     let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
     names.push(CoffNameOccurrence {
         source: None,
-        hash: 0,
+        hash: None,
         error: Some(error),
     });
     Ok(id)
@@ -729,14 +763,16 @@ mod tests {
     }
 
     #[test]
-    fn eager_index_is_stable_ordered_and_interns_relocation_targets() {
+    fn deferred_index_is_stable_ordered_and_interns_relocation_targets() {
         assert_send_sync::<CoffRelocationIndex>();
         assert_eq!(std::mem::size_of::<CoffRelocationRecord>(), 12);
         assert!(std::mem::size_of::<CoffSectionRecord>() <= 80);
         assert!(std::mem::size_of::<CoffSymbolRecord>() <= 64);
         let bytes = standard_object_with_repeated_relocations();
         let object = CoffObject::parse(&bytes).unwrap();
+        assert!(!object.full_index_initialized());
         let index = object.relocation_index();
+        assert!(object.full_index_initialized());
         assert!(std::ptr::eq(index, object.relocation_index()));
         assert_eq!(index.sections.len(), 1);
         assert_eq!(index.symbols.len(), 1);
@@ -772,7 +808,7 @@ mod tests {
         assert!(occurrence.source.is_some());
         assert!(symbol.shape(&object).unwrap().is_global);
         assert_eq!(symbol.name(&object).unwrap(), b"target");
-        assert_eq!(occurrence.hash(), crate::hash::hash_bytes(b"target"));
+        assert_eq!(occurrence.hash(), None);
     }
 
     #[test]

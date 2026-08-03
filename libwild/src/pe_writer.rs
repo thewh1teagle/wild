@@ -357,6 +357,9 @@ pub(crate) fn link<F: FileSystem>(
     }
     let selected =
         select_inputs_to_fixpoint(fs, args, &definition.exports, &input_storage, &mut inputs)?;
+    // Preserve the historical diagnostic/side-effect boundary: validate every retained object's
+    // full shape before manifest preparation can write an auxiliary file.
+    materialize_selected_object_indices(&selected.objects)?;
     let mut resources = selected.resources;
     {
         crate::timing_phase!(PE_PHASE_PREPARE_RESOURCES);
@@ -383,7 +386,7 @@ pub(crate) fn link<F: FileSystem>(
     roots.dedup();
     ensure!(!objects.is_empty(), "no COFF object files selected");
 
-    let dense = DenseProductionState::finalize(&objects, resolver_seed)?;
+    let dense = DenseProductionState::finalize(&objects, resolver_seed, &symbol_snapshot)?;
 
     let (imports, symbol_metadata) = {
         crate::timing_phase!(PE_PHASE_RESOLVE_IMPORTS);
@@ -442,6 +445,20 @@ pub(crate) fn link<F: FileSystem>(
         }
     }
     Ok(crate::LinkerOutput { layout: None })
+}
+
+/// Materialize only the objects retained by archive selection. Indexed collection preserves input
+/// order (and therefore deterministic error selection) while each independent object does its
+/// generic COFF traversal on the Rayon pool.
+fn materialize_selected_object_indices(objects: &[crate::coff::CoffObject<'_>]) -> Result<()> {
+    let results = objects
+        .par_iter()
+        .map(crate::coff::CoffObject::materialize_full_index)
+        .collect::<Vec<_>>();
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 fn prepare_manifest<F: FileSystem>(
@@ -1220,6 +1237,7 @@ impl<'data> DenseProductionState<'data> {
     fn finalize(
         objects: &[crate::coff::CoffObject<'data>],
         seed: pe_resolver::ResolverSeed<'data>,
+        symbol_snapshot: &pe_resolver::SelectedSymbolSnapshot,
     ) -> Result<Self> {
         let pe_resolver::ResolverSeedParts {
             names,
@@ -1237,7 +1255,11 @@ impl<'data> DenseProductionState<'data> {
             ir,
             names,
             occurrence_names: _,
-        } = pe_ir::PeIr::finalize_selected_objects(objects, names)?;
+        } = pe_ir::PeIr::finalize_selected_objects_with_globals(
+            objects,
+            names,
+            &symbol_snapshot.globals,
+        )?;
 
         let mut resolver_states = states.into_vec();
         // Object-local names appended during finalization were never resolver demands. Their
