@@ -6,6 +6,7 @@ use crate::error;
 use crate::error::Context;
 use crate::error::Result;
 use linker_utils::coff_archives::CoffArchive;
+use linker_utils::coff_archives::CoffArchiveMember;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
 use linker_utils::coff_imports::ShortImportObject;
 use linker_utils::coff_runtime::RuntimeResolution;
@@ -286,11 +287,11 @@ fn extract_pass<'data>(
     use_alternates: bool,
 ) -> Result<bool> {
     let mut changed = false;
-    for (archive_index, archive) in archives.iter().enumerate() {
-        // Archive order is significant. In particular, a definition selected from an
-        // earlier library must suppress a competing definition in a later one during this
-        // same pass. Keep the outer loop because a later library may introduce a new demand
-        // that can be satisfied by an earlier library on the next pass.
+    let mut next_archive = 0;
+    while next_archive < archives.len() {
+        // A demand snapshot remains valid until an archive selects a member and mutates the
+        // symbol state. Reuse it across runs of archives that select nothing instead of cloning,
+        // resolving and allocating the same names once per archive.
         let fallback_names;
         let demands = if use_alternates {
             fallback_names = fallback_demands(
@@ -330,14 +331,21 @@ fn extract_pass<'data>(
             );
             demands
         };
-        let selected = archive.select_shallow_members_with_defined_lookup(
+        let Some((archive_index, selected)) = next_archive_selection(
+            archives,
+            whole_archive,
+            extracted,
+            &symbol_state.defined,
             &demands,
-            whole_archive[archive_index],
-            |name| symbol_state.defined.contains(name),
-        );
+            next_archive,
+        ) else {
+            break;
+        };
+        next_archive = archive_index + 1;
+        drop(demands);
         for member in selected {
             if !extracted.insert((archive_index, member.index())) {
-                continue;
+                unreachable!("the archive-selection scan filters extracted members");
             }
             match member.kind() {
                 CoffArchiveMemberKind::CoffObject { .. } => {
@@ -388,6 +396,28 @@ fn extract_pass<'data>(
         }
     }
     Ok(changed)
+}
+
+fn next_archive_selection<'archive, 'data>(
+    archives: &'archive [&CoffArchive<'data>],
+    whole_archive: &[bool],
+    extracted: &HashSet<(usize, usize)>,
+    defined: &HashSet<Vec<u8>>,
+    demands: &[ArchiveDemand<'_>],
+    start: usize,
+) -> Option<(usize, Vec<&'archive CoffArchiveMember<'data>>)> {
+    for archive_index in start..archives.len() {
+        let mut selected = archives[archive_index].select_shallow_members_with_defined_lookup(
+            demands,
+            whole_archive[archive_index],
+            |name| defined.contains(name),
+        );
+        selected.retain(|member| !extracted.contains(&(archive_index, member.index())));
+        if !selected.is_empty() {
+            return Some((archive_index, selected));
+        }
+    }
+    None
 }
 
 fn fallback_demands(
