@@ -74,8 +74,6 @@ const PE_DETAIL_LAYOUT_PREPARE: &str = "PE detail: Prepare layout inputs";
 const PE_DETAIL_LAYOUT_RELOCATIONS: &str = "PE detail: Converge relocation layout";
 const PE_DETAIL_LAYOUT_RELAYOUT: &str = "PE detail: Re-layout relocation section";
 const PE_DETAIL_PROBE_ARCHIVE_INDICES: &str = "PE detail: Probe archive indices";
-const PE_DETAIL_REBUILD_ARCHIVE_DEMANDS: &str = "PE detail: Rebuild archive demands";
-const PE_DETAIL_SCAN_ARCHIVE_CANDIDATES: &str = "PE detail: Scan archive candidates";
 const PE_DETAIL_ABSORB_SELECTED_SYMBOLS: &str = "PE detail: Absorb selected symbols";
 const PE_DETAIL_REBUILD_SELECTION_ROOTS: &str = "PE detail: Rebuild selection roots";
 const PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES: &str = "PE detail: Evaluate default libraries";
@@ -5872,8 +5870,6 @@ mod tests {
             PE_DETAIL_LAYOUT_RELOCATIONS,
             PE_DETAIL_LAYOUT_RELAYOUT,
             PE_DETAIL_PROBE_ARCHIVE_INDICES,
-            PE_DETAIL_REBUILD_ARCHIVE_DEMANDS,
-            PE_DETAIL_SCAN_ARCHIVE_CANDIDATES,
             PE_DETAIL_ABSORB_SELECTED_SYMBOLS,
             PE_DETAIL_REBUILD_SELECTION_ROOTS,
             PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES,

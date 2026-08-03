@@ -781,15 +781,16 @@ fn extract_pass<'data>(
     pass_phase
         .0
         .add(crate::timing::PeMetric::Archives, archives.len());
+    let instrumentation_enabled = pass_phase.0.enabled();
+    let extracted_before = extracted.len();
     let mut changed = false;
-    let mut selected_count = 0usize;
     let mut demand_count = 0usize;
+    let mut waves = 0usize;
     let mut next_archive = 0;
     while next_archive < archives.len() {
         // A demand snapshot remains valid until an archive selects a member and mutates the
         // symbol state. Reuse it across runs of archives that select nothing instead of cloning,
         // resolving and allocating the same names once per archive.
-        let mut demands_phase = crate::pe_timing_guard!(super::PE_DETAIL_REBUILD_ARCHIVE_DEMANDS);
         let fallback_names;
         let demands = if use_alternates {
             fallback_names = fallback_demands(symbol_state, runtime_resolution)?;
@@ -818,20 +819,10 @@ fn extract_pass<'data>(
             );
             demands
         };
-        demand_count += demands.len();
-        demands_phase
-            .0
-            .add(crate::timing::PeMetric::Names, demands.len());
-        drop(demands_phase);
-        let mut candidates_phase =
-            crate::pe_timing_guard!(super::PE_DETAIL_SCAN_ARCHIVE_CANDIDATES);
-        candidates_phase
-            .0
-            .add(crate::timing::PeMetric::Names, demands.len());
-        candidates_phase.0.add(
-            crate::timing::PeMetric::Archives,
-            archives.len().saturating_sub(next_archive),
-        );
+        if instrumentation_enabled {
+            demand_count += demands.len();
+            waves += 1;
+        }
         let selection = next_archive_selection(
             archives,
             whole_archive,
@@ -841,17 +832,12 @@ fn extract_pass<'data>(
             archive_providers,
             &symbol_state.names,
         );
-        candidates_phase
-            .0
-            .add(crate::timing::PeMetric::Lookups, demands.len());
-        drop(candidates_phase);
         let Some((archive_index, selected)) = selection else {
             break;
         };
         next_archive = archive_index + 1;
         drop(demands);
         for member in selected {
-            selected_count += 1;
             if extracted.len() == extracted.capacity() {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
             }
@@ -944,7 +930,12 @@ fn extract_pass<'data>(
         .add(crate::timing::PeMetric::Names, demand_count);
     pass_phase
         .0
-        .add(crate::timing::PeMetric::Events, selected_count);
+        .add(crate::timing::PeMetric::Lookups, demand_count);
+    pass_phase.0.add(crate::timing::PeMetric::Waves, waves);
+    pass_phase.0.add(
+        crate::timing::PeMetric::Events,
+        extracted.len() - extracted_before,
+    );
     pass_phase
         .0
         .add(crate::timing::PeMetric::Objects, objects.len());

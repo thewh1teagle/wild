@@ -15,7 +15,6 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
@@ -408,8 +407,6 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
         let mut live_bits = vec![0u64; section_count.div_ceil(64)];
         let mut visitation_order = Vec::new();
         let mut pending = VecDeque::new();
-        let instrumentation_enabled = collect_phase.0.enabled();
-        let queue_pushes = Cell::new(0usize);
         let mark = |section: SectionId,
                     live_bits: &mut [u64],
                     pending: &mut VecDeque<SectionId>,
@@ -427,25 +424,40 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 live_bits[word] |= mask;
                 pending.push_back(canonical);
                 visitation_order.push(canonical);
-                if instrumentation_enabled {
-                    queue_pushes.set(queue_pushes.get() + 1);
-                }
             }
             Ok(())
         };
 
         let mut roots_phase = crate::pe_timing_guard!("PE dense GC: Seed roots");
-        let mut root_events = 0usize;
-        let mut root_lookups = 0usize;
+        if roots_phase.0.enabled() {
+            let root_events = input
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        GcEvent::RootSection { .. } | GcEvent::RootSymbol { .. }
+                    )
+                })
+                .count();
+            let root_lookups = input
+                .events
+                .iter()
+                .filter(|event| matches!(event, GcEvent::RootSymbol { .. }))
+                .count();
+            roots_phase
+                .0
+                .add(crate::timing::PeMetric::Events, root_events);
+            roots_phase
+                .0
+                .add(crate::timing::PeMetric::Lookups, root_lookups);
+        }
         for event in input.events {
             match *event {
                 GcEvent::RootSection { section, .. } => {
-                    root_events += 1;
                     mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
                 }
                 GcEvent::RootSymbol { name, .. } => {
-                    root_events += 1;
-                    root_lookups += 1;
                     let target = self.resolve_name(input.symbols, name)?;
                     if let Some(import) = target.import {
                         referenced_imports.insert(import);
@@ -465,20 +477,11 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 | GcEvent::Discard { .. } => {}
             }
         }
-        roots_phase
-            .0
-            .add(crate::timing::PeMetric::Events, root_events);
-        roots_phase
-            .0
-            .add(crate::timing::PeMetric::Lookups, root_lookups);
         drop(roots_phase);
 
         let mut traversal_phase = crate::pe_timing_guard!("PE dense GC: Traverse live graph");
-        let mut visited_sections = 0usize;
-        let mut visited_relocations = 0usize;
         let mut dir64_needs = Vec::new();
         while let Some(section) = pending.pop_front() {
-            visited_sections += 1;
             let group = group_by_section[section.index()];
             if group != u32::MAX {
                 let group = &input.groups[group as usize];
@@ -505,46 +508,43 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 .for_section(section)
                 .context("live section has no relocation CSR row")?;
             for relocation in relocations {
-                visited_relocations += 1;
-                let resolution_timer = traversal_phase.0.timer();
                 let target = self.resolve_occurrence(input.symbols, *relocation)?;
-                traversal_phase.0.add_elapsed(
-                    crate::timing::PeMetric::TargetResolutionUs,
-                    resolution_timer,
-                );
                 if relocation.typ == 1 && !target.absolute {
                     dir64_needs.push(Dir64Need {
                         section,
                         offset: relocation.offset,
                     });
                 }
-                let import_timer = traversal_phase.0.timer();
                 if let Some(import) = target.import {
                     referenced_imports.insert(import);
                 }
                 if let Some(name) = target.import_name {
                     referenced_import_names.insert(name);
                 }
-                traversal_phase
-                    .0
-                    .add_elapsed(crate::timing::PeMetric::ImportCollectionUs, import_timer);
                 if let Some(target) = target.section {
                     mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
                 }
             }
         }
-        traversal_phase
-            .0
-            .add(crate::timing::PeMetric::Sections, visited_sections);
-        traversal_phase
-            .0
-            .add(crate::timing::PeMetric::Relocations, visited_relocations);
-        traversal_phase
-            .0
-            .add(crate::timing::PeMetric::Lookups, visited_relocations);
-        traversal_phase
-            .0
-            .add(crate::timing::PeMetric::QueuePushes, queue_pushes.get());
+        if traversal_phase.0.enabled() {
+            let visited_relocations = visitation_order
+                .iter()
+                .filter_map(|&section| input.relocations.range(section))
+                .map(|range| range.len())
+                .sum();
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::Sections, visitation_order.len());
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::Relocations, visited_relocations);
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::Lookups, visited_relocations);
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::QueuePushes, visitation_order.len());
+        }
         traversal_phase.0.add(
             crate::timing::PeMetric::Imports,
             referenced_import_names.len(),
