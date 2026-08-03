@@ -102,6 +102,26 @@ const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
 const LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK: usize = 64;
 const LIVE_IMPORT_CHUNKS_PER_THREAD: usize = 4;
 const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
+
+#[inline]
+fn count_pe_relocation_decode() {
+    #[cfg(not(test))]
+    crate::perf::removal_counters::increment_relocation_decodes();
+}
+
+#[inline]
+fn count_pe_bytes_copied(bytes: usize) {
+    #[cfg(not(test))]
+    crate::perf::removal_counters::add_bytes_copied(bytes as u64);
+    #[cfg(test)]
+    let _ = bytes;
+}
+
+#[inline]
+fn count_pe_hot_allocation() {
+    #[cfg(not(test))]
+    crate::perf::removal_counters::increment_hot_phase_allocations();
+}
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
@@ -123,6 +143,8 @@ mod pe_gc;
 mod pe_imports;
 #[path = "pe_ir.rs"]
 mod pe_ir;
+#[path = "pe_layout.rs"]
+mod pe_layout;
 #[path = "pe_resolver.rs"]
 mod pe_resolver;
 #[path = "pe_symbol_db.rs"]
@@ -192,7 +214,9 @@ enum Source {
 struct Contribution {
     source: Source,
     spec: SectionContribution,
-    data: Vec<u8>,
+    /// Owned bytes exist only for linker-synthesized sections. Real input sections remain
+    /// source-backed until their final output slice is copied and relocated.
+    synthetic_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1633,14 +1657,14 @@ fn build_image_with_delay_loads(
             .iter_mut()
             .find(|contribution| contribution.spec.id == id)
             .unwrap()
-            .data = emitted_delay_unwind.xdata;
+            .synthetic_data = emitted_delay_unwind.xdata;
     }
     if let Some(id) = delay_pdata_id {
         contributions
             .iter_mut()
             .find(|contribution| contribution.spec.id == id)
             .unwrap()
-            .data = emitted_delay_unwind.pdata;
+            .synthetic_data = emitted_delay_unwind.pdata;
     }
 
     let eager_imports_phase = crate::timing_guard!(PE_DETAIL_BUILD_IMPORTS);
@@ -1657,14 +1681,14 @@ fn build_image_with_delay_loads(
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .data = emitted_imports.idata.clone();
+            .synthetic_data = emitted_imports.idata.clone();
     }
     if let Some(id) = thunk_id {
         contributions
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .data = emitted_imports.thunks.clone();
+            .synthetic_data = emitted_imports.thunks.clone();
     }
     drop(eager_imports_phase);
     // Produce a first deterministic delay image to publish its synthetic definitions before
@@ -1687,14 +1711,14 @@ fn build_image_with_delay_loads(
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .data = emitted_delay_imports.didat.clone();
+            .synthetic_data = emitted_delay_imports.didat.clone();
     }
     if let Some(id) = delay_thunk_id {
         contributions
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .data = emitted_delay_imports.thunks.clone();
+            .synthetic_data = emitted_delay_imports.thunks.clone();
     }
     drop(delay_imports_phase);
     let resources_phase = crate::timing_guard!(PE_DETAIL_BUILD_RESOURCES);
@@ -1706,10 +1730,10 @@ fn build_image_with_delay_loads(
         .context("failed to build PE resource directory")?;
         let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
         ensure!(
-            section.bytes.len() == contribution.data.len(),
+            section.bytes.len() == contribution.synthetic_data.len(),
             "PE resource section changed size after layout"
         );
-        contribution.data.copy_from_slice(&section.bytes);
+        contribution.synthetic_data.copy_from_slice(&section.bytes);
         Some((section.data_directory.rva, section.data_directory.size))
     } else {
         None
@@ -1772,12 +1796,12 @@ fn build_image_with_delay_loads(
             .iter_mut()
             .find(|c| c.spec.id == didat)
             .unwrap()
-            .data = emitted_delay_imports.didat.clone();
+            .synthetic_data = emitted_delay_imports.didat.clone();
         contributions
             .iter_mut()
             .find(|c| c.spec.id == thunks)
             .unwrap()
-            .data = emitted_delay_imports.thunks.clone();
+            .synthetic_data = emitted_delay_imports.thunks.clone();
     }
     let load_config_directory = load_config_directory(
         objects,
@@ -1842,10 +1866,10 @@ fn build_image_with_delay_loads(
                 .context("failed to build PE export directory")?;
         let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
         ensure!(
-            directory.bytes.len() <= contribution.data.len(),
+            directory.bytes.len() <= contribution.synthetic_data.len(),
             "PE export directory exceeded its reserved size"
         );
-        contribution.data[..directory.bytes.len()].copy_from_slice(&directory.bytes);
+        contribution.synthetic_data[..directory.bytes.len()].copy_from_slice(&directory.bytes);
         Some(directory)
     } else {
         None
@@ -1854,22 +1878,29 @@ fn build_image_with_delay_loads(
 
     let assemble_image_phase = crate::timing_guard!(PE_PHASE_COPY_IMAGE);
     let image_allocate_phase = crate::timing_guard!(PE_DETAIL_IMAGE_ALLOCATE);
+    count_pe_hot_allocation();
     let mut image = vec![0; layout.file_size as usize];
     drop(image_allocate_phase);
     let image_copy_phase = crate::timing_guard!(PE_DETAIL_IMAGE_COPY);
     for contribution in &contributions {
+        if !matches!(contribution.source, Source::Synthetic) {
+            continue;
+        }
         let placement = &layout.placements[&contribution.spec.id];
         if let Some(file_offset) = placement.file_offset {
             let start = file_offset as usize;
-            image[start..start + contribution.data.len()].copy_from_slice(&contribution.data);
+            image[start..start + contribution.synthetic_data.len()]
+                .copy_from_slice(&contribution.synthetic_data);
+            count_pe_bytes_copied(contribution.synthetic_data.len());
         }
     }
     drop(image_copy_phase);
     drop(assemble_image_phase);
 
     let relocations_phase = crate::timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
-    apply_relocations(
+    copy_and_apply_relocations(
         objects,
+        &contributions,
         &layout,
         &locations,
         &comdat_redirects,
@@ -2397,14 +2428,13 @@ fn materialize_object_contributions_into(
         } else {
             ContributionKind::Data
         };
-        let data = if kind == ContributionKind::Bss {
-            Vec::new()
-        } else {
-            section
-                .data()
-                .context("invalid COFF section contents")?
-                .to_vec()
-        };
+        if kind != ContributionKind::Bss {
+            let data = section.data().context("invalid COFF section contents")?;
+            ensure!(
+                data.len() == size as usize,
+                "COFF section contents differ from section size"
+            );
+        }
         let alignment =
             u32::try_from(section.align().max(1)).context("COFF section alignment too large")?;
         output.push(Contribution {
@@ -2423,7 +2453,7 @@ fn materialize_object_contributions_into(
                 size,
                 kind,
             },
-            data,
+            synthetic_data: Vec::new(),
         });
     }
     Ok(())
@@ -2512,6 +2542,7 @@ fn collect_live_import_references(
             .section_by_index(section)
             .context("live contribution has an invalid source section")?;
         for (_, relocation) in section.relocations() {
+            count_pe_relocation_decode();
             let RelocationTarget::Symbol(symbol) = relocation.target() else {
                 continue;
             };
@@ -3287,6 +3318,7 @@ fn unreferenced_comdat_sections(
                     continue;
                 };
                 for relocation in relocation_index.relocations(section) {
+                    count_pe_relocation_decode();
                     let symbol = relocation_index.symbol(relocation.symbol());
                     let shape = symbol
                         .shape(object)
@@ -3410,7 +3442,7 @@ fn add_common_symbols(
             size: cursor,
             kind: ContributionKind::Bss,
         },
-        data: Vec::new(),
+        synthetic_data: Vec::new(),
     });
     Ok(offsets)
 }
@@ -3442,7 +3474,7 @@ fn add_synthetic(
             size,
             kind: ContributionKind::Data,
         },
-        data: vec![0; size as usize],
+        synthetic_data: vec![0; size as usize],
     });
     Ok(Some(id))
 }
@@ -3494,7 +3526,7 @@ fn converge_relocation_layout(
                 .iter_mut()
                 .find(|contribution| contribution.spec.id == reloc_id)
                 .expect("synthetic relocation contribution remains present");
-            contribution.data = data;
+            contribution.synthetic_data = data;
             return Ok((layout, Some(reloc_id), true, 0));
         }
 
@@ -3507,7 +3539,7 @@ fn converge_relocation_layout(
             .expect("synthetic relocation contribution remains present");
         contribution.spec.size =
             u32::try_from(expected_size).context("base relocation table too large")?;
-        contribution.data.resize(expected_size, 0);
+        contribution.synthetic_data.resize(expected_size, 0);
     }
 
     loop {
@@ -3524,7 +3556,7 @@ fn converge_relocation_layout(
                 .iter_mut()
                 .find(|contribution| contribution.spec.id == reloc_id)
                 .expect("synthetic relocation contribution remains present");
-            contribution.data = data;
+            contribution.synthetic_data = data;
             return Ok((layout, Some(reloc_id), true, relayouts));
         }
 
@@ -3543,7 +3575,7 @@ fn converge_relocation_layout(
             .expect("synthetic relocation contribution remains present");
         contribution.spec.size =
             u32::try_from(expected_size).context("base relocation table too large")?;
-        contribution.data.resize(expected_size, 0);
+        contribution.synthetic_data.resize(expected_size, 0);
     }
 }
 
@@ -3657,6 +3689,7 @@ fn discover_dir64_sites_in_contributions(
             .section_by_index(section_index)
             .context("selected COFF contribution references an invalid section")?;
         for (offset, relocation) in section.relocations() {
+            count_pe_relocation_decode();
             if relocation.kind() == RelocationKind::Absolute && relocation.size() == 64 {
                 if let RelocationTarget::Symbol(index) = relocation.target() {
                     let symbol = input
@@ -3755,8 +3788,9 @@ fn find_local_symbol(
     Ok(None)
 }
 
-fn apply_relocations(
+fn copy_and_apply_relocations(
     objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
@@ -3765,104 +3799,98 @@ fn apply_relocations(
     image_base: u64,
     image: &mut [u8],
 ) -> Result<()> {
+    validate_object_output_ranges(contributions, layout, image.len())?;
+    let parallel_image = pe_layout::DisjointOutput::new(image);
+    let copy = |contribution: &Contribution| {
+        copy_and_relocate_contribution(
+            objects,
+            contribution,
+            layout,
+            locations,
+            redirects,
+            definitions,
+            absolute_symbols,
+            image_base,
+            parallel_image,
+        )
+    };
     if rayon::current_num_threads() > 1 {
-        let mut jobs = Vec::new();
-        for (object_index, input) in objects.iter().enumerate() {
-            for source in input.file().sections() {
-                let Some(source_id) = locations.get(&(object_index, source.index())) else {
-                    continue;
-                };
-                if source.relocations().next().is_some() {
-                    jobs.push((object_index, source.index(), *source_id));
-                }
-            }
-        }
-        let parallel_image = ParallelImage::new(image);
-        let results = jobs
-            .par_iter()
-            .map(|&(object_index, section_index, source_id)| {
-                apply_section_relocations(
-                    objects,
-                    object_index,
-                    section_index,
-                    source_id,
-                    layout,
-                    locations,
-                    redirects,
-                    definitions,
-                    absolute_symbols,
-                    image_base,
-                    parallel_image,
-                )
-            })
-            .collect::<Vec<_>>();
-        // Indexed parallel collection preserves input-section order, so the first error remains
-        // deterministic even though independent contribution ranges were updated concurrently.
+        let results = contributions.par_iter().map(copy).collect::<Vec<_>>();
+        // Indexed collection retains contribution order, so malformed-input diagnostics remain
+        // deterministic even though every task owns a disjoint final output slice.
         for result in results {
             result?;
         }
-        return Ok(());
-    }
-
-    for (object_index, input) in objects.iter().enumerate() {
-        for source in input.file().sections() {
-            let Some(source_id) = locations.get(&(object_index, source.index())) else {
-                continue;
-            };
-            let placement = &layout.placements[source_id];
-            for (offset, relocation) in source.relocations() {
-                prepare_relocation(
-                    objects,
-                    object_index,
-                    input,
-                    layout,
-                    locations,
-                    redirects,
-                    definitions,
-                    absolute_symbols,
-                    image_base,
-                    placement,
-                    offset,
-                    &relocation,
-                )?
-                .apply(image)?;
-            }
+    } else {
+        for contribution in contributions {
+            copy(contribution)?;
         }
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct ParallelImage<'image> {
-    address: usize,
-    len: usize,
-    borrow: std::marker::PhantomData<&'image mut [u8]>,
-}
-
-impl<'image> ParallelImage<'image> {
-    fn new(image: &'image mut [u8]) -> Self {
-        Self {
-            address: image.as_mut_ptr() as usize,
-            len: image.len(),
-            borrow: std::marker::PhantomData,
+/// Checks the complete safety invariant before `DisjointOutput` is shared with Rayon: every real
+/// input contribution has exactly one placement and every initialized placement owns a unique,
+/// in-bounds file range.
+fn validate_object_output_ranges(
+    contributions: &[Contribution],
+    layout: &SectionLayout,
+    image_len: usize,
+) -> Result<()> {
+    count_pe_hot_allocation();
+    count_pe_hot_allocation();
+    let object_count = contributions
+        .iter()
+        .filter(|contribution| matches!(contribution.source, Source::Object { .. }))
+        .count();
+    let mut ids = Vec::with_capacity(object_count);
+    let mut ranges = Vec::with_capacity(object_count);
+    for contribution in contributions {
+        if !matches!(contribution.source, Source::Object { .. }) {
+            continue;
+        }
+        let placement = layout
+            .placements
+            .get(&contribution.spec.id)
+            .context("real PE contribution has no layout placement")?;
+        ensure!(
+            placement.size == contribution.spec.size,
+            "real PE contribution placement has the wrong size"
+        );
+        ids.push(contribution.spec.id);
+        match (placement.file_offset, contribution.spec.kind) {
+            (Some(offset), ContributionKind::Data) => {
+                let start = usize::try_from(offset).context("PE contribution offset too large")?;
+                let end = start
+                    .checked_add(
+                        usize::try_from(placement.size)
+                            .context("PE contribution size too large")?,
+                    )
+                    .context("PE contribution file range overflow")?;
+                ensure!(end <= image_len, "PE contribution extends past file data");
+                ranges.push((start, end, contribution.spec.id));
+            }
+            (None, ContributionKind::Bss) => {}
+            (Some(_), ContributionKind::Bss) => {
+                return Err(error!("uninitialized PE contribution has file data"));
+            }
+            (None, ContributionKind::Data) => {
+                return Err(error!("initialized PE contribution has no file placement"));
+            }
         }
     }
 
-    /// Returns the uniquely owned range for one live input contribution.
-    ///
-    /// # Safety
-    /// Callers must only request ranges for distinct contribution IDs. `layout_sections` assigns
-    /// those IDs non-overlapping file ranges, and `source_locations` maps each live input section
-    /// to exactly one ID. The output allocation remains fixed while parallel relocation work runs.
-    unsafe fn contribution(self, start: usize, len: usize) -> Result<&'image mut [u8]> {
-        let end = start
-            .checked_add(len)
-            .context("PE contribution file range overflow")?;
-        ensure!(end <= self.len, "PE contribution extends past file data");
-        // SAFETY: The caller upholds uniqueness, bounds were checked above, and the allocation is
-        // kept alive without reallocation until every parallel task has joined.
-        Ok(unsafe { std::slice::from_raw_parts_mut((self.address as *mut u8).add(start), len) })
-    }
+    ids.sort_unstable();
+    ensure!(
+        ids.windows(2).all(|pair| pair[0] != pair[1]),
+        "real PE contributions reuse a layout identity"
+    );
+    ranges.sort_unstable();
+    ensure!(
+        ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "real PE contribution file placements overlap"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -3896,40 +3924,55 @@ impl PreparedRelocation {
     }
 }
 
-fn apply_section_relocations(
+fn copy_and_relocate_contribution(
     objects: &[crate::coff::CoffObject<'_>],
-    object_index: usize,
-    section_index: object::SectionIndex,
-    source_id: ContributionId,
+    contribution: &Contribution,
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
-    parallel_image: ParallelImage<'_>,
+    parallel_image: pe_layout::DisjointOutput<'_>,
 ) -> Result<()> {
+    let Source::Object {
+        object: object_index,
+        section: section_index,
+    } = contribution.source
+    else {
+        return Ok(());
+    };
     let input = &objects[object_index];
     let source = input
         .file()
         .section_by_index(section_index)
         .context("relocation source has an invalid COFF section")?;
-    let placement = &layout.placements[&source_id];
-    let source_file = usize::try_from(
-        placement
-            .file_offset
-            .ok_or_else(|| error!("relocation in uninitialized section"))?,
-    )
-    .context("relocation file offset too large")?;
+    let placement = &layout.placements[&contribution.spec.id];
+    let Some(file_offset) = placement.file_offset else {
+        ensure!(
+            source.relocations().next().is_none(),
+            "relocation in uninitialized section"
+        );
+        return Ok(());
+    };
+    let source_file = usize::try_from(file_offset).context("relocation file offset too large")?;
     // SAFETY: Every selected input section has its own contribution ID and layout assigns
     // contribution IDs disjoint file ranges. This task is the sole writer for this source.
     let contribution = unsafe {
-        parallel_image.contribution(
+        parallel_image.slice(
             source_file,
             usize::try_from(placement.size).context("PE contribution size too large")?,
         )?
     };
+    let source_data = source.data().context("invalid COFF section contents")?;
+    ensure!(
+        source_data.len() == contribution.len(),
+        "COFF source and output contribution sizes differ"
+    );
+    contribution.copy_from_slice(source_data);
+    count_pe_bytes_copied(source_data.len());
     for (offset, relocation) in source.relocations() {
+        count_pe_relocation_decode();
         let mut prepared = prepare_relocation(
             objects,
             object_index,
@@ -4789,7 +4832,7 @@ mod tests {
                 size,
                 kind: ContributionKind::Data,
             },
-            data: vec![0; size as usize],
+            synthetic_data: vec![0; size as usize],
         }
     }
 
@@ -4808,7 +4851,7 @@ mod tests {
                 size: 5,
                 kind: ContributionKind::Data,
             },
-            data: vec![0; 5],
+            synthetic_data: Vec::new(),
         }
     }
 
@@ -4840,7 +4883,7 @@ mod tests {
         assert_eq!(relayouts, 0);
         assert_eq!(reloc_id, Some(ContributionId(2)));
         assert!(has_relocations);
-        let data = &contributions[2].data;
+        let data = &contributions[2].synthetic_data;
         assert_eq!(
             linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
                 data,
@@ -4876,7 +4919,7 @@ mod tests {
         assert_eq!(relayouts, 2);
         assert_eq!(reloc_id, Some(ContributionId(1)));
         assert!(has_relocations);
-        let data = &contributions[1].data;
+        let data = &contributions[1].synthetic_data;
         assert_eq!(data.len(), 24);
         assert_eq!(
             linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
@@ -4912,7 +4955,7 @@ mod tests {
                     size: 8,
                     kind: ContributionKind::Data,
                 },
-                data: Vec::new(),
+                synthetic_data: Vec::new(),
             })
             .collect::<Vec<_>>();
         let objects = [object];
@@ -6479,7 +6522,7 @@ mod tests {
                                 contribution.spec.alignment,
                                 contribution.spec.size,
                                 contribution.spec.kind,
-                                contribution.data.clone(),
+                                contribution.synthetic_data.clone(),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -6517,6 +6560,13 @@ mod tests {
                 && contribution.6 == ContributionKind::Bss
                 && contribution.7.is_empty()
         }));
+        assert!(
+            signature
+                .iter()
+                .filter(|contribution| contribution.0.is_some())
+                .all(|contribution| contribution.7.is_empty()),
+            "real sections must remain source-backed until their final output slice"
+        );
         assert!(
             signature
                 .iter()
