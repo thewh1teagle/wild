@@ -643,7 +643,7 @@ fn undefined_symbols(
             if name.is_empty() || !symbol.is_global() {
                 continue;
             }
-            if symbol.is_undefined() && !symbol.is_common() {
+            if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
                 undefined.insert(name.to_vec());
             } else if symbol.is_definition() || symbol.is_common() {
                 defined.insert(name.to_vec());
@@ -662,7 +662,7 @@ fn resolved_undefined_symbols(
 ) -> Result<HashSet<Vec<u8>>> {
     let undefined = undefined_symbols(objects, roots)?;
     let object_definitions = object_definition_names(objects)?;
-    undefined
+    let mut undefined = undefined
         .into_iter()
         .map(|name| {
             // A selected short import of the primary name is a real definition and
@@ -681,7 +681,36 @@ fn resolved_undefined_symbols(
                 .map(|resolved| resolved.as_bytes().to_vec())
                 .map_err(Into::into)
         })
-        .collect()
+        .collect::<Result<HashSet<_>>>()?;
+    let weak = weak_external_resolution(objects)?;
+    for (symbol, _, _) in weak.records() {
+        if object_definitions.contains(symbol) {
+            continue;
+        }
+        if archive_definitions.contains(symbol) {
+            undefined.insert(symbol.to_vec());
+            continue;
+        }
+        let target = weak.resolve(symbol, |candidate| {
+            object_definitions.contains(candidate) || archive_definitions.contains(candidate)
+        })?;
+        if !object_definitions.contains(target) {
+            undefined.insert(target.to_vec());
+        }
+    }
+    Ok(undefined)
+}
+
+fn weak_external_resolution(
+    objects: &[crate::coff::CoffObject<'_>],
+) -> Result<linker_utils::coff_runtime::WeakExternalResolution> {
+    let mut resolution = linker_utils::coff_runtime::WeakExternalResolution::default();
+    for (index, object) in objects.iter().enumerate() {
+        for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
+            resolution.apply(record, &format!("selected COFF object #{index}"))?;
+        }
+    }
+    Ok(resolution)
 }
 
 fn object_definition_names(objects: &[crate::coff::CoffObject<'_>]) -> Result<HashSet<Vec<u8>>> {
@@ -887,6 +916,7 @@ fn build_image(
             .or_insert(config.image_base + u64::from(*rva));
     }
     add_image_base_symbol(&mut definitions, config.image_base);
+    bind_weak_externals(objects, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
     let load_config_directory = if let Some(id) = load_config_id {
         let cookie_va = definitions
@@ -1079,6 +1109,24 @@ fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u6
     definitions
         .entry(b"__ImageBase".to_vec())
         .or_insert(address);
+}
+
+fn bind_weak_externals(
+    objects: &[crate::coff::CoffObject<'_>],
+    definitions: &mut HashMap<Vec<u8>, u64>,
+) -> Result<()> {
+    let weak = weak_external_resolution(objects)?;
+    let strong = definitions.keys().cloned().collect::<HashSet<_>>();
+    for (symbol, _, _) in weak.records() {
+        if strong.contains(symbol) {
+            continue;
+        }
+        let target = weak.resolve(symbol, |candidate| strong.contains(candidate))?;
+        if let Some(address) = definitions.get(target).copied() {
+            definitions.insert(symbol.to_vec(), address);
+        }
+    }
+    Ok(())
 }
 
 fn bind_alternate_names(
