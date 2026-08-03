@@ -279,7 +279,7 @@ pub fn stable_build_id(
         previous_end = range.end;
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = StableBuildIdHasher::new();
     let mut cursor = 0;
     const ZEROES: [u8; 64] = [0; 64];
     for range in ranges {
@@ -312,16 +312,21 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
-// Small dependency-free SHA-256 implementation. Keeping it here avoids
-// imposing a hashing dependency on users that only need linker-utils.
-struct Sha256 {
+/// Preserves the historical build-ID stream semantics while delegating SHA-256
+/// block compression to RustCrypto's hardware-dispatched implementation.
+///
+/// The old implementation discarded a partial block when a subsequent update
+/// did not complete it, but still included those bytes in the encoded bit
+/// length. Existing build IDs depend on that behavior at excluded-range
+/// boundaries, so changing it would break reproducibility across Wild versions.
+struct StableBuildIdHasher {
     state: [u32; 8],
     length: u64,
     buffer: [u8; 64],
     buffered: usize,
 }
 
-impl Sha256 {
+impl StableBuildIdHasher {
     fn new() -> Self {
         Self {
             state: [
@@ -342,14 +347,13 @@ impl Sha256 {
             self.buffered += count;
             bytes = &bytes[count..];
             if self.buffered == 64 {
-                let block = self.buffer;
-                self.compress(&block);
+                sha2::block_api::compress256(&mut self.state, &[self.buffer]);
                 self.buffered = 0;
             }
         }
-        while bytes.len() >= 64 {
-            self.compress(&bytes[..64]);
-            bytes = &bytes[64..];
+        while let Some((block, remaining)) = bytes.split_first_chunk::<64>() {
+            sha2::block_api::compress256(&mut self.state, std::slice::from_ref(block));
+            bytes = remaining;
         }
         self.buffer[..bytes.len()].copy_from_slice(bytes);
         self.buffered = bytes.len();
@@ -361,76 +365,18 @@ impl Sha256 {
         self.buffered += 1;
         if self.buffered > 56 {
             self.buffer[self.buffered..].fill(0);
-            let block = self.buffer;
-            self.compress(&block);
+            sha2::block_api::compress256(&mut self.state, &[self.buffer]);
             self.buffer = [0; 64];
         } else {
             self.buffer[self.buffered..56].fill(0);
         }
         self.buffer[56..].copy_from_slice(&bit_length.to_be_bytes());
-        let block = self.buffer;
-        self.compress(&block);
+        sha2::block_api::compress256(&mut self.state, &[self.buffer]);
         let mut digest = [0; 32];
         for (chunk, value) in digest.chunks_exact_mut(4).zip(self.state) {
             chunk.copy_from_slice(&value.to_be_bytes());
         }
         digest
-    }
-
-    #[allow(clippy::many_single_char_names)]
-    fn compress(&mut self, block: &[u8]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut schedule = [0u32; 64];
-        for (index, chunk) in block[..64].chunks_exact(4).enumerate() {
-            schedule[index] = u32::from_be_bytes(chunk.try_into().unwrap());
-        }
-        for index in 16..64 {
-            let s0 = schedule[index - 15].rotate_right(7)
-                ^ schedule[index - 15].rotate_right(18)
-                ^ (schedule[index - 15] >> 3);
-            let s1 = schedule[index - 2].rotate_right(17)
-                ^ schedule[index - 2].rotate_right(19)
-                ^ (schedule[index - 2] >> 10);
-            schedule[index] = schedule[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(schedule[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[index])
-                .wrapping_add(schedule[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *state = state.wrapping_add(value);
-        }
     }
 }
 
@@ -475,6 +421,23 @@ mod tests {
         assert_ne!(
             stable_build_id(&first, Some(8), excluded).unwrap(),
             stable_build_id(&second, Some(8), excluded).unwrap()
+        );
+    }
+
+    #[test]
+    fn large_streaming_hash_preserves_legacy_build_id() {
+        let image = (0..8 * 1024 * 1024)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let checksum = 0x1234;
+        let excluded = [0x40_000..0x40_081, 0x70_0000..0x78_0000];
+        let first = stable_build_id(&image, Some(checksum), &excluded).unwrap();
+        assert_eq!(
+            first,
+            [
+                91, 203, 114, 98, 215, 193, 163, 33, 83, 190, 59, 136, 64, 222, 124, 98, 167, 167,
+                58, 224, 130, 79, 33, 68, 182, 153, 217, 200, 112, 226, 64, 83,
+            ]
         );
     }
 
