@@ -32,10 +32,10 @@ pub struct ExceptionDirectoryRange {
     pub size: u32,
 }
 
-/// The validated, canonical exception table.
+/// An emission-ready AMD64 exception table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Amd64ExceptionTable {
-    /// Sorted and deduplicated runtime-function records.
+    /// Runtime-function records in emitted order.
     pub functions: Vec<RuntimeFunction>,
     /// Deterministic bytes to emit as `.pdata`.
     pub pdata: Vec<u8>,
@@ -94,6 +94,41 @@ impl Error for PeUnwindError {}
 
 pub type Result<T> = std::result::Result<T, PeUnwindError>;
 
+/// Sorts an AMD64 `.pdata` contribution the same way as `lld-link`.
+///
+/// The production linker treats unwind data as opaque: it checks only the
+/// loader-visible table shape and image range, then sorts records by their
+/// begin RVA. In particular, it neither deduplicates records nor interprets
+/// the referenced `.xdata` bytes.
+pub fn sort_amd64_exception_table(
+    pdata: &[u8],
+    pdata_rva: u32,
+    size_of_image: u32,
+) -> Result<Amd64ExceptionTable> {
+    let input_size = validate_pdata_shape(pdata, pdata_rva, size_of_image)?;
+    let mut functions = pdata
+        .chunks_exact(RUNTIME_FUNCTION_SIZE)
+        .map(parse_runtime_function)
+        .collect::<Vec<_>>();
+    functions.sort_unstable_by_key(|function| function.begin_rva);
+
+    let mut sorted = Vec::with_capacity(pdata.len());
+    for function in &functions {
+        sorted.extend_from_slice(&function.begin_rva.to_le_bytes());
+        sorted.extend_from_slice(&function.end_rva.to_le_bytes());
+        sorted.extend_from_slice(&function.unwind_info_rva.to_le_bytes());
+    }
+
+    Ok(Amd64ExceptionTable {
+        functions,
+        pdata: sorted,
+        directory: ExceptionDirectoryRange {
+            rva: pdata_rva,
+            size: input_size,
+        },
+    })
+}
+
 /// Parses, validates, sorts and deduplicates an AMD64 `.pdata` contribution.
 ///
 /// `pdata_rva` is where the returned bytes will be emitted. `xdata_rva` and
@@ -106,29 +141,7 @@ pub fn build_amd64_exception_table(
     xdata_rva: u32,
     size_of_image: u32,
 ) -> Result<Amd64ExceptionTable> {
-    if !pdata_rva.is_multiple_of(4) {
-        return Err(PeUnwindError::new(
-            PeUnwindErrorKind::MisalignedPdata,
-            format!(".pdata RVA {pdata_rva:#x} is not 4-byte aligned"),
-        ));
-    }
-    if !pdata.len().is_multiple_of(RUNTIME_FUNCTION_SIZE) {
-        return Err(PeUnwindError::new(
-            PeUnwindErrorKind::TruncatedPdata,
-            format!(
-                ".pdata size {} is not a multiple of {RUNTIME_FUNCTION_SIZE}",
-                pdata.len()
-            ),
-        ));
-    }
-
-    let input_size = u32::try_from(pdata.len()).map_err(|_| {
-        PeUnwindError::new(
-            PeUnwindErrorKind::ArithmeticOverflow,
-            ".pdata exceeds the PE 32-bit directory-size limit",
-        )
-    })?;
-    checked_image_range(pdata_rva, input_size, size_of_image, ".pdata")?;
+    validate_pdata_shape(pdata, pdata_rva, size_of_image)?;
     let xdata_size = u32::try_from(xdata.len()).map_err(|_| {
         PeUnwindError::new(
             PeUnwindErrorKind::ArithmeticOverflow,
@@ -202,6 +215,33 @@ pub fn build_amd64_exception_table(
             size: canonical_size,
         },
     })
+}
+
+fn validate_pdata_shape(pdata: &[u8], pdata_rva: u32, size_of_image: u32) -> Result<u32> {
+    if !pdata_rva.is_multiple_of(4) {
+        return Err(PeUnwindError::new(
+            PeUnwindErrorKind::MisalignedPdata,
+            format!(".pdata RVA {pdata_rva:#x} is not 4-byte aligned"),
+        ));
+    }
+    if !pdata.len().is_multiple_of(RUNTIME_FUNCTION_SIZE) {
+        return Err(PeUnwindError::new(
+            PeUnwindErrorKind::TruncatedPdata,
+            format!(
+                ".pdata size {} is not a multiple of {RUNTIME_FUNCTION_SIZE}",
+                pdata.len()
+            ),
+        ));
+    }
+
+    let input_size = u32::try_from(pdata.len()).map_err(|_| {
+        PeUnwindError::new(
+            PeUnwindErrorKind::ArithmeticOverflow,
+            ".pdata exceeds the PE 32-bit directory-size limit",
+        )
+    })?;
+    checked_image_range(pdata_rva, input_size, size_of_image, ".pdata")?;
+    Ok(input_size)
 }
 
 #[derive(Clone, Copy)]
@@ -529,6 +569,35 @@ mod tests {
 
     fn basic_unwind() -> Vec<u8> {
         vec![1, 4, 1, 0, 4, 0, 0, 0]
+    }
+
+    #[test]
+    fn lld_sort_preserves_opaque_records_and_duplicates() {
+        let first = function(0x1000, 0, 0xffff_fff1);
+        let second = function(0x2000, 1, 0xdead_beef);
+        let pdata = [second.as_slice(), first.as_slice(), first.as_slice()].concat();
+
+        let table = sort_amd64_exception_table(&pdata, PDATA_RVA, IMAGE_SIZE).unwrap();
+
+        assert_eq!(
+            table.pdata,
+            [first.as_slice(), first.as_slice(), second.as_slice()].concat()
+        );
+        assert_eq!(table.directory.rva, PDATA_RVA);
+        assert_eq!(table.directory.size, 36);
+    }
+
+    #[test]
+    fn lld_sort_rejects_malformed_pdata_shape_and_range() {
+        let record = function(0x1000, 0x1010, XDATA_RVA);
+        let error = sort_amd64_exception_table(&record, PDATA_RVA + 1, IMAGE_SIZE).unwrap_err();
+        assert_eq!(error.kind(), PeUnwindErrorKind::MisalignedPdata);
+
+        let error = sort_amd64_exception_table(&record[..11], PDATA_RVA, IMAGE_SIZE).unwrap_err();
+        assert_eq!(error.kind(), PeUnwindErrorKind::TruncatedPdata);
+
+        let error = sort_amd64_exception_table(&record, IMAGE_SIZE - 4, IMAGE_SIZE).unwrap_err();
+        assert_eq!(error.kind(), PeUnwindErrorKind::FunctionOutOfBounds);
     }
 
     #[test]
