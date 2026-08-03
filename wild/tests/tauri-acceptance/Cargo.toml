@@ -8,7 +8,10 @@ publish = false
 tauri-build = { version = "=2.6.3", features = [] }
 
 [target.'cfg(windows)'.dependencies]
-tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
+tauri = { version = "=2.11.5", default-features = false, features = [
+  "common-controls-v6",
+  "wry",
+] }
 
 [workspace]
 resolver = "2"
