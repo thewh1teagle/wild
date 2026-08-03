@@ -37,7 +37,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const LOAD_CONFIG_SYMBOL: &[u8] = b"_load_config_used";
-const GUARD_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
+const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
     b"__guard_flags",
@@ -48,8 +48,6 @@ const GUARD_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_eh_cont_count",
     b"__guard_eh_cont_table",
     b"__enclave_config",
-    b"__volatile_metadata",
-    b"__guard_memcpy_fptr",
 ];
 
 #[path = "pe_entry.rs"]
@@ -534,7 +532,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
         archive_definitions: BTreeSet::new(),
         resolver: pe_resolver::ResolverSession::new(),
     };
-    for symbol in GUARD_ABSOLUTE_ZERO_SYMBOLS {
+    for symbol in LINKER_ABSOLUTE_ZERO_SYMBOLS {
         selection.resolver.define_linker_symbol(symbol);
     }
     let active = inputs.iter().filter(|(path, _, is_default)| {
@@ -907,7 +905,7 @@ fn resolved_undefined_symbols(
             undefined.insert(target.to_vec());
         }
     }
-    undefined.retain(|name| !GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name.as_slice()));
+    undefined.retain(|name| !LINKER_ABSOLUTE_ZERO_SYMBOLS.contains(&name.as_slice()));
     Ok(undefined)
 }
 
@@ -935,6 +933,52 @@ fn object_definition_names(objects: &[crate::coff::CoffObject<'_>]) -> Result<Ha
     Ok(definitions)
 }
 
+fn absolute_symbol_values(
+    objects: &[crate::coff::CoffObject<'_>],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashMap<Vec<u8>, u64>> {
+    let definitions = object_definition_names(objects)?;
+    let mut absolute = HashMap::new();
+    for input in objects {
+        for symbol in input.file().symbols() {
+            if symbol.is_global()
+                && symbol.section() == object::SymbolSection::Absolute
+                && !symbol.name_bytes()?.is_empty()
+            {
+                absolute.insert(symbol.name_bytes()?.to_vec(), symbol.address());
+            }
+        }
+    }
+    for symbol in LINKER_ABSOLUTE_ZERO_SYMBOLS {
+        if !definitions.contains(*symbol) {
+            absolute.insert(symbol.to_vec(), 0);
+        }
+    }
+
+    let weak = weak_external_resolution(objects)?;
+    for (symbol, _, _) in weak.records() {
+        if definitions.contains(symbol) {
+            continue;
+        }
+        let target = weak.resolve(symbol, |candidate| definitions.contains(candidate))?;
+        if let Some(value) = absolute.get(target).copied() {
+            absolute.insert(symbol.to_vec(), value);
+        }
+    }
+    for (symbol, _) in runtime_resolution.alternate_names() {
+        if definitions.contains(symbol.as_bytes()) {
+            continue;
+        }
+        let target = runtime_resolution.resolve_alternate_name(symbol, |candidate| {
+            definitions.contains(candidate.as_bytes())
+        })?;
+        if let Some(value) = absolute.get(target.as_bytes()).copied() {
+            absolute.insert(symbol.as_bytes().to_vec(), value);
+        }
+    }
+    Ok(absolute)
+}
+
 fn build_image(
     objects: &[crate::coff::CoffObject<'_>],
     imports: &[pe_imports::Import],
@@ -947,6 +991,7 @@ fn build_image(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
     let (mut contributions, comdat_redirects) = collect_contributions(objects, args)?;
+    let absolute_symbols = absolute_symbol_values(objects, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
@@ -1004,7 +1049,7 @@ fn build_image(
     let mut layout = make_layout(&contributions, config)?;
     if dynamic_base {
         for _ in 0..3 {
-            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            let dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
             let next = build_amd64_base_relocation_table(dir64, layout.size_of_image)
                 .context("failed to build PE base relocation table")?;
             if next.is_empty() {
@@ -1035,7 +1080,7 @@ fn build_image(
             layout = next_layout;
         }
         if let Some(id) = reloc_id {
-            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
+            let dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
             reloc_data = build_amd64_base_relocation_table(dir64, layout.size_of_image)?;
             let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
             contribution.spec.size = reloc_data.len() as u32;
@@ -1112,8 +1157,8 @@ fn build_image(
             .or_insert(config.image_base + u64::from(*rva));
     }
     add_image_base_symbol(&mut definitions, config.image_base);
-    for symbol in GUARD_ABSOLUTE_ZERO_SYMBOLS {
-        definitions.entry(symbol.to_vec()).or_insert(0);
+    for (symbol, value) in &absolute_symbols {
+        definitions.entry(symbol.clone()).or_insert(*value);
     }
     bind_weak_externals(objects, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
@@ -1202,6 +1247,7 @@ fn build_image(
         &locations,
         &comdat_redirects,
         &definitions,
+        &absolute_symbols,
         config.image_base,
         &mut image,
     )?;
@@ -1210,6 +1256,7 @@ fn build_image(
         &contributions,
         &layout,
         &definitions,
+        &absolute_symbols,
         config.image_base,
         dynamic_base,
         has_tls_inputs,
@@ -1416,10 +1463,6 @@ fn load_config_directory(
                 .file()
                 .section_by_index(section_index)
                 .context("`_load_config_used` references an invalid section")?;
-            ensure!(
-                section.align() >= 8 && symbol.address().is_multiple_of(8),
-                "`_load_config_used` must be 8-byte aligned"
-            );
             let data = section
                 .data()
                 .context("`_load_config_used` points to uninitialized data")?;
@@ -1432,10 +1475,6 @@ fn load_config_directory(
                 .get(offset..size_field_end)
                 .context("`_load_config_used` section is too small")?;
             let size = u32::from_le_bytes(size_field.try_into().unwrap());
-            ensure!(
-                size >= 4,
-                "`_load_config_used` declares an invalid size {size}"
-            );
             let end = symbol_offset
                 .checked_add(size)
                 .context("`_load_config_used` size overflow")?;
@@ -1452,9 +1491,7 @@ fn load_config_directory(
             return Ok(Some((symbol_rva, size)));
         }
     }
-    Err(error!(
-        "selected `_load_config_used` definition is not backed by initialized section data"
-    ))
+    Ok(None)
 }
 
 fn estimated_export_size(
@@ -2237,21 +2274,9 @@ fn dir64_rvas(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
     layout: &SectionLayout,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
 ) -> Result<Vec<u32>> {
     let locations = source_locations(contributions);
-    let live_definitions = objects
-        .iter()
-        .enumerate()
-        .flat_map(|(object_index, input)| {
-            let locations = &locations;
-            input.file().symbols().filter_map(move |symbol| {
-                let section = symbol.section_index()?;
-                (symbol.is_global() && locations.contains_key(&(object_index, section)))
-                    .then(|| symbol.name_bytes().ok().map(<[u8]>::to_vec))
-                    .flatten()
-            })
-        })
-        .collect::<HashSet<_>>();
     let mut rvas = Vec::new();
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
@@ -2266,9 +2291,7 @@ fn dir64_rvas(
                             .symbol_by_index(index)
                             .context("invalid relocation symbol")?;
                         let name = symbol.name_bytes()?;
-                        if GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name)
-                            && !live_definitions.contains(name)
-                        {
+                        if absolute_symbols.contains_key(name) {
                             continue;
                         }
                     }
@@ -2361,6 +2384,7 @@ fn apply_relocations(
     locations: &LocationMap,
     redirects: &SectionRedirects,
     definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     image: &mut [u8],
 ) -> Result<()> {
@@ -2380,27 +2404,26 @@ fn apply_relocations(
                 let source_file = placement
                     .file_offset
                     .ok_or_else(|| error!("relocation in uninitialized section"))?;
-                let (target, target_section, target_section_index, absolute_zero) = match relocation
-                    .target()
-                {
-                    RelocationTarget::Symbol(index) => {
-                        let symbol = input
-                            .file()
-                            .symbol_by_index(index)
-                            .context("invalid relocation symbol")?;
-                        let name = symbol.name_bytes()?;
-                        if symbol.is_global()
-                            && let Some(address) = definitions.get(name)
-                        {
-                            if *address == 0 && GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name) {
-                                (0, 0, 0, true)
-                            } else {
-                                let (target, section, index) =
-                                    target_location(layout, image_base, *address)?;
-                                (target, section, index, false)
-                            }
-                        } else if let Some(section) = symbol.section_index() {
-                            let ((target_object, target_section_index), id) =
+                let (target, target_section, target_section_index, absolute_value) =
+                    match relocation.target() {
+                        RelocationTarget::Symbol(index) => {
+                            let symbol = input
+                                .file()
+                                .symbol_by_index(index)
+                                .context("invalid relocation symbol")?;
+                            let name = symbol.name_bytes()?;
+                            if symbol.is_global()
+                                && let Some(address) = definitions.get(name)
+                            {
+                                if let Some(value) = absolute_symbols.get(name) {
+                                    (0, 0, 0, Some(*value))
+                                } else {
+                                    let (target, section, index) =
+                                        target_location(layout, image_base, *address)?;
+                                    (target, section, index, None)
+                                }
+                            } else if let Some(section) = symbol.section_index() {
+                                let ((target_object, target_section_index), id) =
                                 redirected_location(locations, redirects, (object_index, section))?
                                     .ok_or_else(|| {
                                         error!(
@@ -2408,40 +2431,40 @@ fn apply_relocations(
                                             String::from_utf8_lossy(name)
                                         )
                                     })?;
-                            let target_section = objects[target_object]
-                                .file()
-                                .section_by_index(target_section_index)
-                                .context("COMDAT redirect targets an invalid section")?;
-                            ensure!(
-                                symbol.address() <= target_section.size(),
-                                "symbol offset exceeds selected COMDAT section"
-                            );
-                            let target_placement = &layout.placements[&id];
-                            let target = target_placement
-                                .rva
-                                .checked_add(
-                                    u32::try_from(symbol.address())
-                                        .context("COFF symbol offset exceeds u32")?,
+                                let target_section = objects[target_object]
+                                    .file()
+                                    .section_by_index(target_section_index)
+                                    .context("COMDAT redirect targets an invalid section")?;
+                                ensure!(
+                                    symbol.address() <= target_section.size(),
+                                    "symbol offset exceeds selected COMDAT section"
+                                );
+                                let target_placement = &layout.placements[&id];
+                                let target = target_placement
+                                    .rva
+                                    .checked_add(
+                                        u32::try_from(symbol.address())
+                                            .context("COFF symbol offset exceeds u32")?,
+                                    )
+                                    .context("COFF symbol RVA overflow")?;
+                                (
+                                    target,
+                                    layout.sections[target_placement.output_section].rva,
+                                    u16::try_from(target_placement.output_section + 1)
+                                        .context("PE section index exceeds u16")?,
+                                    None,
                                 )
-                                .context("COFF symbol RVA overflow")?;
-                            (
-                                target,
-                                layout.sections[target_placement.output_section].rva,
-                                u16::try_from(target_placement.output_section + 1)
-                                    .context("PE section index exceeds u16")?,
-                                false,
-                            )
-                        } else {
-                            let address = *definitions.get(name).ok_or_else(|| {
-                                error!("undefined symbol `{}`", String::from_utf8_lossy(name))
-                            })?;
-                            let (target, section, index) =
-                                target_location(layout, image_base, address)?;
-                            (target, section, index, false)
+                            } else {
+                                let address = *definitions.get(name).ok_or_else(|| {
+                                    error!("undefined symbol `{}`", String::from_utf8_lossy(name))
+                                })?;
+                                let (target, section, index) =
+                                    target_location(layout, image_base, address)?;
+                                (target, section, index, None)
+                            }
                         }
-                    }
-                    RelocationTarget::Section(section) => {
-                        let (_, id) = redirected_location(
+                        RelocationTarget::Section(section) => {
+                            let (_, id) = redirected_location(
                             locations,
                             redirects,
                             (object_index, section),
@@ -2451,17 +2474,17 @@ fn apply_relocations(
                                 "relocation targets discarded section {object_index}:{section:?}"
                             )
                         })?;
-                        let target_placement = &layout.placements[&id];
-                        (
-                            target_placement.rva,
-                            layout.sections[target_placement.output_section].rva,
-                            u16::try_from(target_placement.output_section + 1)
-                                .context("PE section index exceeds u16")?,
-                            false,
-                        )
-                    }
-                    _ => return Err(error!("unsupported COFF relocation target")),
-                };
+                            let target_placement = &layout.placements[&id];
+                            (
+                                target_placement.rva,
+                                layout.sections[target_placement.output_section].rva,
+                                u16::try_from(target_placement.output_section + 1)
+                                    .context("PE section index exceeds u16")?,
+                                None,
+                            )
+                        }
+                        _ => return Err(error!("unsupported COFF relocation target")),
+                    };
                 let typ = match relocation.flags() {
                     object::RelocationFlags::Coff { typ } => typ,
                     flags => return Err(error!("expected COFF relocation flags, got {flags:?}")),
@@ -2471,19 +2494,15 @@ fn apply_relocations(
                 let at = usize::try_from(u64::from(source_file) + offset)
                     .context("relocation file offset too large")?;
                 let field = image.get_mut(at..).context("relocation past file data")?;
-                if absolute_zero {
-                    ensure!(
-                        matches!(
-                            kind,
-                            Amd64RelocationKind::Absolute
-                                | Amd64RelocationKind::Address64
-                                | Amd64RelocationKind::Address32
-                                | Amd64RelocationKind::Address32NoBase
-                        ),
-                        "unsupported {kind:?} relocation to absolute-zero linker symbol"
-                    );
-                    // The field already contains its implicit addend. Adding
-                    // the absolute symbol value zero leaves it unchanged.
+                if let Some(value) = absolute_value {
+                    apply_absolute_amd64_relocation(
+                        kind,
+                        field,
+                        value,
+                        image_base,
+                        placement.rva,
+                        offset,
+                    )?;
                     continue;
                 }
                 apply_amd64_relocation(
@@ -2504,6 +2523,67 @@ fn apply_relocations(
                 )
                 .context("failed to apply AMD64 COFF relocation")?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn apply_absolute_amd64_relocation(
+    kind: linker_utils::coff::Amd64RelocationKind,
+    field: &mut [u8],
+    target: u64,
+    image_base: u64,
+    contribution_rva: u32,
+    offset: u64,
+) -> Result<()> {
+    use linker_utils::coff::Amd64RelocationKind;
+
+    ensure!(
+        field.len() >= kind.field_size(),
+        "{kind:?} relocation field is truncated"
+    );
+    let addend = match kind {
+        Amd64RelocationKind::Absolute => return Ok(()),
+        Amd64RelocationKind::Address64 => {
+            i128::from(i64::from_le_bytes(field[..8].try_into().unwrap()))
+        }
+        Amd64RelocationKind::Section => {
+            i128::from(i16::from_le_bytes(field[..2].try_into().unwrap()))
+        }
+        _ => i128::from(i32::from_le_bytes(field[..4].try_into().unwrap())),
+    };
+    let target = i128::from(target);
+    match kind {
+        Amd64RelocationKind::Absolute => unreachable!(),
+        Amd64RelocationKind::Address64 => {
+            let value = u64::try_from(target + addend)
+                .context("absolute ADDR64 relocation value is outside u64")?;
+            field[..8].copy_from_slice(&value.to_le_bytes());
+        }
+        Amd64RelocationKind::Address32 | Amd64RelocationKind::Address32NoBase => {
+            let value = u32::try_from(target + addend)
+                .context("absolute ADDR32 relocation value is outside u32")?;
+            field[..4].copy_from_slice(&value.to_le_bytes());
+        }
+        Amd64RelocationKind::Relative { extra_offset } => {
+            let place = i128::from(image_base)
+                + i128::from(contribution_rva)
+                + i128::from(offset)
+                + 4
+                + i128::from(extra_offset);
+            let value = i32::try_from(target + addend - place)
+                .context("absolute REL32 relocation value is outside i32")?;
+            field[..4].copy_from_slice(&value.to_le_bytes());
+        }
+        Amd64RelocationKind::Section => {
+            let value = u16::try_from(i128::from(u16::MAX) + addend)
+                .context("absolute SECTION relocation value is outside u16")?;
+            field[..2].copy_from_slice(&value.to_le_bytes());
+        }
+        Amd64RelocationKind::SectionRelative => {
+            let value = u32::try_from(target + addend)
+                .context("absolute SECREL relocation value is outside u32")?;
+            field[..4].copy_from_slice(&value.to_le_bytes());
         }
     }
     Ok(())
@@ -2590,6 +2670,7 @@ fn prepare_tls_directory(
     contributions: &[Contribution],
     layout: &SectionLayout,
     definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     dynamic_base: bool,
     has_tls_inputs: bool,
@@ -2679,7 +2760,7 @@ fn prepare_tls_directory(
         "TLS template size changed during metadata construction"
     );
 
-    let dir64 = dir64_rvas(objects, contributions, layout)?;
+    let dir64 = dir64_rvas(objects, contributions, layout, absolute_symbols)?;
     if dynamic_base {
         for rva in &tls.dir64_relocation_rvas {
             ensure!(
@@ -2959,8 +3040,8 @@ fn write_headers(
         put_u32(image, opt + 164, size);
     }
     if let Some((rva, size)) = load_config_directory {
-        put_u32(image, opt + 200, rva);
-        put_u32(image, opt + 204, size);
+        put_u32(image, opt + 192, rva);
+        put_u32(image, opt + 196, size);
     }
     let table = opt + 240;
     for (index, section) in layout.sections.iter().enumerate() {
@@ -3490,6 +3571,22 @@ mod tests {
             section: SymbolSection::Section(config),
             flags: object::SymbolFlags::None,
         });
+        object.section_symbol(config);
+        let comdat_leader = object.add_symbol(Symbol {
+            name: b"loadcfg_comdat".to_vec(),
+            value: 0,
+            size: u64::try_from(contents.len()).unwrap(),
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(config),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: comdat_leader,
+            sections: vec![config],
+        });
         object
             .add_relocation(
                 config,
@@ -3530,8 +3627,18 @@ mod tests {
             section: SymbolSection::Section(config),
             flags: object::SymbolFlags::None,
         });
+        object.add_symbol(Symbol {
+            name: b"__AbsoluteZero".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Absolute,
+            flags: object::SymbolFlags::None,
+        });
         let count = object.add_symbol(Symbol {
-            name: b"__guard_fids_count".to_vec(),
+            name: b"__volatile_metadata".to_vec(),
             value: 0,
             size: 0,
             kind: object::SymbolKind::Unknown,
@@ -4662,6 +4769,7 @@ mod tests {
             &[],
             &layout,
             &HashMap::new(),
+            &HashMap::new(),
             PeWriterConfig::default().image_base,
             true,
             true,
@@ -4766,11 +4874,15 @@ mod tests {
         )
         .unwrap()
         .bytes;
-        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
+        let directory_rva = u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap());
         assert_ne!(directory_rva, 0);
         assert_eq!(
-            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
             312
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[0x160..0x168].try_into().unwrap()),
+            0
         );
         assert_ne!(
             u32::from_le_bytes(image[0x130..0x134].try_into().unwrap()),
@@ -4825,6 +4937,13 @@ mod tests {
     fn absolute_zero_guard_load_config_fields_are_not_base_relocations() {
         let bytes = guard_absolute_load_config_object();
         let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let mut runtime = linker_utils::coff_runtime::RuntimeResolution::new();
+        runtime
+            .parse_and_apply(
+                "/alternatename:__volatile_metadata=__AbsoluteZero",
+                "loadcfg.obj",
+            )
+            .unwrap();
         let image = build_image(
             &[object],
             &[],
@@ -4834,14 +4953,14 @@ mod tests {
             &crate::args::coff::CoffArgs::default(),
             PeWriterConfig::default(),
             &[],
-            &Default::default(),
+            &runtime,
         )
         .unwrap()
         .bytes;
-        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
+        let directory_rva = u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap());
         assert_ne!(directory_rva, 0);
         assert_eq!(
-            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
             112
         );
         assert_eq!(
@@ -4864,10 +4983,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_misaligned_crt_load_config_symbol() {
+    fn accepts_misaligned_crt_load_config_symbol_like_lld() {
         let bytes = crt_load_config_object(312, 4);
         let object = crate::coff::CoffObject::parse(&bytes).unwrap();
-        let error = build_image(
+        let image = build_image(
             &[object],
             &[],
             &[],
@@ -4878,9 +4997,130 @@ mod tests {
             &[],
             &Default::default(),
         )
-        .err()
+        .unwrap()
+        .bytes;
+        assert_ne!(
+            u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
+            312
+        );
+    }
+
+    #[test]
+    fn publishes_small_readable_crt_load_config_size_like_lld() {
+        let bytes = crt_load_config_object(2, 8);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"small-load-config.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap()
+        .bytes;
+        assert_ne!(
+            u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
+            2
+        );
+    }
+
+    #[test]
+    fn ignores_absolute_load_config_symbol() {
+        let mut input = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let data = input.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        input.append_section_data(data, &[1], 1);
+        input.add_symbol(Symbol {
+            name: LOAD_CONFIG_SYMBOL.to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Absolute,
+            flags: object::SymbolFlags::None,
+        });
+        let bytes = input.write().unwrap();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"absolute-load-config.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap()
+        .bytes;
+        assert_eq!(
+            u64::from_le_bytes(image[0x158..0x160].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn extracts_comdat_load_config_from_archive_and_publishes_index_ten() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("loadcfg.lib");
+        std::fs::write(
+            &archive_path,
+            single_member_archive(b"loadcfg.obj", &crt_load_config_object(312, 8)),
+        )
         .unwrap();
-        assert!(format!("{error:?}").contains("must be 8-byte aligned"));
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            no_entry: true,
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let storage = colosseum::sync::Arena::new();
+        let mut inputs = Vec::new();
+        open_input(&fs, &archive_path, &args, &storage, &mut inputs, false).unwrap();
+        let selected = select_inputs_to_fixpoint(&fs, &args, &[], &storage, &mut inputs).unwrap();
+        assert_eq!(selected.objects.len(), 1);
+        let image = build_image(
+            &selected.objects,
+            &[],
+            &[],
+            b"loadcfg.dll",
+            None,
+            &args,
+            PeWriterConfig::default(),
+            &[],
+            &selected.runtime_resolution,
+        )
+        .unwrap()
+        .bytes;
+        assert_ne!(
+            u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
+            312
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[0x160..0x168].try_into().unwrap()),
+            0
+        );
     }
 
     #[test]
@@ -4965,11 +5205,15 @@ mod tests {
         .unwrap()
         .bytes;
         assert_eq!(
-            u32::from_le_bytes(image[0x160..0x164].try_into().unwrap()),
+            u32::from_le_bytes(image[0x158..0x15c].try_into().unwrap()),
             0
         );
         assert_eq!(
-            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            u32::from_le_bytes(image[0x15c..0x160].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[0x160..0x168].try_into().unwrap()),
             0
         );
     }
