@@ -419,6 +419,16 @@ impl<'data> CoffArchive<'data> {
             .is_some_and(|entry| entry.has_object)
     }
 
+    /// Returns the first member associated with `name` by this archive's definition index.
+    ///
+    /// This is the same member lookup used by shallow extraction planning. Callers that cache
+    /// providers across archives can use it without walking every archive for every resolution
+    /// pass.
+    #[must_use]
+    pub fn first_definition_member_index(&self, name: &[u8]) -> Option<usize> {
+        self.definition_members.get(name).map(|entry| entry.first)
+    }
+
     /// Selects members to a fixpoint.
     ///
     /// `defined` contains definitions supplied by objects seen before this
@@ -998,6 +1008,8 @@ mod tests {
         );
         let parsed = CoffArchive::parse(&archive).unwrap();
         assert_eq!(parsed.members()[0].name(), long_name.as_bytes());
+        assert_eq!(parsed.first_definition_member_index(b"entry"), Some(0));
+        assert_eq!(parsed.first_definition_member_index(b"missing"), None);
         let plan = parsed.plan(
             &[ArchiveDemand {
                 name: b"entry",

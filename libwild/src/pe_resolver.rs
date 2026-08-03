@@ -5,6 +5,8 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
+use foldhash::HashMap;
+use foldhash::HashMapExt;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
 use linker_utils::coff_archives::CoffArchive;
@@ -188,6 +190,55 @@ fn parsed_archives<'session, 'data>(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArchiveProvider {
+    archive_index: usize,
+    member_index: usize,
+}
+
+#[derive(Default)]
+struct CachedArchiveProviders {
+    archives_scanned: usize,
+    providers: Vec<ArchiveProvider>,
+}
+
+struct ArchiveProviderCache {
+    by_name: HashMap<Vec<u8>, CachedArchiveProviders>,
+}
+
+impl ArchiveProviderCache {
+    fn new() -> Self {
+        Self {
+            by_name: HashMap::new(),
+        }
+    }
+
+    fn providers<'cache, 'data>(
+        &'cache mut self,
+        name: &[u8],
+        archives: &[&CoffArchive<'data>],
+    ) -> &'cache [ArchiveProvider] {
+        if !self.by_name.contains_key(name) {
+            self.by_name
+                .insert(name.to_vec(), CachedArchiveProviders::default());
+        }
+        let cached = self
+            .by_name
+            .get_mut(name)
+            .expect("archive provider cache entry was just inserted");
+        for (archive_index, archive) in archives.iter().enumerate().skip(cached.archives_scanned) {
+            if let Some(member_index) = archive.first_definition_member_index(name) {
+                cached.providers.push(ArchiveProvider {
+                    archive_index,
+                    member_index,
+                });
+            }
+        }
+        cached.archives_scanned = archives.len();
+        &cached.providers
+    }
+}
+
 pub(super) struct ResolverSession<'data> {
     archives: Vec<LazyArchive<'data>>,
     whole_archive: Vec<bool>,
@@ -197,6 +248,7 @@ pub(super) struct ResolverSession<'data> {
     symbol_state: IncrementalSymbolState,
     scanned_objects: usize,
     selected_aliases: Vec<(usize, usize)>,
+    archive_providers: ArchiveProviderCache,
 }
 
 impl<'data> ResolverSession<'data> {
@@ -210,6 +262,7 @@ impl<'data> ResolverSession<'data> {
             symbol_state: IncrementalSymbolState::new(),
             scanned_objects: 0,
             selected_aliases: Vec::new(),
+            archive_providers: ArchiveProviderCache::new(),
         }
     }
 
@@ -294,6 +347,7 @@ impl<'data> ResolverSession<'data> {
                 &mut self.selected_imports,
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
+                &mut self.archive_providers,
                 false,
             )?;
             self.scanned_objects = objects.len();
@@ -310,6 +364,7 @@ impl<'data> ResolverSession<'data> {
                 &mut self.selected_imports,
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
+                &mut self.archive_providers,
                 true,
             )?;
             self.scanned_objects = objects.len();
@@ -357,6 +412,7 @@ fn extract_pass<'data>(
     selected_imports: &mut Vec<ShortImportObject<'data>>,
     symbol_state: &mut IncrementalSymbolState,
     selected_aliases: &mut Vec<(usize, usize)>,
+    archive_providers: &mut ArchiveProviderCache,
     use_alternates: bool,
 ) -> Result<bool> {
     let mut changed = false;
@@ -414,6 +470,7 @@ fn extract_pass<'data>(
             &symbol_state.defined,
             &demands,
             next_archive,
+            archive_providers,
         );
         drop(candidates_phase);
         let Some((archive_index, selected)) = selection else {
@@ -480,6 +537,58 @@ fn extract_pass<'data>(
 }
 
 fn next_archive_selection<'archive, 'data>(
+    archives: &'archive [&CoffArchive<'data>],
+    whole_archive: &[bool],
+    extracted: &HashSet<(usize, usize)>,
+    defined: &HashSet<Vec<u8>>,
+    demands: &[ArchiveDemand<'_>],
+    start: usize,
+    archive_providers: &mut ArchiveProviderCache,
+) -> Option<(usize, Vec<&'archive CoffArchiveMember<'data>>)> {
+    let mut demands_by_archive = vec![Vec::new(); archives.len()];
+    let mut touched_archives = Vec::new();
+    for &demand in demands {
+        if defined.contains(demand.name) {
+            continue;
+        }
+        for &provider in archive_providers.providers(demand.name, archives) {
+            if provider.archive_index < start {
+                continue;
+            }
+            debug_assert_eq!(
+                archives[provider.archive_index].first_definition_member_index(demand.name),
+                Some(provider.member_index)
+            );
+            let archive_demands = &mut demands_by_archive[provider.archive_index];
+            if archive_demands.is_empty() {
+                touched_archives.push(provider.archive_index);
+            }
+            archive_demands.push(demand);
+        }
+    }
+    for (archive_index, &is_whole_archive) in whole_archive.iter().enumerate().skip(start) {
+        if is_whole_archive && demands_by_archive[archive_index].is_empty() {
+            touched_archives.push(archive_index);
+        }
+    }
+    touched_archives.sort_unstable();
+
+    for archive_index in touched_archives {
+        let mut selected = archives[archive_index].select_shallow_members_with_defined_lookup(
+            &demands_by_archive[archive_index],
+            whole_archive[archive_index],
+            |name| defined.contains(name),
+        );
+        selected.retain(|member| !extracted.contains(&(archive_index, member.index())));
+        if !selected.is_empty() {
+            return Some((archive_index, selected));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn next_archive_selection_reference<'archive, 'data>(
     archives: &'archive [&CoffArchive<'data>],
     whole_archive: &[bool],
     extracted: &HashSet<(usize, usize)>,
@@ -833,6 +942,171 @@ mod tests {
 
             assert_eq!(objects.len() == 2, extracts_primary, "search type {search}");
         }
+    }
+
+    #[test]
+    fn indexed_archive_selection_matches_reference_across_adversarial_states() {
+        let archive_bytes = [
+            archive(&[
+                ("multi.obj", coff_object(&["alpha", "shared"], &[])),
+                ("weak.obj", coff_object(&["weak"], &[])),
+            ]),
+            archive(&[
+                ("shared.obj", coff_object(&["shared"], &[])),
+                ("later.obj", coff_object(&["later"], &[])),
+            ]),
+            archive(&[("whole.obj", coff_object(&["whole"], &[]))]),
+        ];
+        let parsed = archive_bytes
+            .iter()
+            .map(|bytes| CoffArchive::parse(bytes).unwrap())
+            .collect::<Vec<_>>();
+        let archives = parsed.iter().collect::<Vec<_>>();
+        let demands = [
+            ArchiveDemand {
+                name: b"alpha",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"later",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"shared",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"weak",
+                kind: ArchiveDemandKind::WeakLibrary,
+            },
+        ];
+        let cases = [
+            (0, vec![false, false, false], HashSet::new(), HashSet::new()),
+            (1, vec![false, false, false], HashSet::new(), HashSet::new()),
+            (0, vec![false, false, true], HashSet::new(), HashSet::new()),
+            (2, vec![false, false, true], HashSet::new(), HashSet::new()),
+            (
+                0,
+                vec![false, false, false],
+                HashSet::from_iter([(0, 0)]),
+                HashSet::new(),
+            ),
+            (
+                0,
+                vec![false, false, false],
+                HashSet::new(),
+                HashSet::from_iter([b"alpha".to_vec()]),
+            ),
+        ];
+        let mut providers = ArchiveProviderCache::new();
+        for (start, whole, extracted, defined) in cases {
+            let expected = next_archive_selection_reference(
+                &archives, &whole, &extracted, &defined, &demands, start,
+            );
+            let actual = next_archive_selection(
+                &archives,
+                &whole,
+                &extracted,
+                &defined,
+                &demands,
+                start,
+                &mut providers,
+            );
+            assert_eq!(selection_indices(actual), selection_indices(expected));
+        }
+
+        let shared_only = [ArchiveDemand {
+            name: b"shared",
+            kind: ArchiveDemandKind::Strong,
+        }];
+        let extracted = HashSet::from_iter([(0, 0)]);
+        let expected = selection_indices(next_archive_selection_reference(
+            &archives,
+            &[false, false, false],
+            &extracted,
+            &HashSet::new(),
+            &shared_only,
+            0,
+        ));
+        let actual = selection_indices(next_archive_selection(
+            &archives,
+            &[false, false, false],
+            &extracted,
+            &HashSet::new(),
+            &shared_only,
+            0,
+            &mut providers,
+        ));
+        assert_eq!(actual, expected);
+        assert_eq!(expected, Some((1, vec![0])));
+    }
+
+    #[test]
+    fn provider_cache_extends_negative_entries_for_appended_default_libraries() {
+        let unrelated = archive(&[("other.obj", coff_object(&["other"], &[]))]);
+        let provider = archive(&[("target.obj", coff_object(&["target"], &[]))]);
+        let parsed = [
+            CoffArchive::parse(&unrelated).unwrap(),
+            CoffArchive::parse(&provider).unwrap(),
+        ];
+        let mut cache = ArchiveProviderCache::new();
+
+        assert!(cache.providers(b"target", &[&parsed[0]]).is_empty());
+        assert_eq!(
+            cache.providers(b"target", &[&parsed[0], &parsed[1]]),
+            [ArchiveProvider {
+                archive_index: 1,
+                member_index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn cursor_finishes_later_archives_before_revisiting_an_earlier_provider() {
+        let root = coff_object(&[], &["foo", "current"]);
+        let earlier = archive(&[("new.obj", coff_object(&["new"], &[]))]);
+        let middle = archive(&[("foo.obj", coff_object(&["foo"], &["new"]))]);
+        let later = archive(&[("current.obj", coff_object(&["current"], &[]))]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+
+        extract(
+            &mut objects,
+            &[&earlier, &middle, &later],
+            &[false, false, false],
+            &[],
+            &mut RuntimeResolution::new(),
+        )
+        .unwrap();
+
+        let definitions = objects
+            .iter()
+            .skip(1)
+            .map(|object| {
+                object
+                    .file()
+                    .symbols()
+                    .find(|symbol| symbol.is_global() && symbol.is_definition())
+                    .unwrap()
+                    .name_bytes()
+                    .unwrap()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definitions,
+            [b"foo".to_vec(), b"current".to_vec(), b"new".to_vec()]
+        );
+    }
+
+    fn selection_indices(
+        selection: Option<(usize, Vec<&CoffArchiveMember<'_>>)>,
+    ) -> Option<(usize, Vec<usize>)> {
+        selection.map(|(archive, members)| {
+            (
+                archive,
+                members.into_iter().map(CoffArchiveMember::index).collect(),
+            )
+        })
     }
 
     #[test]
