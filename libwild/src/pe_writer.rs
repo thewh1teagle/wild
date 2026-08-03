@@ -1489,6 +1489,12 @@ fn collect_contributions(
                     .unwrap(),
             )
     });
+    // Filtering an entirely empty output group can leave gaps in the IDs assigned above.
+    // Synthetic contributions use the retained length for their IDs, so compact the live
+    // object contributions before any synthetic sections are appended.
+    for (index, contribution) in output.iter_mut().enumerate() {
+        contribution.spec.id = ContributionId(index as u32);
+    }
     Ok((output, comdats.redirects))
 }
 
