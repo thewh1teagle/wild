@@ -1,4 +1,4 @@
-//! Packed symbol/provider contract for the final PE architecture.
+//! Canonical names and packed symbol/provider storage for PE.
 
 #![allow(dead_code)]
 
@@ -9,8 +9,31 @@ use super::pe_ir::ImportLibraryId;
 use super::pe_ir::NameId;
 use super::pe_ir::ObjectId;
 use super::pe_ir::ProviderId;
-use super::pe_ir::SectionId;
 use super::pe_ir::SymbolId;
+use foldhash::HashMap;
+use foldhash::HashMapExt;
+use std::fmt;
+
+const NONE_U32: u32 = u32::MAX;
+
+fn note_vec_push<T>(values: &Vec<T>) {
+    if values.len() == values.capacity() {
+        crate::perf::removal_counters::increment_hot_phase_allocations();
+    }
+}
+
+fn note_nonempty_allocation(len: usize) {
+    if len != 0 {
+        crate::perf::removal_counters::increment_hot_phase_allocations();
+    }
+}
+
+fn into_boxed_slice_counted<T>(values: Vec<T>) -> Box<[T]> {
+    if !values.is_empty() && values.len() != values.capacity() {
+        crate::perf::removal_counters::increment_hot_phase_allocations();
+    }
+    values.into_boxed_slice()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -28,6 +51,12 @@ pub(super) enum BindingStrength {
     Weak,
     Common,
     Strong,
+}
+
+impl BindingStrength {
+    const fn rank(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Fixed-width provider payload. `owner` and `subject` are interpreted by `kind`.
@@ -85,10 +114,6 @@ impl ProviderRecord {
         }
     }
 
-    pub(super) const fn kind(self) -> ProviderKind {
-        self.kind
-    }
-
     pub(super) const fn absolute(value_index: u32, linker_defined: bool) -> Self {
         Self {
             owner: 0,
@@ -101,6 +126,10 @@ impl ProviderRecord {
             strength: BindingStrength::Strong,
             flags: 0,
         }
+    }
+
+    pub(super) const fn kind(self) -> ProviderKind {
+        self.kind
     }
 }
 
@@ -174,8 +203,158 @@ impl SymbolEntry {
     }
 }
 
-/// One canonical entry per NameId. SymbolId identifies a per-object occurrence and only appears in
-/// object-provider payloads; global resolution and fallback relationships use NameId.
+/// A name occurrence whose hash was computed by the one-pass PE input indexer.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OrderedNameOccurrence<'data> {
+    pub(super) bytes: &'data [u8],
+    pub(super) hash: u64,
+}
+
+enum NameStorage<'data> {
+    Borrowed(&'data [u8]),
+    /// Textual command-line names have no input-file lifetime and are copied once at ingress.
+    Owned(Box<[u8]>),
+}
+
+impl NameStorage<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// Deterministic canonical-name interner.
+///
+/// IDs are assigned only by calls to `intern_*`, never by hash-table iteration. Feeding local
+/// occurrences in input/object/symbol order therefore produces the same IDs for every Rayon
+/// schedule. The hash table stores only collision chains of dense IDs; input names stay borrowed.
+pub(super) struct OrderedNameInterner<'data> {
+    names: Vec<NameStorage<'data>>,
+    hashes: Vec<u64>,
+    /// First dense NameId for each hash. Collisions continue through `collision_next`.
+    by_hash: HashMap<u64, NameId>,
+    collision_next: Vec<u32>,
+}
+
+impl<'data> OrderedNameInterner<'data> {
+    pub(super) fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            hashes: Vec::new(),
+            by_hash: HashMap::new(),
+            collision_next: Vec::new(),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub(super) fn bytes(&self, id: NameId) -> Option<&[u8]> {
+        self.names.get(id.index()).map(NameStorage::bytes)
+    }
+
+    pub(super) fn hash(&self, id: NameId) -> Option<u64> {
+        self.hashes.get(id.index()).copied()
+    }
+
+    pub(super) fn lookup_prehashed(&self, bytes: &[u8], hash: u64) -> Option<NameId> {
+        let mut current = self.by_hash.get(&hash).copied();
+        while let Some(id) = current {
+            if self
+                .bytes(id)
+                .expect("collision chains contain valid NameIds")
+                == bytes
+            {
+                return Some(id);
+            }
+            let next = *self
+                .collision_next
+                .get(id.index())
+                .expect("collision chains contain valid NameIds");
+            current = (next != NONE_U32).then(|| NameId::from_u32(next));
+        }
+        None
+    }
+
+    pub(super) fn intern_borrowed_prehashed(&mut self, bytes: &'data [u8], hash: u64) -> NameId {
+        if let Some(id) = self.lookup_prehashed(bytes, hash) {
+            return id;
+        }
+        self.push(NameStorage::Borrowed(bytes), hash)
+    }
+
+    pub(super) fn intern_owned_prehashed(&mut self, bytes: &[u8], hash: u64) -> NameId {
+        if let Some(id) = self.lookup_prehashed(bytes, hash) {
+            return id;
+        }
+        crate::perf::removal_counters::add_name_bytes_allocated(bytes.len() as u64);
+        // One owned textual name allocation; borrowed object names do not increment this.
+        if !bytes.is_empty() {
+            crate::perf::removal_counters::increment_hot_phase_allocations();
+        }
+        self.push(NameStorage::Owned(bytes.into()), hash)
+    }
+
+    fn push(&mut self, name: NameStorage<'data>, hash: u64) -> NameId {
+        let raw = u32::try_from(self.names.len()).expect("PE canonical name count exceeds u32");
+        let id = NameId::from_u32(raw);
+        let previous = self.by_hash.get(&hash).copied();
+        note_vec_push(&self.names);
+        self.names.push(name);
+        note_vec_push(&self.hashes);
+        self.hashes.push(hash);
+        note_vec_push(&self.collision_next);
+        self.collision_next
+            .push(previous.map_or(NONE_U32, NameId::get));
+        if previous.is_none() && self.by_hash.len() == self.by_hash.capacity() {
+            crate::perf::removal_counters::increment_hot_phase_allocations();
+        }
+        self.by_hash.insert(hash, id);
+        id
+    }
+}
+
+impl fmt::Debug for OrderedNameInterner<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrderedNameInterner")
+            .field("names", &self.names.len())
+            .field("hash_heads", &self.by_hash.len())
+            .finish()
+    }
+}
+
+/// Result of the single ordered ID-assignment phase. Workstream 1 can parse in parallel, order its
+/// local occurrences by input ordinal, and feed that flat sequence here without parallel ID races.
+pub(super) struct OrderedNameFinalization<'data> {
+    pub(super) names: OrderedNameInterner<'data>,
+    pub(super) occurrence_names: Box<[NameId]>,
+}
+
+pub(super) fn finalize_ordered_names<'data>(
+    occurrences: impl IntoIterator<Item = OrderedNameOccurrence<'data>>,
+) -> OrderedNameFinalization<'data> {
+    let mut names = OrderedNameInterner::new();
+    let mut occurrence_names = Vec::new();
+    for occurrence in occurrences {
+        let name = names.intern_borrowed_prehashed(occurrence.bytes, occurrence.hash);
+        note_vec_push(&occurrence_names);
+        occurrence_names.push(name);
+    }
+    OrderedNameFinalization {
+        names,
+        occurrence_names: into_boxed_slice_counted(occurrence_names),
+    }
+}
+
+/// One canonical entry per NameId. Provider rows are CSR ranges in stable provider encounter order.
 #[derive(Debug)]
 pub(super) struct SymbolDb {
     pub(super) entries: Box<[SymbolEntry]>,
@@ -200,43 +379,366 @@ impl SymbolDb {
     }
 }
 
-/// Builder boundary for M1. Parsing/archives emit providers; one resolver owns final decisions.
-pub(super) trait BuildSymbolDb {
-    type Error;
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SymbolDbBuildError {
+    ProviderCountOverflow,
+    NameOutOfRange(NameId),
+}
 
-    fn build_symbol_db(
-        &self,
-        names: &[NameId],
-        object_sections: &[Option<SectionId>],
-        providers: &[ProviderRecord],
-    ) -> std::result::Result<SymbolDb, Self::Error>;
+#[derive(Clone, Copy, Debug)]
+struct PendingProviderNode {
+    record: ProviderRecord,
+    next: u32,
+}
+
+/// Ordered builder boundary between the input indexer/archive resolver and all resolution users.
+pub(super) struct SymbolDbBuilder<'data> {
+    names: OrderedNameInterner<'data>,
+    provider_nodes: Vec<PendingProviderNode>,
+    provider_heads: Vec<u32>,
+    provider_tails: Vec<u32>,
+    provider_counts: Vec<u32>,
+    weak_fallbacks: Vec<Option<NameId>>,
+    absolute_values: Vec<u64>,
+}
+
+/// Completed canonical name table and its dense resolution database.
+pub(super) struct FinalizedSymbolDb<'data> {
+    pub(super) names: OrderedNameInterner<'data>,
+    pub(super) symbols: SymbolDb,
+}
+
+impl<'data> SymbolDbBuilder<'data> {
+    pub(super) fn new(names: OrderedNameInterner<'data>) -> Self {
+        let count = names.len();
+        // Each dense side table is one flat allocation, independent of the number of providers.
+        for _ in 0..4 {
+            note_nonempty_allocation(count);
+        }
+        Self {
+            names,
+            provider_nodes: Vec::new(),
+            provider_heads: vec![NONE_U32; count],
+            provider_tails: vec![NONE_U32; count],
+            provider_counts: vec![0; count],
+            weak_fallbacks: vec![None; count],
+            absolute_values: Vec::new(),
+        }
+    }
+
+    pub(super) fn names(&self) -> &OrderedNameInterner<'data> {
+        &self.names
+    }
+
+    /// Append a borrowed occurrence discovered by a selected object/default-library wave. The
+    /// caller serializes waves by archive/input order, so existing IDs and provider rows remain
+    /// stable while the database grows.
+    pub(super) fn intern_borrowed_prehashed(&mut self, bytes: &'data [u8], hash: u64) -> NameId {
+        let id = self.names.intern_borrowed_prehashed(bytes, hash);
+        self.extend_name_rows();
+        id
+    }
+
+    /// Intern one textual directive name at ingress. This is the narrow owned-name path.
+    pub(super) fn intern_owned_prehashed(&mut self, bytes: &[u8], hash: u64) -> NameId {
+        let id = self.names.intern_owned_prehashed(bytes, hash);
+        self.extend_name_rows();
+        id
+    }
+
+    fn extend_name_rows(&mut self) {
+        let count = self.names.len();
+        for capacity in [
+            self.provider_heads.capacity(),
+            self.provider_tails.capacity(),
+            self.provider_counts.capacity(),
+            self.weak_fallbacks.capacity(),
+        ] {
+            if count > capacity {
+                crate::perf::removal_counters::increment_hot_phase_allocations();
+            }
+        }
+        self.provider_heads.resize(count, NONE_U32);
+        self.provider_tails.resize(count, NONE_U32);
+        self.provider_counts.resize(count, 0);
+        self.weak_fallbacks.resize(self.names.len(), None);
+    }
+
+    pub(super) fn add_provider(
+        &mut self,
+        name: NameId,
+        provider: ProviderRecord,
+    ) -> Result<(), SymbolDbBuildError> {
+        let head = self
+            .provider_heads
+            .get_mut(name.index())
+            .ok_or(SymbolDbBuildError::NameOutOfRange(name))?;
+        let new_count = self.provider_counts[name.index()]
+            .checked_add(1)
+            .ok_or(SymbolDbBuildError::ProviderCountOverflow)?;
+        let index = u32::try_from(self.provider_nodes.len())
+            .map_err(|_| SymbolDbBuildError::ProviderCountOverflow)?;
+        note_vec_push(&self.provider_nodes);
+        self.provider_nodes.push(PendingProviderNode {
+            record: provider,
+            next: NONE_U32,
+        });
+        let tail = &mut self.provider_tails[name.index()];
+        if *head == NONE_U32 {
+            *head = index;
+        } else {
+            self.provider_nodes[*tail as usize].next = index;
+        }
+        *tail = index;
+        self.provider_counts[name.index()] = new_count;
+        Ok(())
+    }
+
+    pub(super) fn set_weak_fallback(
+        &mut self,
+        name: NameId,
+        fallback: NameId,
+    ) -> Result<(), SymbolDbBuildError> {
+        *self
+            .weak_fallbacks
+            .get_mut(name.index())
+            .ok_or(SymbolDbBuildError::NameOutOfRange(name))? = Some(fallback);
+        Ok(())
+    }
+
+    pub(super) fn add_absolute_value(&mut self, value: u64) -> u32 {
+        let index =
+            u32::try_from(self.absolute_values.len()).expect("PE absolute value count exceeds u32");
+        note_vec_push(&self.absolute_values);
+        self.absolute_values.push(value);
+        index
+    }
+
+    pub(super) fn finish(self) -> Result<FinalizedSymbolDb<'data>, SymbolDbBuildError> {
+        let provider_count = self.provider_nodes.len();
+        note_nonempty_allocation(provider_count);
+        let mut providers = Vec::with_capacity(provider_count);
+        note_nonempty_allocation(self.provider_heads.len());
+        let mut entries = Vec::with_capacity(self.provider_heads.len());
+        for name_index in 0..self.provider_heads.len() {
+            let start = u32::try_from(providers.len())
+                .map_err(|_| SymbolDbBuildError::ProviderCountOverflow)?;
+            let len = self.provider_counts[name_index];
+            let mut current = self.provider_heads[name_index];
+            let mut offset = 0u32;
+            let mut selected: Option<(u32, BindingStrength)> = None;
+            while current != NONE_U32 {
+                let node = self.provider_nodes[current as usize];
+                // Strictly stronger replaces; equal strength retains the first provider.
+                if selected
+                    .is_none_or(|(_, strength)| node.record.strength.rank() > strength.rank())
+                {
+                    selected = Some((offset, node.record.strength));
+                }
+                providers.push(node.record);
+                current = node.next;
+                offset += 1;
+            }
+            debug_assert_eq!(offset, len);
+            let resolution = selected.map_or(Resolution::UNRESOLVED, |(offset, strength)| {
+                Resolution::resolved(ProviderId::from_u32(start + offset), strength)
+            });
+            entries.push(SymbolEntry {
+                resolution,
+                provider_start: start,
+                provider_len: len,
+                weak_fallback: self.weak_fallbacks[name_index]
+                    .map_or(SymbolEntry::NO_FALLBACK, NameId::get),
+            });
+        }
+        Ok(FinalizedSymbolDb {
+            names: self.names,
+            symbols: SymbolDb {
+                entries: into_boxed_slice_counted(entries),
+                providers: into_boxed_slice_counted(providers),
+                absolute_values: into_boxed_slice_counted(self.absolute_values),
+            },
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn occurrence(bytes: &'static [u8], hash: u64) -> OrderedNameOccurrence<'static> {
+        OrderedNameOccurrence { bytes, hash }
+    }
+
+    #[test]
+    fn ordered_interner_is_collision_safe_and_schedule_independent() {
+        let input = [
+            occurrence(b"zeta", 7),
+            occurrence(b"alpha", 7),
+            occurrence(b"zeta", 7),
+            occurrence(b"beta", 11),
+        ];
+        let first = finalize_ordered_names(input);
+        let second = finalize_ordered_names(input);
+        assert_eq!(first.occurrence_names, second.occurrence_names);
+        assert_eq!(
+            first.occurrence_names.as_ref(),
+            [
+                NameId::from_u32(0),
+                NameId::from_u32(1),
+                NameId::from_u32(0),
+                NameId::from_u32(2),
+            ]
+        );
+        assert_eq!(
+            first.names.bytes(NameId::from_u32(1)),
+            Some(b"alpha".as_slice())
+        );
+    }
+
+    #[test]
+    fn interner_handles_many_unique_names_and_one_large_collision_chain() {
+        let unique_bytes = (0..2048)
+            .map(|index| format!("unique-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        let unique =
+            finalize_ordered_names(unique_bytes.iter().enumerate().map(|(index, bytes)| {
+                OrderedNameOccurrence {
+                    bytes,
+                    hash: index as u64,
+                }
+            }));
+        assert_eq!(unique.names.len(), 2048);
+        assert_eq!(unique.names.by_hash.len(), 2048);
+        assert_eq!(unique.names.collision_next.len(), 2048);
+
+        let collision_bytes = (0..1024)
+            .map(|index| format!("collision-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        let collision =
+            finalize_ordered_names(collision_bytes.iter().map(|bytes| OrderedNameOccurrence {
+                bytes,
+                hash: 0xdead_beef,
+            }));
+        assert_eq!(collision.names.by_hash.len(), 1);
+        for (index, bytes) in collision_bytes.iter().enumerate() {
+            assert_eq!(
+                collision.names.lookup_prehashed(bytes, 0xdead_beef),
+                Some(NameId::from_u32(index as u32))
+            );
+        }
+    }
+
+    #[test]
+    fn provider_csr_preserves_order_and_first_equal_strength_wins() {
+        let finalized = finalize_ordered_names([occurrence(b"target", 1)]);
+        let name = finalized.occurrence_names[0];
+        let weak = ProviderRecord::object(
+            ObjectId::from_u32(0),
+            SymbolId::from_u32(0),
+            BindingStrength::Weak,
+        );
+        let first_strong = ProviderRecord::object(
+            ObjectId::from_u32(1),
+            SymbolId::from_u32(1),
+            BindingStrength::Strong,
+        );
+        let second_strong = ProviderRecord::object(
+            ObjectId::from_u32(2),
+            SymbolId::from_u32(2),
+            BindingStrength::Strong,
+        );
+        let mut builder = SymbolDbBuilder::new(finalized.names);
+        for provider in [weak, first_strong, second_strong] {
+            builder.add_provider(name, provider).unwrap();
+        }
+        let database = builder.finish().unwrap();
+        assert_eq!(
+            database.symbols.providers_for(name),
+            Some(&[weak, first_strong, second_strong][..])
+        );
+        assert_eq!(
+            database.symbols.entry(name).unwrap().resolution.provider(),
+            Some(ProviderId::from_u32(1))
+        );
+    }
+
+    #[test]
+    fn appended_archive_wave_extends_names_without_renumbering() {
+        let finalized = finalize_ordered_names([occurrence(b"root", 1)]);
+        let root = finalized.occurrence_names[0];
+        let mut builder = SymbolDbBuilder::new(finalized.names);
+        let appended = builder.intern_borrowed_prehashed(b"defaultlib", 2);
+        let duplicate = builder.intern_borrowed_prehashed(b"root", 1);
+        assert_eq!(root, NameId::from_u32(0));
+        assert_eq!(appended, NameId::from_u32(1));
+        assert_eq!(duplicate, root);
+        builder
+            .add_provider(
+                appended,
+                ProviderRecord::archive(
+                    ArchiveId::from_u32(3),
+                    ArchiveMemberId::from_u32(4),
+                    BindingStrength::Strong,
+                ),
+            )
+            .unwrap();
+        let database = builder.finish().unwrap();
+        assert_eq!(database.symbols.providers_for(root), Some(&[][..]));
+        assert_eq!(database.symbols.providers_for(appended).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn many_provider_rows_use_one_flat_node_arena_and_preserve_order() {
+        const NAME_COUNT: usize = 256;
+        const PROVIDERS_PER_NAME: usize = 8;
+        let names = (0..NAME_COUNT)
+            .map(|index| format!("name-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        let finalized = finalize_ordered_names(names.iter().enumerate().map(|(index, bytes)| {
+            OrderedNameOccurrence {
+                bytes,
+                hash: index as u64,
+            }
+        }));
+        let mut builder = SymbolDbBuilder::new(finalized.names);
+        for name in 0..NAME_COUNT {
+            for provider in 0..PROVIDERS_PER_NAME {
+                builder
+                    .add_provider(
+                        NameId::from_u32(name as u32),
+                        ProviderRecord::object(
+                            ObjectId::from_u32(provider as u32),
+                            SymbolId::from_u32(provider as u32),
+                            BindingStrength::Strong,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            builder.provider_nodes.len(),
+            NAME_COUNT * PROVIDERS_PER_NAME
+        );
+        assert_eq!(std::mem::size_of::<PendingProviderNode>(), 16);
+        let database = builder.finish().unwrap();
+        for name in 0..NAME_COUNT {
+            let id = NameId::from_u32(name as u32);
+            let providers = database.symbols.providers_for(id).unwrap();
+            assert_eq!(providers.len(), PROVIDERS_PER_NAME);
+            assert_eq!(providers[0].owner, 0);
+            assert_eq!(providers[PROVIDERS_PER_NAME - 1].owner, 7);
+            assert_eq!(
+                database.symbols.entry(id).unwrap().resolution.provider(),
+                Some(ProviderId::from_u32((name * PROVIDERS_PER_NAME) as u32))
+            );
+        }
+    }
+
     #[test]
     fn provider_and_resolution_records_remain_packed() {
         assert_eq!(std::mem::size_of::<ProviderRecord>(), 12);
         assert_eq!(std::mem::size_of::<Resolution>(), 8);
         assert_eq!(Resolution::UNRESOLVED.provider(), None);
-        let resolution = Resolution::resolved(ProviderId::from_u32(7), BindingStrength::Strong);
-        assert_eq!(resolution.provider(), Some(ProviderId::from_u32(7)));
-        let entry = SymbolEntry {
-            resolution,
-            provider_start: 0,
-            provider_len: 0,
-            weak_fallback: NameId::from_u32(2).get(),
-        };
-        assert_eq!(entry.weak_fallback(), Some(NameId::from_u32(2)));
-
-        let database = SymbolDb {
-            entries: vec![entry].into_boxed_slice(),
-            providers: Box::new([]),
-            absolute_values: Box::new([]),
-        };
-        assert_eq!(database.entry(NameId::from_u32(0)), Some(&entry));
-        assert_eq!(database.providers_for(NameId::from_u32(0)), Some(&[][..]));
     }
 }

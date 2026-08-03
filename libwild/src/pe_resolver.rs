@@ -5,8 +5,6 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
-use foldhash::HashMap;
-use foldhash::HashMapExt;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
 use linker_utils::coff_archives::CoffArchive;
@@ -16,7 +14,9 @@ use linker_utils::coff_imports::ShortImportObject;
 use linker_utils::coff_runtime::RuntimeResolution;
 use linker_utils::coff_runtime::WeakExternalResolution;
 use linker_utils::coff_runtime::parse_legacy_alias_object;
+#[cfg(test)]
 use linker_utils::coff_symbols::ArchiveDemand;
+#[cfg(test)]
 use linker_utils::coff_symbols::ArchiveDemandKind;
 use object::Object;
 use object::ObjectSymbol;
@@ -24,13 +24,37 @@ use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use super::pe_ir::NameId;
+use super::pe_ir::{ArchiveId, ArchiveMemberId};
+use super::pe_symbol_db::OrderedNameInterner;
+
 #[cfg(test)]
 type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
-struct IncrementalSymbolState {
-    defined: HashSet<Vec<u8>>,
-    unresolved: BTreeSet<Vec<u8>>,
+/// Compatibility deletion sites after Workstream 1 publishes `PeIr` occurrences:
+///
+/// - `SelectedGlobalSymbol::name` and `SelectedSymbolSnapshot` (legacy writer metadata),
+/// - `WeakExternalResolution` raw-name records (replace with the SymbolDb fallback column), and
+/// - the returned `BTreeSet<Vec<u8>>` import-definition snapshot (legacy import writer input).
+///
+/// None of these bridges participates in archive provider lookup or canonical ID assignment.
+const COMPATIBILITY_DELETION_SITES: &[&str] = &[
+    "SelectedGlobalSymbol::name",
+    "WeakExternalResolution raw-name records",
+    "BTreeSet<Vec<u8>> import-definition snapshot",
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DenseNameState {
+    defined: bool,
+    unresolved: bool,
+}
+
+struct IncrementalSymbolState<'data> {
+    names: OrderedNameInterner<'data>,
+    states: Vec<DenseNameState>,
     weak_resolution: WeakExternalResolution,
+    weak_names: Vec<(NameId, NameId, linker_utils::coff_symbols::WeakSearch)>,
     globals: Vec<SelectedGlobalSymbol>,
     absorbed_objects: usize,
 }
@@ -64,12 +88,24 @@ pub(super) struct ResolverOutput<'data> {
     pub(super) object_scans: usize,
 }
 
-impl IncrementalSymbolState {
+fn hash_name(name: &[u8]) -> u64 {
+    crate::perf::removal_counters::increment_name_hash_ops();
+    crate::hash::hash_bytes(name)
+}
+
+fn note_vec_push<T>(values: &Vec<T>) {
+    if values.len() == values.capacity() {
+        crate::perf::removal_counters::increment_hot_phase_allocations();
+    }
+}
+
+impl<'data> IncrementalSymbolState<'data> {
     fn new() -> Self {
         Self {
-            defined: HashSet::new(),
-            unresolved: BTreeSet::new(),
+            names: OrderedNameInterner::new(),
+            states: Vec::new(),
             weak_resolution: WeakExternalResolution::default(),
+            weak_names: Vec::new(),
             globals: Vec::new(),
             absorbed_objects: 0,
         }
@@ -77,24 +113,49 @@ impl IncrementalSymbolState {
 
     fn add_roots(&mut self, roots: &[Vec<u8>]) {
         for root in roots {
-            if !self.defined.contains(root.as_slice()) && !self.unresolved.contains(root.as_slice())
-            {
-                self.unresolved.insert(root.clone());
+            let id = self.intern_owned(root);
+            let state = &mut self.states[id.index()];
+            if !state.defined {
+                state.unresolved = true;
             }
         }
     }
 
-    fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>, index: usize) -> Result<()> {
+    fn absorb_object(
+        &mut self,
+        object: &crate::coff::CoffObject<'data>,
+        index: usize,
+    ) -> Result<()> {
         self.absorbed_objects += 1;
         for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
+            let symbol = self.intern_borrowed(record.symbol);
+            let target = self.intern_borrowed(record.target);
             self.weak_resolution
                 .apply(record, &format!("selected COFF object #{index}"))?;
+            if !self
+                .weak_names
+                .iter()
+                .any(|&(old_symbol, old_target, old_search)| {
+                    old_symbol == symbol && old_target == target && old_search == record.search
+                })
+            {
+                note_vec_push(&self.weak_names);
+                self.weak_names.push((symbol, target, record.search));
+            }
         }
         for symbol in object.file().symbols() {
             let name = symbol.name_bytes().context("invalid COFF symbol name")?;
             if !symbol.is_global() {
                 continue;
             }
+            let name_id = self.intern_borrowed(name);
+            // This is the final legacy writer bridge. The canonical resolver and archive cache
+            // retain only NameId; Workstream 1 deletes this copy with SelectedGlobalSymbol.
+            crate::perf::removal_counters::add_name_bytes_allocated(name.len() as u64);
+            if !name.is_empty() {
+                crate::perf::removal_counters::increment_hot_phase_allocations();
+            }
+            note_vec_push(&self.globals);
             self.globals.push(SelectedGlobalSymbol {
                 object: index,
                 index: symbol.index(),
@@ -112,23 +173,73 @@ impl IncrementalSymbolState {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
-                if !self.defined.contains(name) && !self.unresolved.contains(name) {
-                    self.unresolved.insert(name.to_vec());
+                let state = &mut self.states[name_id.index()];
+                if !state.defined {
+                    state.unresolved = true;
                 }
             } else if symbol.is_definition() || symbol.is_common() {
-                if !self.defined.contains(name) {
-                    self.defined.insert(name.to_vec());
-                }
-                self.unresolved.remove(name);
+                self.define_id(name_id);
             }
         }
         Ok(())
     }
 
-    fn define(&mut self, name: &[u8]) -> bool {
-        let changed = self.defined.insert(name.to_vec());
-        self.unresolved.remove(name);
+    fn intern_borrowed(&mut self, name: &'data [u8]) -> NameId {
+        let id = self.names.intern_borrowed_prehashed(name, hash_name(name));
+        self.ensure_state(id);
+        id
+    }
+
+    fn intern_owned(&mut self, name: &[u8]) -> NameId {
+        let id = self.names.intern_owned_prehashed(name, hash_name(name));
+        self.ensure_state(id);
+        id
+    }
+
+    fn ensure_state(&mut self, id: NameId) {
+        if self.states.len() <= id.index() {
+            if id.index() + 1 > self.states.capacity() {
+                crate::perf::removal_counters::increment_hot_phase_allocations();
+            }
+            self.states
+                .resize(id.index() + 1, DenseNameState::default());
+        }
+    }
+
+    fn define_id(&mut self, id: NameId) -> bool {
+        let state = &mut self.states[id.index()];
+        let changed = !state.defined;
+        state.defined = true;
+        state.unresolved = false;
         changed
+    }
+
+    fn define_owned(&mut self, name: &[u8]) -> bool {
+        let id = self.intern_owned(name);
+        self.define_id(id)
+    }
+
+    fn is_defined(&self, id: NameId) -> bool {
+        self.states
+            .get(id.index())
+            .is_some_and(|state| state.defined)
+    }
+
+    fn unresolved_in_byte_order(&self) -> Vec<NameId> {
+        let mut ids = self
+            .states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.unresolved && !state.defined)
+            .map(|(index, _)| NameId::from_u32(index as u32))
+            .collect::<Vec<_>>();
+        ids.sort_by(|&left, &right| {
+            self.names
+                .bytes(left)
+                .expect("state NameId is interned")
+                .cmp(self.names.bytes(right).expect("state NameId is interned"))
+        });
+        ids
     }
 }
 
@@ -192,8 +303,8 @@ fn parsed_archives<'session, 'data>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArchiveProvider {
-    archive_index: usize,
-    member_index: usize,
+    archive: ArchiveId,
+    member: ArchiveMemberId,
 }
 
 #[derive(Default)]
@@ -203,34 +314,43 @@ struct CachedArchiveProviders {
 }
 
 struct ArchiveProviderCache {
-    by_name: HashMap<Vec<u8>, CachedArchiveProviders>,
+    by_name: Vec<Option<CachedArchiveProviders>>,
 }
 
 impl ArchiveProviderCache {
     fn new() -> Self {
         Self {
-            by_name: HashMap::new(),
+            by_name: Vec::new(),
         }
     }
 
     fn providers<'cache, 'data>(
         &'cache mut self,
+        name_id: NameId,
         name: &[u8],
         archives: &[&CoffArchive<'data>],
     ) -> &'cache [ArchiveProvider] {
-        if !self.by_name.contains_key(name) {
-            self.by_name
-                .insert(name.to_vec(), CachedArchiveProviders::default());
+        if self.by_name.len() <= name_id.index() {
+            if name_id.index() + 1 > self.by_name.capacity() {
+                crate::perf::removal_counters::increment_hot_phase_allocations();
+            }
+            self.by_name.resize_with(name_id.index() + 1, || None);
         }
-        let cached = self
-            .by_name
-            .get_mut(name)
-            .expect("archive provider cache entry was just inserted");
+        let cached =
+            self.by_name[name_id.index()].get_or_insert_with(CachedArchiveProviders::default);
         for (archive_index, archive) in archives.iter().enumerate().skip(cached.archives_scanned) {
+            // One indexed archive query for this canonical name and archive. The cached scan
+            // cursor ensures appended /defaultlib archives extend both positive and negative rows.
+            crate::perf::removal_counters::increment_archive_member_probes();
             if let Some(member_index) = archive.first_definition_member_index(name) {
+                note_vec_push(&cached.providers);
                 cached.providers.push(ArchiveProvider {
-                    archive_index,
-                    member_index,
+                    archive: ArchiveId::from_u32(
+                        u32::try_from(archive_index).expect("PE archive count exceeds u32"),
+                    ),
+                    member: ArchiveMemberId::from_u32(
+                        u32::try_from(member_index).expect("PE archive member count exceeds u32"),
+                    ),
                 });
             }
         }
@@ -245,7 +365,7 @@ pub(super) struct ResolverSession<'data> {
     extracted: HashSet<(usize, usize)>,
     import_definitions: BTreeSet<Vec<u8>>,
     selected_imports: Vec<ShortImportObject<'data>>,
-    symbol_state: IncrementalSymbolState,
+    symbol_state: IncrementalSymbolState<'data>,
     scanned_objects: usize,
     selected_aliases: Vec<(usize, usize)>,
     archive_providers: ArchiveProviderCache,
@@ -287,7 +407,7 @@ impl<'data> ResolverSession<'data> {
     }
 
     pub(super) fn define_linker_symbol(&mut self, name: &[u8]) {
-        self.symbol_state.define(name);
+        self.symbol_state.define_owned(name);
     }
 
     #[cfg(test)]
@@ -296,6 +416,7 @@ impl<'data> ResolverSession<'data> {
     }
 
     pub(super) fn finish(self) -> ResolverOutput<'data> {
+        let _ = COMPATIBILITY_DELETION_SITES;
         ResolverOutput {
             selected_imports: self.selected_imports,
             symbols: SelectedSymbolSnapshot {
@@ -371,6 +492,17 @@ impl<'data> ResolverSession<'data> {
             if !changed {
                 let snapshot_phase =
                     crate::timing_guard!(super::PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS);
+                // Legacy import-writer snapshot clones one owned Vec payload per name. Internal
+                // BTree node allocation is deliberately outside the explicit-call-site counter.
+                crate::perf::removal_counters::add_name_bytes_allocated(
+                    self.import_definitions
+                        .iter()
+                        .map(|name| name.len() as u64)
+                        .sum(),
+                );
+                crate::perf::removal_counters::add_hot_phase_allocations(
+                    self.import_definitions.len() as u64,
+                );
                 let import_definitions = self.import_definitions.clone();
                 drop(snapshot_phase);
                 return Ok(import_definitions);
@@ -410,7 +542,7 @@ fn extract_pass<'data>(
     extracted: &mut HashSet<(usize, usize)>,
     import_definitions: &mut BTreeSet<Vec<u8>>,
     selected_imports: &mut Vec<ShortImportObject<'data>>,
-    symbol_state: &mut IncrementalSymbolState,
+    symbol_state: &mut IncrementalSymbolState<'data>,
     selected_aliases: &mut Vec<(usize, usize)>,
     archive_providers: &mut ArchiveProviderCache,
     use_alternates: bool,
@@ -424,40 +556,26 @@ fn extract_pass<'data>(
         let demands_phase = crate::timing_guard!(super::PE_DETAIL_REBUILD_ARCHIVE_DEMANDS);
         let fallback_names;
         let demands = if use_alternates {
-            fallback_names = fallback_demands(
-                symbol_state.unresolved.clone(),
-                &symbol_state.defined,
-                runtime_resolution,
-                &symbol_state.weak_resolution,
-            )?;
+            fallback_names = fallback_demands(symbol_state, runtime_resolution)?;
             fallback_names
                 .iter()
-                .map(|name| ArchiveDemand {
-                    name,
-                    kind: ArchiveDemandKind::Strong,
-                })
+                .map(|&name| CanonicalArchiveDemand { name })
                 .collect::<Vec<_>>()
         } else {
             let mut demands = symbol_state
-                .unresolved
-                .iter()
-                .map(|name| ArchiveDemand {
-                    name: name.as_slice(),
-                    kind: ArchiveDemandKind::Strong,
-                })
+                .unresolved_in_byte_order()
+                .into_iter()
+                .map(|name| CanonicalArchiveDemand { name })
                 .collect::<Vec<_>>();
             demands.extend(
                 symbol_state
-                    .weak_resolution
-                    .records()
+                    .weak_names
+                    .iter()
                     .filter(|(symbol, _, search)| {
                         *search == linker_utils::coff_symbols::WeakSearch::Library
-                            && !symbol_state.defined.contains(*symbol)
+                            && !symbol_state.is_defined(*symbol)
                     })
-                    .map(|(symbol, _, _)| ArchiveDemand {
-                        name: symbol,
-                        kind: ArchiveDemandKind::WeakLibrary,
-                    }),
+                    .map(|&(symbol, _, _)| CanonicalArchiveDemand { name: symbol }),
             );
             demands
         };
@@ -467,10 +585,10 @@ fn extract_pass<'data>(
             archives,
             whole_archive,
             extracted,
-            &symbol_state.defined,
             &demands,
             next_archive,
             archive_providers,
+            &symbol_state.names,
         );
         drop(candidates_phase);
         let Some((archive_index, selected)) = selection else {
@@ -479,9 +597,14 @@ fn extract_pass<'data>(
         next_archive = archive_index + 1;
         drop(demands);
         for member in selected {
+            if extracted.len() == extracted.capacity() {
+                crate::perf::removal_counters::increment_hot_phase_allocations();
+            }
             if !extracted.insert((archive_index, member.index())) {
                 unreachable!("the archive-selection scan filters extracted members");
             }
+            // Count only the first transition into the selected set.
+            crate::perf::removal_counters::increment_selected_members();
             match member.kind() {
                 CoffArchiveMemberKind::CoffObject { .. } => {
                     let object =
@@ -495,6 +618,7 @@ fn extract_pass<'data>(
                         crate::timing_guard!(super::PE_DETAIL_ABSORB_SELECTED_SYMBOLS);
                     symbol_state.absorb_object(&object, objects.len())?;
                     drop(absorb_phase);
+                    note_vec_push(objects);
                     objects.push(object);
                     changed = true;
                 }
@@ -503,11 +627,19 @@ fn extract_pass<'data>(
                     // the original archive. Do not parse these as ordinary objects, but do
                     // retain their definitions for subsequent archive decisions.
                     for definition in member.definitions() {
-                        if import_definitions.insert(definition.to_vec()) {
-                            symbol_state.define(definition);
+                        if !import_definitions.contains(definition) {
+                            // Legacy import-writer bridge; canonical state below retains NameId.
+                            crate::perf::removal_counters::add_name_bytes_allocated(
+                                definition.len() as u64,
+                            );
+                            // Count the explicit Vec payload; BTree internals are out of scope.
+                            crate::perf::removal_counters::increment_hot_phase_allocations();
+                            import_definitions.insert(definition.to_vec());
+                            symbol_state.define_owned(definition);
                             changed = true;
                         }
                     }
+                    note_vec_push(selected_imports);
                     selected_imports.push(import);
                 }
                 CoffArchiveMemberKind::Opaque => {
@@ -518,6 +650,7 @@ fn extract_pass<'data>(
                             runtime_resolution
                                 .apply(directive, &String::from_utf8_lossy(member.name()))?;
                         }
+                        note_vec_push(selected_aliases);
                         selected_aliases.push((archive_index, member.index()));
                         changed = true;
                     } else {
@@ -536,34 +669,37 @@ fn extract_pass<'data>(
     Ok(changed)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalArchiveDemand {
+    name: NameId,
+}
+
 fn next_archive_selection<'archive, 'data>(
     archives: &'archive [&CoffArchive<'data>],
     whole_archive: &[bool],
     extracted: &HashSet<(usize, usize)>,
-    defined: &HashSet<Vec<u8>>,
-    demands: &[ArchiveDemand<'_>],
+    demands: &[CanonicalArchiveDemand],
     start: usize,
     archive_providers: &mut ArchiveProviderCache,
+    names: &OrderedNameInterner<'_>,
 ) -> Option<(usize, Vec<&'archive CoffArchiveMember<'data>>)> {
     let mut demands_by_archive = vec![Vec::new(); archives.len()];
     let mut touched_archives = Vec::new();
     for &demand in demands {
-        if defined.contains(demand.name) {
-            continue;
-        }
-        for &provider in archive_providers.providers(demand.name, archives) {
-            if provider.archive_index < start {
+        let name = names
+            .bytes(demand.name)
+            .expect("archive demands use canonical NameIds");
+        for &provider in archive_providers.providers(demand.name, name, archives) {
+            let archive_index = provider.archive.index();
+            let member_index = provider.member.index();
+            if archive_index < start {
                 continue;
             }
-            debug_assert_eq!(
-                archives[provider.archive_index].first_definition_member_index(demand.name),
-                Some(provider.member_index)
-            );
-            let archive_demands = &mut demands_by_archive[provider.archive_index];
+            let archive_demands = &mut demands_by_archive[archive_index];
             if archive_demands.is_empty() {
-                touched_archives.push(provider.archive_index);
+                touched_archives.push(archive_index);
             }
-            archive_demands.push(demand);
+            archive_demands.push((name, member_index));
         }
     }
     for (archive_index, &is_whole_archive) in whole_archive.iter().enumerate().skip(start) {
@@ -574,10 +710,9 @@ fn next_archive_selection<'archive, 'data>(
     touched_archives.sort_unstable();
 
     for archive_index in touched_archives {
-        let mut selected = archives[archive_index].select_shallow_members_with_defined_lookup(
+        let mut selected = archives[archive_index].select_shallow_members_from_provider_indices(
             &demands_by_archive[archive_index],
             whole_archive[archive_index],
-            |name| defined.contains(name),
         );
         selected.retain(|member| !extracted.contains(&(archive_index, member.index())));
         if !selected.is_empty() {
@@ -610,34 +745,78 @@ fn next_archive_selection_reference<'archive, 'data>(
     None
 }
 
-fn fallback_demands(
-    unresolved: BTreeSet<Vec<u8>>,
-    defined: &HashSet<Vec<u8>>,
+fn fallback_demands<'data>(
+    state: &mut IncrementalSymbolState<'data>,
     runtime_resolution: &RuntimeResolution,
-    weak_resolution: &WeakExternalResolution,
-) -> Result<BTreeSet<Vec<u8>>> {
-    let mut names = unresolved
-        .into_iter()
-        .map(|name| {
-            let Ok(text) = std::str::from_utf8(&name) else {
-                return Ok(name);
+) -> Result<Vec<NameId>> {
+    let unresolved = state.unresolved_in_byte_order();
+    let mut demands = Vec::with_capacity(unresolved.len() + state.weak_names.len());
+    for name in unresolved {
+        let resolved = {
+            let bytes = state
+                .names
+                .bytes(name)
+                .expect("unresolved NameId is interned");
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                demands.push(name);
+                continue;
             };
             runtime_resolution
-                .resolve_alternate_name(text, |candidate| defined.contains(candidate.as_bytes()))
-                .map(|resolved| resolved.as_bytes().to_vec())
-                .map_err(Into::into)
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
-    for (symbol, _, _) in weak_resolution.records() {
-        if defined.contains(symbol) {
-            continue;
-        }
-        let target = weak_resolution.resolve(symbol, |name| defined.contains(name))?;
-        if !defined.contains(target) {
-            names.insert(target.to_vec());
+                .resolve_alternate_name(text, |candidate| {
+                    let bytes = candidate.as_bytes();
+                    state
+                        .names
+                        .lookup_prehashed(bytes, hash_name(bytes))
+                        .is_some_and(|id| state.is_defined(id))
+                })?
+                .as_bytes()
+                .to_vec()
+        };
+        let resolved = state.intern_owned(&resolved);
+        if !state.is_defined(resolved) {
+            demands.push(resolved);
         }
     }
-    Ok(names)
+    let weak_symbols = state
+        .weak_names
+        .iter()
+        .map(|&(symbol, _, _)| symbol)
+        .collect::<Vec<_>>();
+    for symbol in weak_symbols {
+        if state.is_defined(symbol) {
+            continue;
+        }
+        let target = {
+            let symbol = state.names.bytes(symbol).expect("weak NameId is interned");
+            state
+                .weak_resolution
+                .resolve(symbol, |name| {
+                    state
+                        .names
+                        .lookup_prehashed(name, hash_name(name))
+                        .is_some_and(|id| state.is_defined(id))
+                })?
+                .to_vec()
+        };
+        let target = state.intern_owned(&target);
+        if !state.is_defined(target) {
+            demands.push(target);
+        }
+    }
+    demands.sort_by(|&left, &right| {
+        state
+            .names
+            .bytes(left)
+            .expect("fallback NameId is interned")
+            .cmp(
+                state
+                    .names
+                    .bytes(right)
+                    .expect("fallback NameId is interned"),
+            )
+    });
+    demands.dedup();
+    Ok(demands)
 }
 
 #[cfg(test)]
@@ -647,7 +826,25 @@ fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> R
     for (index, object) in objects.iter().enumerate() {
         state.absorb_object(object, index)?;
     }
-    Ok((state.defined, state.unresolved))
+    let defined = state
+        .states
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.defined)
+        .map(|(index, _)| {
+            state
+                .names
+                .bytes(NameId::from_u32(index as u32))
+                .expect("state NameId is interned")
+                .to_vec()
+        })
+        .collect();
+    let unresolved = state
+        .unresolved_in_byte_order()
+        .into_iter()
+        .map(|name| state.names.bytes(name).unwrap().to_vec())
+        .collect();
+    Ok((defined, unresolved))
 }
 
 #[cfg(test)]
@@ -945,6 +1142,32 @@ mod tests {
     }
 
     #[test]
+    fn weak_library_search_precedes_alternate_fallback_wave() {
+        let root = weak_object(pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY.0);
+        let library = archive(&[
+            ("alt.obj", coff_object(&["alt"], &[])),
+            ("primary.obj", coff_object(&["primary"], &[])),
+            ("fallback.obj", coff_object(&["fallback"], &[])),
+        ]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+        let mut runtime = RuntimeResolution::new();
+        runtime
+            .parse_and_apply("/alternatename:primary=alt", "root.obj")
+            .unwrap();
+
+        extract(&mut objects, &[&library], &[false], &[], &mut runtime).unwrap();
+
+        let definitions = objects
+            .iter()
+            .skip(1)
+            .flat_map(|object| object.file().symbols())
+            .filter(|symbol| symbol.is_global() && symbol.is_definition())
+            .map(|symbol| symbol.name_bytes().unwrap().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(definitions, [b"primary".to_vec()]);
+    }
+
+    #[test]
     fn indexed_archive_selection_matches_reference_across_adversarial_states() {
         let archive_bytes = [
             archive(&[
@@ -980,6 +1203,10 @@ mod tests {
                 kind: ArchiveDemandKind::WeakLibrary,
             },
         ];
+        let mut names = OrderedNameInterner::new();
+        for demand in demands {
+            names.intern_borrowed_prehashed(demand.name, hash_name(demand.name));
+        }
         let cases = [
             (0, vec![false, false, false], HashSet::new(), HashSet::new()),
             (1, vec![false, false, false], HashSet::new(), HashSet::new()),
@@ -1003,14 +1230,23 @@ mod tests {
             let expected = next_archive_selection_reference(
                 &archives, &whole, &extracted, &defined, &demands, start,
             );
+            let canonical_demands = demands
+                .iter()
+                .filter(|demand| !defined.contains(demand.name))
+                .map(|demand| CanonicalArchiveDemand {
+                    name: names
+                        .lookup_prehashed(demand.name, hash_name(demand.name))
+                        .unwrap(),
+                })
+                .collect::<Vec<_>>();
             let actual = next_archive_selection(
                 &archives,
                 &whole,
                 &extracted,
-                &defined,
-                &demands,
+                &canonical_demands,
                 start,
                 &mut providers,
+                &names,
             );
             assert_eq!(selection_indices(actual), selection_indices(expected));
         }
@@ -1032,10 +1268,14 @@ mod tests {
             &archives,
             &[false, false, false],
             &extracted,
-            &HashSet::new(),
-            &shared_only,
+            &[CanonicalArchiveDemand {
+                name: names
+                    .lookup_prehashed(b"shared", hash_name(b"shared"))
+                    .unwrap(),
+            }],
             0,
             &mut providers,
+            &names,
         ));
         assert_eq!(actual, expected);
         assert_eq!(expected, Some((1, vec![0])));
@@ -1050,13 +1290,14 @@ mod tests {
             CoffArchive::parse(&provider).unwrap(),
         ];
         let mut cache = ArchiveProviderCache::new();
+        let name = NameId::from_u32(0);
 
-        assert!(cache.providers(b"target", &[&parsed[0]]).is_empty());
+        assert!(cache.providers(name, b"target", &[&parsed[0]]).is_empty());
         assert_eq!(
-            cache.providers(b"target", &[&parsed[0], &parsed[1]]),
+            cache.providers(name, b"target", &[&parsed[0], &parsed[1]]),
             [ArchiveProvider {
-                archive_index: 1,
-                member_index: 0,
+                archive: ArchiveId::from_u32(1),
+                member: ArchiveMemberId::from_u32(0),
             }]
         );
     }

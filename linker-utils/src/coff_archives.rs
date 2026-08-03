@@ -491,27 +491,61 @@ impl<'data> CoffArchive<'data> {
             return self.members.iter().collect();
         }
 
-        let candidates = demands
-            .iter()
-            .filter_map(|demand| {
-                self.definition_members
-                    .get(demand.name)
-                    .filter(|_| !is_defined(demand.name))
-                    .map(|entry| (demand.name, entry.first))
-            })
-            .collect::<Vec<_>>();
         let mut local_definitions = HashSet::<&[u8]>::new();
         let mut selected_indices = HashSet::new();
         let mut selected = Vec::new();
         // Selection and local-definition sets only grow. A candidate skipped because its demand
         // was defined or its member was already selected can therefore never become eligible on
         // a later restart. Walk demand-ordered candidates once instead of rescanning the prefix
-        // after every extraction.
-        for (name, member_index) in candidates {
+        // after every extraction. Keep the lookup linearized here rather than materializing a
+        // second candidate Vec; NameId-based callers already retain the provider row externally.
+        for demand in demands {
+            let name = demand.name;
+            let Some(member_index) = self
+                .definition_members
+                .get(name)
+                .filter(|_| !is_defined(name))
+                .map(|entry| entry.first)
+            else {
+                continue;
+            };
             if local_definitions.contains(name) || !selected_indices.insert(member_index) {
                 continue;
             }
             let member = &self.members[member_index];
+            local_definitions.extend(member.definitions.as_slice().iter().map(AsRef::as_ref));
+            selected.push(member);
+        }
+        selected
+    }
+
+    /// Selects shallow members from provider rows already resolved by the caller.
+    ///
+    /// `candidates` is in canonical demand order and contains the first member associated with
+    /// each demand in this archive. This is the NameId/CSR fast path: it preserves the same
+    /// linear shallow-selection algorithm without hashing raw names through
+    /// `definition_members` again.
+    #[must_use]
+    pub fn select_shallow_members_from_provider_indices<'archive>(
+        &'archive self,
+        candidates: &[(&[u8], usize)],
+        whole_archive: bool,
+    ) -> Vec<&'archive CoffArchiveMember<'data>> {
+        if whole_archive {
+            return self.members.iter().collect();
+        }
+
+        let mut local_definitions = HashSet::<&[u8]>::new();
+        let mut selected_indices = HashSet::new();
+        let mut selected = Vec::new();
+        for &(name, member_index) in candidates {
+            if local_definitions.contains(name) || !selected_indices.insert(member_index) {
+                continue;
+            }
+            let Some(member) = self.members.get(member_index) else {
+                debug_assert!(false, "cached archive provider member is out of range");
+                continue;
+            };
             local_definitions.extend(member.definitions.as_slice().iter().map(AsRef::as_ref));
             selected.push(member);
         }
@@ -1350,6 +1384,23 @@ mod tests {
                 .map(|selected| selected.member().index())
                 .collect::<Vec<_>>()
         );
+        let provider_rows = [
+            (b"alias".as_slice(), 0),
+            (b"first".as_slice(), 0),
+            (b"second".as_slice(), 1),
+        ];
+        let from_provider_rows =
+            parsed.select_shallow_members_from_provider_indices(&provider_rows, false);
+        assert_eq!(
+            from_provider_rows
+                .iter()
+                .map(|member| member.index())
+                .collect::<Vec<_>>(),
+            borrowed
+                .iter()
+                .map(|member| member.index())
+                .collect::<Vec<_>>()
+        );
 
         let planned =
             parsed.plan_shallow_with_defined_lookup(&demands, false, |name| name == b"second");
@@ -1360,6 +1411,12 @@ mod tests {
 
         let borrowed = parsed.select_shallow_members_with_defined_lookup(&[], true, |_| false);
         assert_eq!(borrowed.len(), parsed.members().len());
+        assert_eq!(
+            parsed
+                .select_shallow_members_from_provider_indices(&[], true)
+                .len(),
+            parsed.members().len()
+        );
     }
 
     #[test]
