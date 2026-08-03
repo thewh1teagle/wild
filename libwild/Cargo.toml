@@ -94,6 +94,9 @@ wasm = []
 # Experimental support for linking Mach-O. Currently incomplete.
 macho = []
 
+# Experimental support for linking PE/COFF. Currently incomplete.
+pe = []
+
 # Support for zstd compression and decompression of sections.
 zstd = ["dep:zstd"]
 
