@@ -135,6 +135,39 @@ def require_identity(
         )
 
 
+def validated_rss_median(
+    configuration: dict[str, Any],
+    tool_name: str,
+    protocol: dict[str, Any],
+    label: str,
+) -> float:
+    try:
+        rss = configuration["tools"][tool_name]["maximum_rss_kib"]
+        raw_values = rss["raw_samples"]
+        if any(isinstance(value, bool) for value in raw_values):
+            raise ValueError
+        values = [float(value) for value in raw_values]
+        reported_median = float(rss["median"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise AggregateError(f"{label} {tool_name} has invalid RSS evidence") from error
+    if len(values) < protocol["rss_samples"]:
+        raise AggregateError(f"{label} {tool_name} lacks required RSS samples")
+    if any(value <= 0 or not math.isfinite(value) for value in values):
+        raise AggregateError(
+            f"{label} {tool_name} has a non-positive/non-finite RSS sample"
+        )
+    calculated_median = statistics.median(values)
+    if (
+        reported_median <= 0
+        or not math.isfinite(reported_median)
+        or not math.isclose(
+            reported_median, calculated_median, rel_tol=1e-12, abs_tol=1e-12
+        )
+    ):
+        raise AggregateError(f"{label} {tool_name} RSS median does not match raw data")
+    return calculated_median
+
+
 def configuration_samples(
     configuration: dict[str, Any],
     tool_names: tuple[str, str],
@@ -154,9 +187,7 @@ def configuration_samples(
             raise AggregateError(f"{label} {name} has too little accumulated time")
         if any(value <= 0 or not math.isfinite(value) for value in elapsed):
             raise AggregateError(f"{label} {name} has a non-positive/non-finite sample")
-        rss = configuration["tools"][name].get("maximum_rss_kib")
-        if not isinstance(rss, dict) or len(rss.get("raw_samples", [])) < protocol["rss_samples"]:
-            raise AggregateError(f"{label} {name} lacks required RSS samples")
+        validated_rss_median(configuration, name, protocol, label)
         values.append(elapsed)
     if len(values[0]) != len(values[1]):
         raise AggregateError(f"{label} does not contain complete paired blocks")
@@ -412,8 +443,12 @@ def validate_series(
         expected["output_properties"],
     )
     rss = {
-        "wild_median_kib": configuration["tools"]["wild"]["maximum_rss_kib"]["median"],
-        "comparator_median_kib": configuration["tools"][comparator]["maximum_rss_kib"]["median"],
+        "wild_median_kib": validated_rss_median(
+            configuration, "wild", protocol, f"{label} direct"
+        ),
+        "comparator_median_kib": validated_rss_median(
+            configuration, comparator, protocol, f"{label} direct"
+        ),
     }
     rss["wild_over_comparator"] = rss["wild_median_kib"] / rss["comparator_median_kib"]
     return pairs, rss
@@ -484,12 +519,12 @@ def validate_baseline_series(
     )
     configuration = configurations[0]
     rss = {
-        "final_wild_median_kib": configuration["tools"]["wild"][
-            "maximum_rss_kib"
-        ]["median"],
-        "baseline_wild_median_kib": configuration["tools"]["baseline-wild"][
-            "maximum_rss_kib"
-        ]["median"],
+        "final_wild_median_kib": validated_rss_median(
+            configuration, "wild", protocol, label
+        ),
+        "baseline_wild_median_kib": validated_rss_median(
+            configuration, "baseline-wild", protocol, label
+        ),
     }
     rss["final_over_baseline"] = (
         rss["final_wild_median_kib"] / rss["baseline_wild_median_kib"]
@@ -724,6 +759,17 @@ def aggregate(manifest_path: Path) -> dict[str, Any]:
         )
         series[name] = {"pe": pe, "elf": elf, "baseline": baseline}
         rss[name] = {"pe": pe_rss, "elf": elf_rss, "baseline": baseline_rss}
+    rss_geometric_means = {
+        "pe_wild_over_lld_link": geometric_mean(
+            [rss[name]["pe"]["wild_over_comparator"] for name in REQUIRED_CORPORA]
+        ),
+        "elf_wild_over_ld_lld": geometric_mean(
+            [rss[name]["elf"]["wild_over_comparator"] for name in REQUIRED_CORPORA]
+        ),
+        "pe_final_wild_over_baseline_wild": geometric_mean(
+            [rss[name]["baseline"]["final_over_baseline"] for name in REQUIRED_CORPORA]
+        ),
+    }
     statistics_report = compute_statistics(
         series, bootstrap["seed"], bootstrap["resamples"]
     )
@@ -736,7 +782,15 @@ def aggregate(manifest_path: Path) -> dict[str, Any]:
         },
         "protocol": protocol,
         "identities": identities,
-        "rss": rss,
+        "rss": {
+            "estimator": (
+                "unweighted geometric mean of four per-corpus ratios of "
+                "validated median peak-RSS KiB"
+            ),
+            "per_corpus": rss,
+            "geometric_mean_ratios": rss_geometric_means,
+            "decision_threshold": None,
+        },
         "statistics": statistics_report,
     }
 
@@ -1026,6 +1080,27 @@ class AggregatorTests(unittest.TestCase):
         with self.assertRaisesRegex(AggregateError, "properties drift"):
             corpus_and_invocation_check(report, expected, False, "synthetic PE")
 
+    def test_nonpositive_and_forged_rss_are_rejected(self) -> None:
+        protocol = {"rss_samples": 2}
+        configuration = {
+            "tools": {
+                "wild": {
+                    "maximum_rss_kib": {
+                        "raw_samples": [100, 0],
+                        "median": 50,
+                    }
+                }
+            }
+        }
+        with self.assertRaisesRegex(AggregateError, "non-positive"):
+            validated_rss_median(configuration, "wild", protocol, "synthetic")
+        configuration["tools"]["wild"]["maximum_rss_kib"] = {
+            "raw_samples": [100, 200],
+            "median": 100,
+        }
+        with self.assertRaisesRegex(AggregateError, "does not match"):
+            validated_rss_median(configuration, "wild", protocol, "synthetic")
+
     def test_full_synthetic_matrix_smoke(self) -> None:
         identities = {
             "wild-pe": {"sha256": "1" * 64, "version": "wild final"},
@@ -1216,6 +1291,15 @@ class AggregatorTests(unittest.TestCase):
             report = aggregate(manifest_path)
             self.assertEqual(report["status"], "pass")
             self.assertTrue(report["statistics"]["goal_pass"])
+            self.assertEqual(
+                report["rss"]["geometric_mean_ratios"],
+                {
+                    "pe_wild_over_lld_link": 1.0,
+                    "elf_wild_over_ld_lld": 1.0,
+                    "pe_final_wild_over_baseline_wild": 1.0,
+                },
+            )
+            self.assertIsNone(report["rss"]["decision_threshold"])
 
 
 def parser() -> argparse.ArgumentParser:

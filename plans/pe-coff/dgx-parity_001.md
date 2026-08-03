@@ -188,10 +188,17 @@ Goal 3 passes only if all of these are true:
   1.03; and
 - all separately required correctness and native Windows gates pass.
 
-The aggregator decides the statistical conditions and reports RSS ratios. The
-external Windows gates are intentionally not inferred from benchmark JSON.
-Point estimates do not pass an overlapping interval; an inconclusive result
-means continue optimizing and acquire a fresh holdout.
+The aggregator validates that every required raw peak-RSS sample and its
+reported median are positive, finite, and internally consistent. It reports,
+for each corpus, Wild/comparator median peak-RSS ratios for PE and ELF plus the
+final-Wild/baseline-Wild PE ratio. It then reports the unweighted four-corpus
+geometric mean of each of those three memory ratios. These disclose memory
+tradeoffs but have no pass/fail threshold in Goal 3.
+
+The aggregator decides the statistical timing conditions above. The external
+Windows gates are intentionally not inferred from benchmark JSON. Point
+estimates do not pass an overlapping interval; an inconclusive result means
+continue optimizing and acquire a fresh holdout.
 
 ## Run
 
