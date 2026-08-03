@@ -2726,12 +2726,12 @@ fn record_comdat_redirects(
     winner_sections: &[object::SectionIndex],
     winner_parents: &HashMap<object::SectionIndex, Option<object::SectionIndex>>,
     redirects: &mut SectionRedirects,
-) -> Result<()> {
+) {
     let Some((&loser_primary, loser_children)) = loser_sections.split_first() else {
-        return Ok(());
+        return;
     };
     let Some((&winner_primary, winner_children)) = winner_sections.split_first() else {
-        return Ok(());
+        return;
     };
     redirects.insert(
         (loser_object, loser_primary),
@@ -2739,7 +2739,11 @@ fn record_comdat_redirects(
     );
 
     // Match children by both section name and direct association parent. This preserves nested
-    // association topology even when two objects order same-named children differently.
+    // association topology even when two objects order same-named children differently. The
+    // sets of associates need not be identical: link.exe and lld-link discard all associates of
+    // the losing leader, retain all associates of the winner, and only redirect losing sections
+    // for which the winner has an equivalent. In particular, MSVC libraries can emit an extra
+    // `.voltbl` associate in one copy of an otherwise duplicate inline function.
     let mut winner_used = vec![false; winner_children.len()];
     let mut pending = loser_children.to_vec();
     while !pending.is_empty() {
@@ -2786,11 +2790,6 @@ fn record_comdat_redirects(
             break;
         }
     }
-    ensure!(
-        pending.is_empty() && winner_used.iter().all(|used| *used),
-        "duplicate COMDAT associative structures do not match"
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2972,7 +2971,7 @@ fn discarded_comdat_sections_with_metadata(
                             &existing.sections,
                             &existing.parents,
                             &mut resolution.redirects,
-                        )?;
+                        );
                     }
                     ComdatDecision::ReplaceExisting => {
                         resolution.discarded.extend(
@@ -2990,7 +2989,7 @@ fn discarded_comdat_sections_with_metadata(
                             &sections,
                             &parents,
                             &mut resolution.redirects,
-                        )?;
+                        );
                         selected.insert(
                             name,
                             SelectedComdat {
@@ -6340,6 +6339,54 @@ mod tests {
                     "selection {kind:?} section {section:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn duplicate_comdats_allow_different_associative_children() {
+        for (winner_has_child, loser_has_child) in [(true, false), (false, true)] {
+            let winner = comdat_object(
+                b"different-associates",
+                object::SymbolScope::Linkage,
+                object::ComdatKind::Any,
+                b"winner",
+                0,
+                winner_has_child,
+            );
+            let loser = comdat_object(
+                b"different-associates",
+                object::SymbolScope::Linkage,
+                object::ComdatKind::Any,
+                b"loser",
+                0,
+                loser_has_child,
+            );
+            let objects = [
+                crate::coff::CoffObject::parse(&winner).unwrap(),
+                crate::coff::CoffObject::parse(&loser).unwrap(),
+            ];
+
+            let resolution = discarded_comdat_sections(&objects).unwrap();
+            assert_eq!(resolution.discarded.len(), 1 + usize::from(loser_has_child));
+            assert_eq!(
+                resolution.redirects[&(1, object::SectionIndex(1))],
+                (0, object::SectionIndex(1))
+            );
+            assert_eq!(resolution.redirects.len(), 1);
+            assert_eq!(
+                resolution
+                    .analysis
+                    .groups
+                    .iter()
+                    .map(Vec::len)
+                    .filter(|len| *len > 1)
+                    .collect::<Vec<_>>(),
+                if winner_has_child || loser_has_child {
+                    vec![2]
+                } else {
+                    Vec::new()
+                }
+            );
         }
     }
 
