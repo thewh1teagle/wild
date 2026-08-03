@@ -409,7 +409,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
         match object::FileKind::parse(data.bytes())
             .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
         {
-            object::FileKind::Coff => objects.push(
+            object::FileKind::Coff | object::FileKind::CoffBig => objects.push(
                 crate::coff::CoffObject::parse(data.bytes())
                     .with_context(|| format!("while reading `{}`", path.display()))?,
             ),
