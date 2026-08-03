@@ -170,6 +170,13 @@ jobs:
             }
           }
 
+      - name: Force a fresh Vibe package link
+        working-directory: vibe-source
+        run: >-
+          cargo clean --manifest-path desktop/src-tauri/Cargo.toml
+          --package vibe
+          --target x86_64-pc-windows-msvc
+
       - name: Build Vibe ${{ matrix.profile }} with Wild
         working-directory: vibe-source/desktop
         env:
@@ -224,6 +231,8 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Replay Vibe link with lld-link
+        id: replay
+        continue-on-error: true
         shell: pwsh
         working-directory: vibe-source
         env:
@@ -454,14 +463,18 @@ jobs:
 
           $wildDirectory = (Resolve-Path `
             (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE)).Path
-          if (-not $env:VIBE_LLD_DIRECTORY -or -not (Test-Path $env:VIBE_LLD_DIRECTORY)) {
-            throw "Missing lld-link replay directory"
-          }
-          $lldDirectory = (Resolve-Path $env:VIBE_LLD_DIRECTORY).Path
           $variants = @(
-            [pscustomobject]@{ Name = 'wild'; Directory = $wildDirectory },
-            [pscustomobject]@{ Name = 'lld'; Directory = $lldDirectory }
+            [pscustomobject]@{ Name = 'wild'; Directory = $wildDirectory }
           )
+          if ($env:VIBE_LLD_DIRECTORY) {
+            $lldExecutable = Join-Path $env:VIBE_LLD_DIRECTORY 'vibe.exe'
+            if (Test-Path $lldExecutable) {
+              $variants += [pscustomobject]@{
+                Name = 'lld'
+                Directory = (Resolve-Path $env:VIBE_LLD_DIRECTORY).Path
+              }
+            }
+          }
 
           # This pinned Vibe revision treats any argv[1] as CLI mode and
           # forwards it to sona. Baseline the sidecars before testing that
@@ -526,6 +539,11 @@ jobs:
           if ($failures.Count -ne 0) {
             throw "Vibe acceptance failed:`n$($failures -join "`n")"
           }
+
+      - name: Require identical-input lld-link replay
+        if: always() && steps.replay.outcome != 'success'
+        shell: pwsh
+        run: throw "The identical-input lld-link replay did not succeed"
 
       - name: Capture Vibe ${{ matrix.profile }} failure evidence
         if: failure()
