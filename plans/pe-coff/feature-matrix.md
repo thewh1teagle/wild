@@ -1,8 +1,10 @@
 # PE/COFF feature matrix
 
 Snapshot of completed Goal 1 at commit `547c72f309dc8dd73e5a43166e183491138395e7`
-(2026-08-03; audited in [`goal1-gaps.md`](goal1-gaps.md)). This
-describes demonstrated behavior, not intended future behavior. See
+and the in-progress Goal 2 checkpoint at
+`8dd69ea6b4adba060782cafbba33bd57b44dee4d` (2026-08-03; Goal 1 audited in
+[`goal1-gaps.md`](goal1-gaps.md)). This describes demonstrated behavior, not
+intended future behavior. See
 [`GOAL.md`](../../GOAL.md), [`quality-gate.md`](quality-gate.md), and
 [`session-handoff.md`](session-handoff.md) for scope and reproducible evidence.
 
@@ -15,7 +17,7 @@ describes demonstrated behavior, not intended future behavior. See
 | **Accepted / no-op compatibility** | Accepted so compiler drivers work, but does not provide the feature normally associated with the option. |
 | **Intentionally rejected** | Fails explicitly instead of silently producing a misleading or unsafe image. |
 | **Not implemented** | No end-to-end implementation is claimed. |
-| **Performance gap** | Correctness exists, but measured performance or scaling is behind the reference. |
+| **Performance result** | Performance is measured and verified for the named corpus, host, cache mode, and thread count; it is not a universal claim. |
 
 ## Targets and application coverage
 
@@ -48,7 +50,7 @@ describes demonstrated behavior, not intended future behavior. See
 | `/ALTERNATENAME`, weak externals, absolute symbols | **Supported + verified** | Fallback chains, cycle detection, precedence and relocation behavior have resolver/writer tests and real CRT use. | Expand malformed and uncommon weak-external cases. |
 | COMDAT selection and associative liveness | **Supported + verified** | Object-local identity, deterministic selection, associative liveness and relocation redirection from discarded COMDATs are covered. | Add scale/performance and more selection-kind cases. |
 | Common MSVC/rustc compatibility flags | **Supported + verified** | Common CMake/MSBuild release options, `/` and `-` spellings, and safe no-op compatibility forms are accepted. Unknown options warn instead of failing; enabled CET, CFG, LTO and incremental linking remain explicitly rejected. | Expand only from observed production link lines. |
-| `/OPT:REF` and `/OPT:ICF` | **Supported / limited** | `/OPT:REF` performs real COMDAT-group reachability and dead-import pruning, with lld-compatible release/debug defaults and explicit `/OPT:NOREF`. `/OPT:ICF` remains an accepted no-op. | Profile the GC pass in Goal 2; implement ICF later if justified. |
+| `/OPT:REF` and `/OPT:ICF` | **Supported / limited** | `/OPT:REF` performs real COMDAT-group reachability and dead-import pruning, with lld-compatible release/debug defaults and explicit `/OPT:NOREF`. Its graph and set costs were profiled and reduced in Goal 2. `/OPT:ICF` remains an accepted no-op. | Implement ICF later if justified. |
 | Diagnostics and invalid-input handling | **Supported + verified** | Unsupported machines and unsafe deferred features fail explicitly; parser/unit coverage includes overflow cases and native Windows negative-loader fixtures. | Continue fuzzing and improve diagnostics from production reports. |
 
 ## PE image and loader features
@@ -89,8 +91,8 @@ describes demonstrated behavior, not intended future behavior. See
 | Wild deterministic output | **Supported + verified** | Each of six freestanding fixtures links twice with Wild and produces byte-identical output. | Extend determinism gates to larger cached/non-cached links and multiple hosts. |
 | `lld-link` semantic parity | **Supported + verified** | Six normalized differential fixtures pass, and paired debug/release Vibe builds have matching CLI/GUI behavior on Windows. | Keep bounded equivalences explicit and expand the corpus. |
 | Wild versus `lld-link` byte identity | **Not implemented** | Byte identity is not a goal and is disproven: all differential fixtures differ; Vibe differs from offset `0x2`. Legal section/layout choices also differ. | Compare loader-visible semantics and behavior, not producer bytes. |
-| PE linker parallelism | **Performance gap** | No demonstrated PE-specific parallel resolution/layout/writer speedup is present in the current implementation. | Profile first, then parallelize proven hot stages with scaling benchmarks. |
-| Current link speed | **Performance gap** | The latest local complete Rust compile/link probe remains slower than `lld-link`; the 30-second check is only a correctness budget. | Goal 2 begins with link-only cold/warm, RSS and thread-scaling profiles before optimization. |
+| PE linker parallelism | **Performance result** | Indexed archive preparation and relocation application use measured parallel paths. In the interim Vibe warm sweep, Wild scaled from 179.9 ms at one thread to 138.0 ms at ten (1.30x); `lld-link` slowed from 103.3 to 148.0 ms (0.70x). | This unpinned, `min_seconds=0` checkpoint is not the final authority run; preserve deterministic ordering and remeasure under the documented protocol. |
+| Current link speed | **Performance gap** | At `8dd69ea6`, a 30-pair Vibe confirmation measured Wild faster at the same 8/10-thread settings, but best-vs-best warm still favors lld (about 103 ms at one thread versus Wild's 138 ms at ten). Rust-std warm links favored Wild at measured 1/4/8/10-thread points. | Goal 2 remains open. Rerun pinned with the five-second floor and close the best-vs-best Vibe gap before claiming completion. |
 | Focused CI and local verification | **Supported + verified** | macOS M4 runs unit, xwin, structural, differential and budget checks; focused Actions run the real Windows loader for core, runtime, Tauri and Vibe tiers. | Preserve fast focused gates and add negative/fuzz/performance jobs separately. |
 
 ## Prioritized next milestones
@@ -102,9 +104,12 @@ with evidence in [`goal1-gaps.md`](goal1-gaps.md).
 option compatibility, real `/OPT:REF`, delay imports, stability/fuzz hardening,
 and manifest embedding all pass local and native Windows acceptance gates.
 
-**Goal 2 — performance (next, on a new branch):** profile link-only workloads
-(cold/warm/RSS/thread scaling) against `lld-link` first, then parallelize the
-proven hot stages; remove the measured slowdown before making speed claims.
+**Goal 2 is in progress** at checkpoint
+`8dd69ea6b4adba060782cafbba33bd57b44dee4d`: the link-only harness records
+warm/advisory-cold latency, RSS and thread scaling, and Wild has narrow
+same-`/threads` wins at Vibe 8/10 plus the bounded Rust-std wins above. The
+best-vs-best Vibe target is not met, and the checkpoint was unpinned with
+`min_seconds=0`; an authoritative rerun and further optimization remain.
 
 **Deferred final phases (each separate):** PDB emission with debugger
 validation and real `/MAP`; full CFG/`/GUARD:EHCONT`/`/CETCOMPAT` security

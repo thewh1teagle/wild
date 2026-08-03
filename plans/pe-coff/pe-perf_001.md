@@ -6,6 +6,11 @@ both complete rustc/link invocations, and validates that both outputs are AMD64
 PE images with readable imports. Its stdout is a single machine-readable JSON
 document; success, budget failure, and setup/timeout failure exit 0, 1, and 2.
 
+This remains a correctness/time-budget smoke test, not Goal 2 performance
+evidence: compilation is included and the sample count is too small for a
+linker comparison. Use `pe-link-bench_001.py` and its documented statistical,
+affinity, RSS, cache-mode, and best-vs-best protocol for performance claims.
+
 Run it from the repository root on macOS with the Windows Rust target and xwin
 CRT/SDK already installed:
 
