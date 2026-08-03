@@ -14,15 +14,21 @@ mislink. See `plans/pe-coff/feature-matrix.md` for the full parity table.
 
 Two options; both come with the `pe` feature enabled.
 
-### 1. Prebuilt binary (cargo binstall)
+### 1. Prebuilt binary (recommended on Windows)
 
-```sh
-cargo binstall wild-linker --git https://github.com/thewh1teagle/wild
+Download from this fork's [releases page](https://github.com/thewh1teagle/wild/releases)
+(Linux x86-64/aarch64 and Windows x86-64) and put `wild` on your PATH:
+
+```powershell
+# Windows (PowerShell)
+Invoke-WebRequest https://github.com/thewh1teagle/wild/releases/download/pe-v0.1.0/wild-linker-pe-v0.1.0-x86_64-pc-windows-msvc.tar.gz -OutFile wild.tar.gz
+tar xzf wild.tar.gz
+Move-Item .\wild-linker-pe-v0.1.0-x86_64-pc-windows-msvc\wild.exe $env:USERPROFILE\.cargo\bin\
 ```
 
-Binaries are published on this fork's [releases page](https://github.com/thewh1teagle/wild/releases)
-(Linux x86-64/aarch64 and Windows x86-64) — you can also just download a tarball
-from there and put `wild` on your PATH.
+On Linux, `cargo binstall wild-linker --git https://github.com/thewh1teagle/wild`
+also works. Note: binstall/git-based installs fail **on Windows** because the
+repo's `fakes/` directory uses Unix symlinks — use the tarball there.
 
 ### 2. Build from source (cargo install)
 
