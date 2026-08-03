@@ -493,15 +493,14 @@ impl<'data> CoffArchive<'data> {
         let mut local_definitions = HashSet::<&[u8]>::new();
         let mut selected_indices = HashSet::new();
         let mut selected = Vec::new();
-        loop {
-            let candidate = candidates.iter().find_map(|(name, member_index)| {
-                (!local_definitions.contains(name) && !selected_indices.contains(member_index))
-                    .then_some(*member_index)
-            });
-            let Some(member_index) = candidate else {
-                break;
-            };
-            selected_indices.insert(member_index);
+        // Selection and local-definition sets only grow. A candidate skipped because its demand
+        // was defined or its member was already selected can therefore never become eligible on
+        // a later restart. Walk demand-ordered candidates once instead of rescanning the prefix
+        // after every extraction.
+        for (name, member_index) in candidates {
+            if local_definitions.contains(name) || !selected_indices.insert(member_index) {
+                continue;
+            }
             let member = &self.members[member_index];
             local_definitions.extend(member.definitions.as_slice().iter().map(AsRef::as_ref));
             selected.push(member);
@@ -1349,6 +1348,137 @@ mod tests {
 
         let borrowed = parsed.select_shallow_members_with_defined_lookup(&[], true, |_| false);
         assert_eq!(borrowed.len(), parsed.members().len());
+    }
+
+    #[test]
+    fn linear_shallow_selection_preserves_order_duplicates_and_demand_kinds() {
+        let archive = test_archive(
+            TestArchiveKind::Gnu,
+            &[
+                TestMember {
+                    name: "many.obj",
+                    data: coff_object(&["alias", "first", "later"], &[]),
+                    symbols: &["alias", "first", "later"],
+                },
+                TestMember {
+                    name: "next.obj",
+                    data: coff_object(&["next"], &[]),
+                    symbols: &["next"],
+                },
+                TestMember {
+                    name: "global.obj",
+                    data: coff_object(&["global"], &[]),
+                    symbols: &["global"],
+                },
+            ],
+            false,
+        );
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        let demands = [
+            ArchiveDemand {
+                name: b"alias",
+                kind: ArchiveDemandKind::WeakLibrary,
+            },
+            ArchiveDemand {
+                name: b"first",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"next",
+                kind: ArchiveDemandKind::WeakLibrary,
+            },
+            ArchiveDemand {
+                name: b"later",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"alias",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"global",
+                kind: ArchiveDemandKind::Strong,
+            },
+        ];
+
+        let selected = parsed
+            .select_shallow_members_with_defined_lookup(&demands, false, |name| name == b"global");
+        let selected_indices = selected
+            .iter()
+            .map(|member| member.index())
+            .collect::<Vec<_>>();
+        assert_eq!(selected_indices, [0, 1]);
+
+        let shallow =
+            parsed.plan_shallow_with_defined_lookup(&demands, false, |name| name == b"global");
+        assert_eq!(
+            selected_indices,
+            shallow
+                .selected()
+                .iter()
+                .map(|selection| selection.member().index())
+                .collect::<Vec<_>>()
+        );
+
+        // These members introduce no new demands, so full and shallow planning coincide.
+        let full = parsed.plan(&demands, &[b"global"], false);
+        assert_eq!(
+            selected_indices,
+            full.selected()
+                .iter()
+                .map(|selection| selection.member().index())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linear_shallow_selection_honors_local_definition_suppression() {
+        let archive = test_archive(
+            TestArchiveKind::Gnu,
+            &[
+                TestMember {
+                    name: "first.obj",
+                    data: coff_object(&["trigger", "local"], &[]),
+                    symbols: &["trigger", "local"],
+                },
+                TestMember {
+                    name: "later.obj",
+                    data: coff_object(&["local"], &[]),
+                    symbols: &["local"],
+                },
+            ],
+            false,
+        );
+        let mut parsed = CoffArchive::parse(&archive).unwrap();
+
+        // Model an index candidate later than a definition already carried by the first member.
+        // Selecting `trigger` must suppress the later `local` candidate before member 1 is read.
+        parsed
+            .definition_members
+            .get_mut(b"local".as_slice())
+            .unwrap()
+            .first = 1;
+        let demands = [
+            ArchiveDemand {
+                name: b"trigger",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"local",
+                kind: ArchiveDemandKind::Strong,
+            },
+        ];
+
+        let selected =
+            parsed.select_shallow_members_with_defined_lookup(&demands, false, |_| false);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|member| member.index())
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(parsed.plan(&demands, &[], false).selected().len(), 1);
     }
 
     #[test]
