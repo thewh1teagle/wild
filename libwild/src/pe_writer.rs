@@ -3267,7 +3267,8 @@ fn unreferenced_comdat_sections(
         .enumerate()
         .map(|(object_index, object)| {
             let mut edges = Vec::<(ComdatGroupId, ComdatGroupId)>::new();
-            for section in object.file().sections() {
+            let relocation_index = object.relocation_index();
+            for section in relocation_index.sections() {
                 let key = (object_index, section.index());
                 if comdats.discarded.contains(&key) {
                     continue;
@@ -3279,22 +3280,19 @@ fn unreferenced_comdat_sections(
                 let Some(source_group) = resolved_groups[source_node] else {
                     continue;
                 };
-                for (_, relocation) in section.relocations() {
-                    let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
-                        continue;
-                    };
-                    let symbol = object
-                        .file()
-                        .symbol_by_index(symbol_index)
+                for relocation in relocation_index.relocations(section) {
+                    let symbol = relocation_index.symbol(relocation.symbol());
+                    let shape = symbol
+                        .shape(object)
                         .context("invalid COFF relocation symbol")?;
-                    let target = if let Some(section) = symbol.section_index() {
+                    let target = if let Some(section) = shape.section {
                         let node = comdats
                             .analysis
                             .node((object_index, section))
                             .context("relocation targets an invalid COFF section")?;
                         resolved_groups[node]
-                    } else if symbol.is_global() {
-                        resolve_definition(symbol.name_bytes()?)?
+                    } else if shape.is_global {
+                        resolve_definition(symbol.name(object)?)?
                     } else {
                         None
                     };
@@ -5563,6 +5561,13 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn relocation_object_with_invalid_target() -> Vec<u8> {
+        let mut bytes = relocation_object(b"source", b"target");
+        let relocation = u32::from_le_bytes(bytes[44..48].try_into().unwrap()) as usize;
+        bytes[relocation + 4..relocation + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes
+    }
+
     fn comdat_relocation_object(source: &[u8], target: &[u8]) -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -6083,6 +6088,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(contributions.len(), 2);
+        assert!(
+            objects
+                .iter()
+                .all(|object| !object.relocation_index_initialized()),
+            "/OPT:NOREF must not allocate relocation indices"
+        );
     }
 
     #[test]
@@ -6134,6 +6145,41 @@ mod tests {
                     Source::Synthetic => false,
                 })
         );
+    }
+
+    #[test]
+    fn ref_reports_invalid_live_targets_but_skips_discarded_sources() {
+        let bytes = relocation_object_with_invalid_target();
+        let objects = [crate::coff::CoffObject::parse(&bytes).unwrap()];
+        let snapshot = selected_symbol_snapshot(&objects).unwrap();
+        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+        let section_groups = [HashMap::new()];
+        let analysis = CompactComdatAnalysis::new(&objects, &section_groups).unwrap();
+        let live = ComdatResolution {
+            analysis,
+            ..Default::default()
+        };
+        let error =
+            unreferenced_comdat_sections(&objects, &metadata, &live, &[], &Default::default())
+                .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("invalid COFF relocation symbol"),
+            "{error:?}"
+        );
+
+        let bytes = relocation_object_with_invalid_target();
+        let objects = [crate::coff::CoffObject::parse(&bytes).unwrap()];
+        let snapshot = selected_symbol_snapshot(&objects).unwrap();
+        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+        let section_groups = [HashMap::new()];
+        let analysis = CompactComdatAnalysis::new(&objects, &section_groups).unwrap();
+        let discarded = ComdatResolution {
+            discarded: HashSet::from([(0, object::SectionIndex(1))]),
+            analysis,
+            ..Default::default()
+        };
+        unreferenced_comdat_sections(&objects, &metadata, &discarded, &[], &Default::default())
+            .unwrap();
     }
 
     #[test]
