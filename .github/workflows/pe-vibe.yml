@@ -125,9 +125,6 @@ jobs:
 
       - name: Build Vibe release with Wild
         working-directory: vibe-source/desktop
-        env:
-          # Wild v1 intentionally excludes LTO; Vibe enables it in its release profile.
-          CARGO_PROFILE_RELEASE_LTO: 'false'
         run: >-
           pnpm exec tauri build --no-bundle
           --target x86_64-pc-windows-msvc
