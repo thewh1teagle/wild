@@ -884,13 +884,46 @@ fn windows_command_line_args(input: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
+/// Decodes a link.exe response file.
+///
+/// MSVC tools (and rustc when targeting MSVC) commonly emit UTF-16LE response files with a byte
+/// order mark. Plain UTF-8 remains the default when no BOM is present. UTF-16BE is accepted as
+/// well, since the BOM makes its byte order unambiguous.
+fn decode_response_file(contents: &[u8]) -> Result<String> {
+    const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+    const UTF16_LE_BOM: &[u8] = b"\xff\xfe";
+    const UTF16_BE_BOM: &[u8] = b"\xfe\xff";
+
+    if let Some(contents) = contents.strip_prefix(UTF16_LE_BOM) {
+        decode_utf16_response_file(contents, u16::from_le_bytes)
+    } else if let Some(contents) = contents.strip_prefix(UTF16_BE_BOM) {
+        decode_utf16_response_file(contents, u16::from_be_bytes)
+    } else {
+        let contents = contents.strip_prefix(UTF8_BOM).unwrap_or(contents);
+        String::from_utf8(contents.to_owned()).context("response file is not valid UTF-8")
+    }
+}
+
+fn decode_utf16_response_file(contents: &[u8], decode: fn([u8; 2]) -> u16) -> Result<String> {
+    if !contents.len().is_multiple_of(2) {
+        bail!("UTF-16 response file has an odd number of bytes after its BOM");
+    }
+    let words = contents
+        .chunks_exact(2)
+        .map(|bytes| decode([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&words).context("response file contains malformed UTF-16")
+}
+
 fn expand_response_files<S: AsRef<str>, I: Iterator<Item = S>>(input: I) -> Result<Vec<String>> {
     let mut output = Vec::new();
     for arg in input {
         let arg = arg.as_ref();
         if let Some(path) = arg.strip_prefix('@') {
-            let contents = std::fs::read_to_string(path)
+            let contents = std::fs::read(path)
                 .with_context(|| format!("failed to read response file `{path}`"))?;
+            let contents = decode_response_file(&contents)
+                .with_context(|| format!("failed to decode response file `{path}`"))?;
             let nested = windows_command_line_args(&contents)?;
             output.extend(expand_response_files(nested.into_iter())?);
         } else {
@@ -1130,6 +1163,76 @@ mod tests {
             args.common.inputs[0].spec,
             InputSpec::File(ref path) if &**path == Path::new("object with spaces.obj")
         ));
+    }
+
+    #[test]
+    fn expands_utf16_response_files() {
+        fn encoded_response(contents: &str, little_endian: bool) -> Vec<u8> {
+            let mut encoded = if little_endian {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for word in contents.encode_utf16() {
+                encoded.extend(if little_endian {
+                    word.to_le_bytes()
+                } else {
+                    word.to_be_bytes()
+                });
+            }
+            encoded
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        for (name, little_endian) in [("little.rsp", true), ("big.rsp", false)] {
+            let response = directory.path().join(name);
+            std::fs::write(
+                &response,
+                encoded_response(
+                    "/OUT:unicode.exe \"object with spaces.obj\" caf\u{e9}.obj",
+                    little_endian,
+                ),
+            )
+            .unwrap();
+
+            let mut args = CoffArgs::default();
+            parse(&mut args, [format!("@{}", response.display())].into_iter()).unwrap();
+            assert_eq!(&*args.common.output, Path::new("unicode.exe"));
+            assert!(matches!(
+                args.common.inputs[0].spec,
+                InputSpec::File(ref path) if &**path == Path::new("object with spaces.obj")
+            ));
+            assert!(matches!(
+                args.common.inputs[1].spec,
+                InputSpec::File(ref path) if &**path == Path::new("caf\u{e9}.obj")
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_utf16_response_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let odd = directory.path().join("odd.rsp");
+        std::fs::write(&odd, [0xff, 0xfe, b'A']).unwrap();
+        let error = parse(
+            &mut CoffArgs::default(),
+            [format!("@{}", odd.display())].into_iter(),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("failed to decode response file"));
+        assert!(diagnostic.contains("odd number of bytes"));
+
+        let unpaired_surrogate = directory.path().join("surrogate.rsp");
+        std::fs::write(&unpaired_surrogate, [0xff, 0xfe, 0x00, 0xd8]).unwrap();
+        let error = parse(
+            &mut CoffArgs::default(),
+            [format!("@{}", unpaired_surrogate.display())].into_iter(),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("failed to decode response file"));
+        assert!(diagnostic.contains("malformed UTF-16"));
     }
 
     #[test]
