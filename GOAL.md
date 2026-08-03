@@ -4,7 +4,7 @@ Make Wild's x86-64 PE/COFF support production-usable and stable, then fast.
 Two sequential goals on two branches; optional heavyweight features are
 deferred to the end.
 
-## Goal 1 — production-usable and stable, no optimization (current: `feature/pe-coff-v1`)
+## Goal 1 — production-usable and stable (complete on `feature/pe-coff-v1`)
 
 Match `lld-link` in loader-visible behavior for real release builds; byte
 identity is not the target. In priority order:
@@ -13,8 +13,8 @@ identity is not the target. In priority order:
    flags that today hard-fail (`/INCREMENTAL:NO`, `/IGNORE`, `/ERRORREPORT`,
    `/TLBID`, `/MANIFESTUAC`, `-`-prefixed spellings, …); unknown-option policy
    becomes warn-not-fatal where lld does the same.
-2. `/OPT:REF` dead-code elimination (real, not the current no-op); `/OPT:ICF`
-   may follow later.
+2. `/OPT:REF` dead-code elimination (real rather than a parser-only no-op);
+   `/OPT:ICF` may follow later.
 3. Delay imports end-to-end (`/DELAYLOAD`, `.didat`, helper thunks) — the
    format layer already exists in `linker-utils`.
 4. Stability hardening: fuzz targets for object/archive parsers, the AMD64
@@ -30,7 +30,13 @@ not a rewrite, and keep history topical for later small upstream PRs.
 "Production-usable" here means release-mode builds; debugging via PDB is
 deliberately deferred below.
 
-## Goal 2 — performance (new branch, after Goal 1)
+Completed at `547c72f309dc8dd73e5a43166e183491138395e7` on 2026-08-03. The
+option sweep, real `/OPT:REF`, delay imports with AMD64 unwind information,
+stability/fuzz coverage, and manifest embedding all pass the local gates and
+the native Windows runtime, PE, Tauri, and Vibe workflows recorded in
+`plans/pe-coff/quality-gate.md`.
+
+## Goal 2 — performance (next, on a new branch)
 
 - Profile link-only workloads first (cold/warm, RSS, thread scaling) against
   `lld-link`; only then parallelize the proven hot stages.

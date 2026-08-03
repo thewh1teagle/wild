@@ -1,7 +1,7 @@
 # PE/COFF feature matrix
 
-Snapshot of `feature/pe-coff-v1` at commit `f2392c1a` (2026-08-03; audited by
-the codebase review recorded in [`goal1-gaps.md`](goal1-gaps.md)). This
+Snapshot of completed Goal 1 at commit `547c72f309dc8dd73e5a43166e183491138395e7`
+(2026-08-03; audited in [`goal1-gaps.md`](goal1-gaps.md)). This
 describes demonstrated behavior, not intended future behavior. See
 [`GOAL.md`](../../GOAL.md), [`quality-gate.md`](quality-gate.md), and
 [`session-handoff.md`](session-handoff.md) for scope and reproducible evidence.
@@ -37,7 +37,7 @@ describes demonstrated behavior, not intended future behavior. See
 
 | Area / feature | Status | Current evidence or behavior | Gap or next action |
 |---|---|---|---|
-| Standard COFF objects | **Supported + verified** | Parsed and linked across the complete acceptance corpus. | Add malformed-object fuzzing and more producer versions. |
+| Standard COFF objects | **Supported + verified** | Parsed and linked across the complete acceptance corpus; the standalone cargo-fuzz target exercises standard/bigobj object and archive parsing. | Add more producer versions and sustained fuzzing. |
 | Bigobj COFF objects | **Supported + verified** | Unified standard/bigobj parser and focused tests cover AMD64 bigobj records. | Broaden end-to-end producer coverage. |
 | Self-contained COFF archives | **Supported + verified** | MSVC/GNU-style archives, symbol lookup, lazy extraction and `/WHOLEARCHIVE` behavior are implemented; default libraries resolve to a fixpoint. | Add large-archive performance cases. |
 | Thin COFF archives | **Intentionally rejected** | Parser reports that non-self-contained thin archives are unsupported. | Implement path/member ownership and hermetic tests before accepting them. |
@@ -47,9 +47,9 @@ describes demonstrated behavior, not intended future behavior. See
 | `/DEFAULTLIB`, `/NODEFAULTLIB`, `/DISALLOWLIB` | **Supported + verified** | Directives and command-line forms drive archive selection, including transitive fixpoint behavior and invalidation. | Add diagnostics for more conflicting library graphs. |
 | `/ALTERNATENAME`, weak externals, absolute symbols | **Supported + verified** | Fallback chains, cycle detection, precedence and relocation behavior have resolver/writer tests and real CRT use. | Expand malformed and uncommon weak-external cases. |
 | COMDAT selection and associative liveness | **Supported + verified** | Object-local identity, deterministic selection, associative liveness and relocation redirection from discarded COMDATs are covered. | Add scale/performance and more selection-kind cases. |
-| Common MSVC/rustc compatibility flags | **Supported / limited** | 31 options are fully honored; the rustc/Tauri/Vibe paths are tuned. Unknown options are a **fatal error**, and ~30 common options are unhandled (`/INCREMENTAL:NO`, `/IGNORE`, `/ERRORREPORT`, `/TLBID`, `/MANIFESTUAC`, `/MAP`, `-`-prefixed spellings, …), so stock CMake/MSBuild link lines fail today. | Goal 1 priority 1: accept/no-op the common set and soften the unknown-option policy. See `goal1-gaps.md`. |
-| `/OPT:REF` and `/OPT:ICF` | **Accepted / no-op compatibility** | Parsed into `CoffArgs::optimization` but never read: no section GC or COMDAT folding exists on the PE path, so images are materially larger than `lld-link`'s (e.g. 79 MB vs 42 MB debug Vibe). | Goal 1 priority 2: implement real `/OPT:REF`; ICF may follow later. |
-| Diagnostics and invalid-input handling | **Supported / limited** | Unsupported machines/options, recursive response files, thin archives, unsafe CFG requests and malformed structures fail explicitly; unit tests cover many errors. | Improve context, compatibility wording, negative PE-loader tests and fuzzing. |
+| Common MSVC/rustc compatibility flags | **Supported + verified** | Common CMake/MSBuild release options, `/` and `-` spellings, and safe no-op compatibility forms are accepted. Unknown options warn instead of failing; enabled CET, CFG, LTO and incremental linking remain explicitly rejected. | Expand only from observed production link lines. |
+| `/OPT:REF` and `/OPT:ICF` | **Supported / limited** | `/OPT:REF` performs real COMDAT-group reachability and dead-import pruning, with lld-compatible release/debug defaults and explicit `/OPT:NOREF`. `/OPT:ICF` remains an accepted no-op. | Profile the GC pass in Goal 2; implement ICF later if justified. |
+| Diagnostics and invalid-input handling | **Supported + verified** | Unsupported machines and unsafe deferred features fail explicitly; parser/unit coverage includes overflow cases and native Windows negative-loader fixtures. | Continue fuzzing and improve diagnostics from production reports. |
 
 ## PE image and loader features
 
@@ -57,7 +57,7 @@ describes demonstrated behavior, not intended future behavior. See
 |---|---|---|---|
 | AMD64 relocations | **Supported + verified** | Required COFF AMD64 relocation forms link the C/C++/Rust/Tauri/Vibe corpus. | Expand rare relocation and overflow diagnostics. |
 | Imports and IAT | **Supported + verified** | Import descriptors, thunks and writable IAT work with CRT, SDK, DLL consumers, Tauri and Vibe. | Add unusual bound/import edge cases. |
-| Exports and generated import library | **Supported + verified** | `/EXPORT`, DLL exports and generated consumer import libraries pass native runtime tests. | Broaden ordinals, aliases and forwarders. |
+| Exports and generated import library | **Supported + verified** | `/EXPORT`, ordinal-only imports, forwarded exports, DLL exports and generated consumer import libraries pass native runtime tests. | Broaden unusual aliases and forwarder chains. |
 | Resources | **Supported + verified** | Resource contributions are emitted and exercised by real Tauri/Vibe application images. | Add focused malformed-resource and merge-order cases. |
 | TLS directory and callbacks | **Supported + verified** | Integrated compiler TLS and callback execution passes on Windows. | Add broader runtime patterns. |
 | Exception/unwind tables (`.pdata`/`.xdata`) | **Supported + verified** | Canonical `.pdata` ordering and unwind data support real C++, Rust, Tauri and Vibe. | `/MERGE` of `.pdata` is deliberately unsupported; add exception-heavy runtime tests. |
@@ -67,7 +67,8 @@ describes demonstrated behavior, not intended future behavior. See
 | PE checksum | **Supported + verified** | Independent calculation, patching and validation have focused tests; emitted image support is integrated. | Add comparison with more external producers/signing flows. |
 | Reproducible debug directory | **Supported / limited** | Deterministic in-image debug metadata is emitted and validated; this is not PDB generation. | Validate debugger-facing behavior when real PDB support lands. |
 | Long COFF/PE section names | **Supported + verified** | Long-name string-table handling is tested and required by real Rust/Vibe inputs. | Keep producer-compatibility cases. |
-| Delay-import directory | **Not implemented** | `linker-utils/src/pe_delay_imports.rs` (1146 lines, tested) implements the full binary format, but integration is zero: `/DELAYLOAD` is a fatal unrecognized option; no resolver partitioning, `delayimp.lib`/helper handling, `.didat` layout, directory entry, or thunk emission. | Goal 1 priority 3: plumbing mirrors the existing eager-import path; execute a delay-loaded DLL on Windows. |
+| Delay-import directory | **Supported + verified** | `/DELAYLOAD` partitions eager/delayed imports, extracts `__delayLoadHelper2`, emits `.didat`, writable delay IAT entries and DIR64 relocations, plus ABI-preserving AMD64 resolver thunks with `.pdata`/unwind information. A delay-loaded DLL executes on Windows. | Data imports remain unsupported, matching the practical helper-thunk scope. |
+| Embedded manifests | **Supported + verified** | `/MANIFEST:EMBED[,ID=n]`, UAC/dependencies, UTF-8/UTF-16 `/MANIFESTINPUT` merging, sidecars and DLL/executable resource IDs are integrated. A GUI-subsystem fixture is linked and executed on Windows. | Extend schema-aware merging only when real inputs require it. |
 | `/MERGE` | **Supported / limited** | General section merges are implemented and validated. | `.pdata` merge is explicitly rejected because the exception-directory range must remain exact. |
 
 ## Debugging, optimization, incremental linking, and security
@@ -89,7 +90,7 @@ describes demonstrated behavior, not intended future behavior. See
 | `lld-link` semantic parity | **Supported + verified** | Six normalized differential fixtures pass, and paired debug/release Vibe builds have matching CLI/GUI behavior on Windows. | Keep bounded equivalences explicit and expand the corpus. |
 | Wild versus `lld-link` byte identity | **Not implemented** | Byte identity is not a goal and is disproven: all differential fixtures differ; Vibe differs from offset `0x2`. Legal section/layout choices also differ. | Compare loader-visible semantics and behavior, not producer bytes. |
 | PE linker parallelism | **Performance gap** | No demonstrated PE-specific parallel resolution/layout/writer speedup is present in the current implementation. | Profile first, then parallelize proven hot stages with scaling benchmarks. |
-| Current link speed | **Performance gap** | Captured complete Rust compile/link probe: Wild `0.98 s`, `lld-link` `0.18 s`—about **5.5× slower**. The 30-second check is only a correctness budget. | Benchmark link-only cold/warm runs, RSS and thread scaling; optimize archive/symbol work, allocation/copying, COMDAT selection and output construction. |
+| Current link speed | **Performance gap** | The latest local complete Rust compile/link probe remains slower than `lld-link`; the 30-second check is only a correctness budget. | Goal 2 begins with link-only cold/warm, RSS and thread-scaling profiles before optimization. |
 | Focused CI and local verification | **Supported + verified** | macOS M4 runs unit, xwin, structural, differential and budget checks; focused Actions run the real Windows loader for core, runtime, Tauri and Vibe tiers. | Preserve fast focused gates and add negative/fuzz/performance jobs separately. |
 
 ## Prioritized next milestones
@@ -97,17 +98,11 @@ describes demonstrated behavior, not intended future behavior. See
 Restructured 2026-08-03; the authoritative plan is [`GOAL.md`](../../GOAL.md)
 with evidence in [`goal1-gaps.md`](goal1-gaps.md).
 
-**Goal 1 — production-usable and stable (current branch):**
+**Goal 1 is complete** at `547c72f309dc8dd73e5a43166e183491138395e7`:
+option compatibility, real `/OPT:REF`, delay imports, stability/fuzz hardening,
+and manifest embedding all pass local and native Windows acceptance gates.
 
-1. Option compatibility sweep (accept/no-op the common flag set; warn-not-fatal
-   unknown-option policy where lld matches).
-2. Real `/OPT:REF` dead-code elimination (ICF may follow later).
-3. Delay imports end-to-end.
-4. Stability hardening: parser fuzzing, AMD64 relocation test matrix,
-   forwarded-export/ordinal fixtures, Linux cfg for `windows_pe_runtime.rs`.
-5. Manifest embedding (`/MANIFEST:EMBED`).
-
-**Goal 2 — performance (new branch):** profile link-only workloads
+**Goal 2 — performance (next, on a new branch):** profile link-only workloads
 (cold/warm/RSS/thread scaling) against `lld-link` first, then parallelize the
 proven hot stages; remove the measured slowdown before making speed claims.
 
