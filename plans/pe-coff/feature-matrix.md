@@ -1,6 +1,7 @@
 # PE/COFF feature matrix
 
-Snapshot of `feature/pe-coff-v1` at commit `52aeac2d` (2026-08-03). This
+Snapshot of `feature/pe-coff-v1` at commit `f2392c1a` (2026-08-03; audited by
+the codebase review recorded in [`goal1-gaps.md`](goal1-gaps.md)). This
 describes demonstrated behavior, not intended future behavior. See
 [`GOAL.md`](../../GOAL.md), [`quality-gate.md`](quality-gate.md), and
 [`session-handoff.md`](session-handoff.md) for scope and reproducible evidence.
@@ -46,7 +47,8 @@ describes demonstrated behavior, not intended future behavior. See
 | `/DEFAULTLIB`, `/NODEFAULTLIB`, `/DISALLOWLIB` | **Supported + verified** | Directives and command-line forms drive archive selection, including transitive fixpoint behavior and invalidation. | Add diagnostics for more conflicting library graphs. |
 | `/ALTERNATENAME`, weak externals, absolute symbols | **Supported + verified** | Fallback chains, cycle detection, precedence and relocation behavior have resolver/writer tests and real CRT use. | Expand malformed and uncommon weak-external cases. |
 | COMDAT selection and associative liveness | **Supported + verified** | Object-local identity, deterministic selection, associative liveness and relocation redirection from discarded COMDATs are covered. | Add scale/performance and more selection-kind cases. |
-| Common MSVC/rustc compatibility flags | **Supported / limited** | The parser accepts and applies the options needed by C/C++/Rust/Tauri/Vibe; unknown options are diagnosed. | Complete `link.exe`/`lld-link` option parity is not claimed. |
+| Common MSVC/rustc compatibility flags | **Supported / limited** | 31 options are fully honored; the rustc/Tauri/Vibe paths are tuned. Unknown options are a **fatal error**, and ~30 common options are unhandled (`/INCREMENTAL:NO`, `/IGNORE`, `/ERRORREPORT`, `/TLBID`, `/MANIFESTUAC`, `/MAP`, `-`-prefixed spellings, …), so stock CMake/MSBuild link lines fail today. | Goal 1 priority 1: accept/no-op the common set and soften the unknown-option policy. See `goal1-gaps.md`. |
+| `/OPT:REF` and `/OPT:ICF` | **Accepted / no-op compatibility** | Parsed into `CoffArgs::optimization` but never read: no section GC or COMDAT folding exists on the PE path, so images are materially larger than `lld-link`'s (e.g. 79 MB vs 42 MB debug Vibe). | Goal 1 priority 2: implement real `/OPT:REF`; ICF may follow later. |
 | Diagnostics and invalid-input handling | **Supported / limited** | Unsupported machines/options, recursive response files, thin archives, unsafe CFG requests and malformed structures fail explicitly; unit tests cover many errors. | Improve context, compatibility wording, negative PE-loader tests and fuzzing. |
 
 ## PE image and loader features
@@ -65,7 +67,7 @@ describes demonstrated behavior, not intended future behavior. See
 | PE checksum | **Supported + verified** | Independent calculation, patching and validation have focused tests; emitted image support is integrated. | Add comparison with more external producers/signing flows. |
 | Reproducible debug directory | **Supported / limited** | Deterministic in-image debug metadata is emitted and validated; this is not PDB generation. | Validate debugger-facing behavior when real PDB support lands. |
 | Long COFF/PE section names | **Supported + verified** | Long-name string-table handling is tested and required by real Rust/Vibe inputs. | Keep producer-compatibility cases. |
-| Delay-import directory | **Not implemented** | `linker-utils` has tested delay-import builder/validator utilities, but the driver/resolver/writer acceptance path does not establish end-to-end delay-loaded DLL support. | Integrate command-line/input semantics and execute a delay-loaded DLL on Windows. |
+| Delay-import directory | **Not implemented** | `linker-utils/src/pe_delay_imports.rs` (1146 lines, tested) implements the full binary format, but integration is zero: `/DELAYLOAD` is a fatal unrecognized option; no resolver partitioning, `delayimp.lib`/helper handling, `.didat` layout, directory entry, or thunk emission. | Goal 1 priority 3: plumbing mirrors the existing eager-import path; execute a delay-loaded DLL on Windows. |
 | `/MERGE` | **Supported / limited** | General section merges are implemented and validated. | `.pdata` merge is explicitly rejected because the exception-directory range must remain exact. |
 
 ## Debugging, optimization, incremental linking, and security
@@ -92,16 +94,25 @@ describes demonstrated behavior, not intended future behavior. See
 
 ## Prioritized next milestones
 
-1. Preserve and extend the existing correctness and native-Windows acceptance gates.
-2. Profile PE link-only workloads, establish cold/warm/RSS/thread-scaling baselines, and
-   remove the measured 5.5× performance gap before making speed claims.
-3. Implement real PDB emission with deterministic output and debugger validation.
-4. Add LTO interoperability with explicit LLVM codegen ownership and mixed-input tests.
-5. Complete CFG/security metadata, end-to-end delay imports, and broader SDK/CRT and
-   application compatibility.
-6. Design incremental linking after deterministic full links and PDB behavior are
-   stable.
-7. Add non-x64 targets independently, each with complete relocation and native-runtime
-   coverage.
-8. Continue hardening, fuzzing, diagnostics and real-world adoption toward Linux Wild
-   maturity; no single missing feature closes that maturity gap.
+Restructured 2026-08-03; the authoritative plan is [`GOAL.md`](../../GOAL.md)
+with evidence in [`goal1-gaps.md`](goal1-gaps.md).
+
+**Goal 1 — production-usable and stable (current branch):**
+
+1. Option compatibility sweep (accept/no-op the common flag set; warn-not-fatal
+   unknown-option policy where lld matches).
+2. Real `/OPT:REF` dead-code elimination (ICF may follow later).
+3. Delay imports end-to-end.
+4. Stability hardening: parser fuzzing, AMD64 relocation test matrix,
+   forwarded-export/ordinal fixtures, Linux cfg for `windows_pe_runtime.rs`.
+5. Manifest embedding (`/MANIFEST:EMBED`).
+
+**Goal 2 — performance (new branch):** profile link-only workloads
+(cold/warm/RSS/thread scaling) against `lld-link` first, then parallelize the
+proven hot stages; remove the measured slowdown before making speed claims.
+
+**Deferred final phases (each separate):** PDB emission with debugger
+validation and real `/MAP`; full CFG/`/GUARD:EHCONT`/`/CETCOMPAT` security
+metadata; LTO after PDB; incremental linking last; niche compatibility
+(thin archives, exotic `.def`, `/MERGE:.pdata`, non-x64 targets); continued
+hardening toward Linux Wild maturity.
