@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// The broad category of an archive parsing failure.
@@ -114,6 +115,29 @@ pub struct CoffArchiveMember<'data> {
     data: &'data [u8],
     kind: CoffArchiveMemberKind<'data>,
     opaque_error: Option<CoffArchiveError>,
+    definitions: MemberDefinitions<'data>,
+    demands: OnceLock<Result<Vec<OwnedArchiveDemand>>>,
+}
+
+#[derive(Clone, Debug)]
+struct MemberDefinitions<'data> {
+    values: Arc<Vec<Cow<'data, [u8]>>>,
+    start: u32,
+    end: u32,
+}
+
+impl<'data> MemberDefinitions<'data> {
+    fn as_slice(&self) -> &[Cow<'data, [u8]>] {
+        &self.values[self.start as usize..self.end as usize]
+    }
+}
+
+struct PendingArchiveMember<'data> {
+    index: usize,
+    name: &'data [u8],
+    data: &'data [u8],
+    kind: CoffArchiveMemberKind<'data>,
+    opaque_error: Option<CoffArchiveError>,
     definitions: Vec<Cow<'data, [u8]>>,
     demands: OnceLock<Result<Vec<OwnedArchiveDemand>>>,
 }
@@ -147,7 +171,7 @@ impl<'data> CoffArchiveMember<'data> {
 
     #[must_use]
     pub fn definitions(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.definitions.iter().map(AsRef::as_ref)
+        self.definitions.as_slice().iter().map(AsRef::as_ref)
     }
 
     fn demands(&self) -> &[OwnedArchiveDemand] {
@@ -302,7 +326,7 @@ impl<'data> CoffArchive<'data> {
                     .expect("new archive-member demand cell is empty");
             }
             let member_index = members.len();
-            members.push(CoffArchiveMember {
+            members.push(PendingArchiveMember {
                 index: member_index,
                 name,
                 data: member_data,
@@ -318,6 +342,7 @@ impl<'data> CoffArchive<'data> {
             }
         }
 
+        let mut indexed_definitions = Vec::new();
         if let Some(symbols) = symbols {
             for symbol in symbols {
                 let symbol = symbol.map_err(|error| {
@@ -333,17 +358,14 @@ impl<'data> CoffArchive<'data> {
                         "archive symbol points outside the ordinary member list",
                     ));
                 };
-                let member = &mut members[member_index];
-                member.definitions.push(Cow::Borrowed(symbol.name()));
-            }
-            for member in &mut members {
-                deduplicate_indexed_definitions(&mut member.definitions);
+                indexed_definitions.push((member_index, Cow::Borrowed(symbol.name())));
             }
         }
+        let members = finalize_members(members, indexed_definitions)?;
 
         let mut definition_members = HashMap::<Cow<'data, [u8]>, DefinitionMember>::new();
         for member in &members {
-            for definition in &member.definitions {
+            for definition in member.definitions.as_slice() {
                 definition_members
                     .entry(definition.clone())
                     .and_modify(|entry| {
@@ -479,7 +501,7 @@ impl<'data> CoffArchive<'data> {
             };
             selected_indices.insert(member_index);
             let member = &self.members[member_index];
-            local_definitions.extend(member.definitions.iter().map(AsRef::as_ref));
+            local_definitions.extend(member.definitions.as_slice().iter().map(AsRef::as_ref));
             selected.push(member);
         }
         selected
@@ -556,25 +578,102 @@ impl<'data> CoffArchive<'data> {
     }
 }
 
-fn deduplicate_indexed_definitions<'data>(definitions: &mut Vec<Cow<'data, [u8]>>) {
-    const LINEAR_DEDUP_LIMIT: usize = 8;
-    if definitions.len() <= LINEAR_DEDUP_LIMIT {
-        let mut index = 1;
-        while index < definitions.len() {
-            if contains_name(&definitions[..index], definitions[index].as_ref()) {
-                definitions.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        return;
+fn finalize_members<'data>(
+    mut members: Vec<PendingArchiveMember<'data>>,
+    indexed_definitions: Vec<(usize, Cow<'data, [u8]>)>,
+) -> Result<Vec<CoffArchiveMember<'data>>> {
+    let mut counts = vec![0usize; members.len()];
+    for member in &members {
+        counts[member.index] += member.definitions.len();
+    }
+    for (member_index, _) in &indexed_definitions {
+        counts[*member_index] += 1;
     }
 
-    // Indexed definitions borrow their names from the archive symbol table. Large Rust objects
-    // can publish thousands of names from one member, so checking the member's growing vector for
-    // every symbol is quadratic. Preserve first-occurrence order with one hash lookup per name.
-    let mut seen = HashSet::<Cow<'data, [u8]>>::with_capacity(definitions.len());
-    definitions.retain(|definition| seen.insert(definition.clone()));
+    let definition_count = counts.iter().sum();
+    let mut starts = Vec::with_capacity(members.len());
+    let mut next_start = 0;
+    for &count in &counts {
+        starts.push(next_start);
+        next_start += count;
+    }
+    let mut cursors = starts.clone();
+    let mut grouped_definitions: Vec<Cow<'data, [u8]>> = vec![Cow::Borrowed(&[]); definition_count];
+    for member in &mut members {
+        for definition in std::mem::take(&mut member.definitions) {
+            grouped_definitions[cursors[member.index]] = definition;
+            cursors[member.index] += 1;
+        }
+    }
+    for (member_index, definition) in indexed_definitions {
+        grouped_definitions[cursors[member_index]] = definition;
+        cursors[member_index] += 1;
+    }
+    debug_assert!(
+        cursors
+            .iter()
+            .zip(&starts)
+            .zip(&counts)
+            .all(|((&cursor, &start), &count)| cursor == start + count)
+    );
+
+    let mut definitions = Vec::with_capacity(definition_count);
+    let mut ranges = Vec::with_capacity(members.len());
+    let mut grouped = grouped_definitions.into_iter();
+    let mut large_seen = HashSet::new();
+    const LINEAR_DEDUP_LIMIT: usize = 8;
+    for count in counts {
+        let start = definitions.len();
+        if count <= LINEAR_DEDUP_LIMIT {
+            for definition in grouped.by_ref().take(count) {
+                if !contains_name(&definitions[start..], definition.as_ref()) {
+                    definitions.push(definition);
+                }
+            }
+        } else {
+            large_seen.clear();
+            large_seen.reserve(count);
+            for definition in grouped.by_ref().take(count) {
+                if large_seen.insert(definition.clone()) {
+                    definitions.push(definition);
+                }
+            }
+        }
+        ranges.push((
+            u32::try_from(start).map_err(|_| {
+                CoffArchiveError::archive(
+                    CoffArchiveErrorKind::InvalidSymbolIndex,
+                    "archive definition count exceeds 32-bit range",
+                )
+            })?,
+            u32::try_from(definitions.len()).map_err(|_| {
+                CoffArchiveError::archive(
+                    CoffArchiveErrorKind::InvalidSymbolIndex,
+                    "archive definition count exceeds 32-bit range",
+                )
+            })?,
+        ));
+    }
+    debug_assert!(grouped.next().is_none());
+
+    let definitions = Arc::new(definitions);
+    Ok(members
+        .into_iter()
+        .zip(ranges)
+        .map(|(member, (start, end))| CoffArchiveMember {
+            index: member.index,
+            name: member.name,
+            data: member.data,
+            kind: member.kind,
+            opaque_error: member.opaque_error,
+            definitions: MemberDefinitions {
+                values: Arc::clone(&definitions),
+                start,
+                end,
+            },
+            demands: member.demands,
+        })
+        .collect())
 }
 
 struct ParsedMember<'data> {
@@ -776,7 +875,7 @@ fn absorb_member_with_lookup(
     is_defined: &mut impl FnMut(&[u8]) -> bool,
     expand_demands: bool,
 ) {
-    for definition in &member.definitions {
+    for definition in member.definitions.as_slice() {
         definitions.insert(definition.as_ref().to_vec());
     }
     unresolved.retain(|demand| !definitions.contains(demand.name()) && !is_defined(demand.name()));
@@ -1358,11 +1457,12 @@ mod tests {
             &[],
             false,
         );
-        assert!(
-            plan.selected()
-                .iter()
-                .any(|selected| contains_name(&selected.member().definitions, b"mainCRTStartup"))
-        );
+        assert!(plan.selected().iter().any(|selected| {
+            selected
+                .member()
+                .definitions()
+                .any(|definition| definition == b"mainCRTStartup")
+        }));
     }
 
     fn coff_object(definitions: &[&str], undefined: &[&str]) -> Vec<u8> {
