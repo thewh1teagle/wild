@@ -32,6 +32,7 @@ use object::RelocationKind;
 use object::RelocationTarget;
 use object::SectionFlags;
 use rayon::prelude::*;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1054,6 +1055,78 @@ fn implicit_library_name(requested: &Path) -> Option<PathBuf> {
     Some(name)
 }
 
+#[derive(Debug)]
+struct CachedGlobalSymbol {
+    object: usize,
+    index: object::SymbolIndex,
+    section: Option<object::SectionIndex>,
+    section_kind: object::SymbolSection,
+    address: u64,
+    size: u64,
+    is_definition: bool,
+    is_common: bool,
+    name: OnceCell<Vec<u8>>,
+}
+
+impl CachedGlobalSymbol {
+    fn name<'a>(&'a self, objects: &[crate::coff::CoffObject<'_>]) -> Result<&'a [u8]> {
+        if self.name.get().is_none() {
+            let name = objects[self.object]
+                .file()
+                .symbol_by_index(self.index)?
+                .name_bytes()?
+                .to_vec();
+            let _ = self.name.set(name);
+        }
+        Ok(self.name.get().unwrap())
+    }
+}
+
+#[derive(Debug)]
+struct SelectedObjectMetadata {
+    globals: Vec<CachedGlobalSymbol>,
+    weak: OnceCell<linker_utils::coff_runtime::WeakExternalResolution>,
+}
+
+impl SelectedObjectMetadata {
+    fn new(objects: &[crate::coff::CoffObject<'_>]) -> Self {
+        let globals = objects
+            .iter()
+            .enumerate()
+            .flat_map(|(object, input)| {
+                input.file().symbols().filter_map(move |symbol| {
+                    symbol.is_global().then(|| CachedGlobalSymbol {
+                        object,
+                        index: symbol.index(),
+                        section: symbol.section_index(),
+                        section_kind: symbol.section(),
+                        address: symbol.address(),
+                        size: symbol.size(),
+                        is_definition: symbol.is_definition(),
+                        is_common: symbol.is_common(),
+                        name: OnceCell::new(),
+                    })
+                })
+            })
+            .collect();
+        Self {
+            globals,
+            weak: OnceCell::new(),
+        }
+    }
+
+    fn weak<'a>(
+        &'a self,
+        objects: &[crate::coff::CoffObject<'_>],
+    ) -> Result<&'a linker_utils::coff_runtime::WeakExternalResolution> {
+        if self.weak.get().is_none() {
+            let weak = weak_external_resolution(objects)?;
+            let _ = self.weak.set(weak);
+        }
+        Ok(self.weak.get().unwrap())
+    }
+}
+
 fn undefined_symbols(
     objects: &[crate::coff::CoffObject<'_>],
     roots: &[Vec<u8>],
@@ -1149,19 +1222,30 @@ fn object_definition_names(objects: &[crate::coff::CoffObject<'_>]) -> Result<Ha
     Ok(definitions)
 }
 
+fn selected_object_definition_names(
+    objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
+) -> Result<HashSet<Vec<u8>>> {
+    metadata
+        .globals
+        .iter()
+        .filter(|symbol| symbol.is_definition || symbol.is_common)
+        .map(|symbol| Ok(symbol.name(objects)?.to_vec()))
+        .collect()
+}
+
 fn absolute_symbol_values(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashMap<Vec<u8>, u64>> {
-    let definitions = object_definition_names(objects)?;
+    let definitions = selected_object_definition_names(objects, metadata)?;
     let mut absolute = HashMap::new();
-    for input in objects {
-        for symbol in input.file().symbols() {
-            if symbol.is_global()
-                && symbol.section() == object::SymbolSection::Absolute
-                && !symbol.name_bytes()?.is_empty()
-            {
-                absolute.insert(symbol.name_bytes()?.to_vec(), symbol.address());
+    for symbol in &metadata.globals {
+        if symbol.section_kind == object::SymbolSection::Absolute {
+            let name = symbol.name(objects)?;
+            if !name.is_empty() {
+                absolute.insert(name.to_vec(), symbol.address);
             }
         }
     }
@@ -1171,7 +1255,7 @@ fn absolute_symbol_values(
         }
     }
 
-    let weak = weak_external_resolution(objects)?;
+    let weak = metadata.weak(objects)?;
     for (symbol, _, _) in weak.records() {
         if definitions.contains(symbol) {
             continue;
@@ -1235,6 +1319,7 @@ fn build_image_with_delay_loads(
     delay_load_dlls: &[String],
     selected_roots: &[Vec<u8>],
 ) -> Result<BuiltImage> {
+    let symbol_metadata = SelectedObjectMetadata::new(objects);
     let (mut imports, mut delay_imports) =
         pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
     let comdat_phase = crate::timing_guard!(PE_PHASE_SELECT_COMDATS);
@@ -1273,14 +1358,20 @@ fn build_image_with_delay_loads(
     gc_roots.sort();
     gc_roots.dedup();
     drop(roots_phase);
-    let (mut contributions, comdat_redirects) =
-        collect_contributions_with_roots(objects, args, &gc_roots, runtime_resolution)?;
+    let (mut contributions, comdat_redirects) = collect_contributions_with_roots_metadata(
+        objects,
+        &symbol_metadata,
+        args,
+        &gc_roots,
+        runtime_resolution,
+    )?;
     if opt_ref_enabled(args) {
         let import_selection_phase = crate::timing_guard!(PE_DETAIL_IMPORT_SELECTION);
         let mut import_definitions = pe_imports::definition_names(&imports);
         import_definitions.extend(pe_imports::definition_names(&delay_imports));
         let live_imports = live_import_references(
             objects,
+            &symbol_metadata,
             &contributions,
             &gc_roots,
             &import_definitions,
@@ -1294,9 +1385,9 @@ fn build_image_with_delay_loads(
 
     let layout_phase = crate::timing_guard!(PE_PHASE_LAYOUT);
     let layout_prepare_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_PREPARE);
-    let absolute_symbols = absolute_symbol_values(objects, runtime_resolution)?;
+    let absolute_symbols = absolute_symbol_values(objects, &symbol_metadata, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
-    let common_offsets = add_common_symbols(objects, &mut contributions)?;
+    let common_offsets = add_common_symbols(objects, &symbol_metadata, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
         (0, 0)
     } else {
@@ -1516,6 +1607,7 @@ fn build_image_with_delay_loads(
     let definitions_phase = crate::timing_guard!(PE_PHASE_DEFINE_SYMBOLS);
     let (locations, mut definitions) = definitions(
         objects,
+        &symbol_metadata,
         &contributions,
         &layout,
         config.image_base,
@@ -1540,7 +1632,7 @@ fn build_image_with_delay_loads(
     for (symbol, value) in &absolute_symbols {
         definitions.entry(symbol.clone()).or_insert(*value);
     }
-    bind_weak_externals(objects, &mut definitions)?;
+    bind_weak_externals(objects, &symbol_metadata, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
     if !delay_imports.is_empty() {
         let helper_va = definitions
@@ -1801,9 +1893,10 @@ fn delay_iat_slots(
 
 fn bind_weak_externals(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     definitions: &mut HashMap<Vec<u8>, u64>,
 ) -> Result<()> {
-    let weak = weak_external_resolution(objects)?;
+    let weak = metadata.weak(objects)?;
     let strong = definitions.keys().cloned().collect::<HashSet<_>>();
     for (symbol, _, _) in weak.records() {
         if strong.contains(symbol) {
@@ -2027,11 +2120,35 @@ fn collect_contributions(
     objects: &[crate::coff::CoffObject<'_>],
     args: &crate::args::coff::CoffArgs,
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
-    collect_contributions_with_roots(objects, args, &[], &args.runtime_resolution)
+    let metadata = SelectedObjectMetadata::new(objects);
+    collect_contributions_with_roots_metadata(
+        objects,
+        &metadata,
+        args,
+        &[],
+        &args.runtime_resolution,
+    )
 }
 
+#[cfg(test)]
 fn collect_contributions_with_roots(
     objects: &[crate::coff::CoffObject<'_>],
+    args: &crate::args::coff::CoffArgs,
+    roots: &[Vec<u8>],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<(Vec<Contribution>, SectionRedirects)> {
+    collect_contributions_with_roots_metadata(
+        objects,
+        &SelectedObjectMetadata::new(objects),
+        args,
+        roots,
+        runtime_resolution,
+    )
+}
+
+fn collect_contributions_with_roots_metadata(
+    objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     args: &crate::args::coff::CoffArgs,
     roots: &[Vec<u8>],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
@@ -2042,10 +2159,11 @@ fn collect_contributions_with_roots(
         ));
     }
     let mut output = Vec::new();
-    let mut comdats = discarded_comdat_sections(objects)?;
+    let mut comdats = discarded_comdat_sections_with_metadata(objects, metadata)?;
     if opt_ref_enabled(args) {
         comdats.discarded.extend(unreferenced_comdat_sections(
             objects,
+            metadata,
             &comdats,
             roots,
             runtime_resolution,
@@ -2163,13 +2281,14 @@ fn opt_ref_enabled(args: &crate::args::coff::CoffArgs) -> bool {
 
 fn live_import_references(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     contributions: &[Contribution],
     roots: &[Vec<u8>],
     import_definitions: &HashSet<Vec<u8>>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashSet<Vec<u8>>> {
-    let object_definitions = object_definition_names(objects)?;
-    let weak_resolution = weak_external_resolution(objects)?;
+    let object_definitions = selected_object_definition_names(objects, metadata)?;
+    let weak_resolution = metadata.weak(objects)?;
     let mut referenced = HashSet::new();
     let mut retain = |name: &[u8]| -> Result<()> {
         let is_selected = |candidate: &[u8]| {
@@ -2528,7 +2647,15 @@ fn record_comdat_redirects(
     Ok(())
 }
 
+#[cfg(test)]
 fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<ComdatResolution> {
+    discarded_comdat_sections_with_metadata(objects, &SelectedObjectMetadata::new(objects))
+}
+
+fn discarded_comdat_sections_with_metadata(
+    objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
+) -> Result<ComdatResolution> {
     use linker_utils::coff_symbols::ComdatCandidate;
     use linker_utils::coff_symbols::ComdatDecision;
     use linker_utils::coff_symbols::ComdatSelection;
@@ -2541,20 +2668,18 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
         .collect::<Result<Vec<_>>>()?;
     let analysis = CompactComdatAnalysis::new(objects, &section_groups)?;
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
-    for (object_index, input) in objects.iter().enumerate() {
-        for symbol in input.file().symbols() {
-            if !symbol.is_global() || !symbol.is_definition() {
-                continue;
-            }
-            if symbol
-                .section_index()
-                .and_then(|section| analysis.node((object_index, section)))
-                .is_some_and(|node| analysis.is_comdat[node])
-            {
-                continue;
-            }
-            strong_definitions.insert(symbol.name_bytes()?.to_vec());
+    for symbol in &metadata.globals {
+        if !symbol.is_definition {
+            continue;
         }
+        if symbol
+            .section
+            .and_then(|section| analysis.node((symbol.object, section)))
+            .is_some_and(|node| analysis.is_comdat[node])
+        {
+            continue;
+        }
+        strong_definitions.insert(symbol.name(objects)?.to_vec());
     }
     drop(classify_phase);
 
@@ -2764,6 +2889,7 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
 /// metadata that do not necessarily have a normal relocation edge from the entry point.
 fn unreferenced_comdat_sections(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     comdats: &ComdatResolution,
     roots: &[Vec<u8>],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
@@ -2799,27 +2925,25 @@ fn unreferenced_comdat_sections(
     // symbol's own section below.
     let definitions_phase = crate::timing_guard!(PE_DETAIL_REF_DEFINITIONS);
     let mut definitions = HashMap::<Vec<u8>, ComdatGroupId>::new();
-    for (object_index, object) in objects.iter().enumerate() {
-        for symbol in object.file().symbols() {
-            if !symbol.is_global() || !symbol.is_definition() {
-                continue;
-            }
-            let Some(section) = symbol.section_index() else {
-                continue;
-            };
-            let node = comdats
-                .analysis
-                .node((object_index, section))
-                .context("definition refers to an invalid COFF section")?;
-            let Some(group) = resolved_groups[node] else {
-                continue;
-            };
-            definitions
-                .entry(symbol.name_bytes()?.to_vec())
-                .or_insert(group);
+    for symbol in &metadata.globals {
+        if !symbol.is_definition {
+            continue;
         }
+        let Some(section) = symbol.section else {
+            continue;
+        };
+        let node = comdats
+            .analysis
+            .node((symbol.object, section))
+            .context("definition refers to an invalid COFF section")?;
+        let Some(group) = resolved_groups[node] else {
+            continue;
+        };
+        definitions
+            .entry(symbol.name(objects)?.to_vec())
+            .or_insert(group);
     }
-    let weak_resolution = weak_external_resolution(objects)?;
+    let weak_resolution = metadata.weak(objects)?;
     let resolve_definition = |name: &[u8]| -> Result<Option<ComdatGroupId>> {
         if let Some(&group) = definitions.get(name) {
             return Ok(Some(group));
@@ -2974,18 +3098,15 @@ fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u
 
 fn add_common_symbols(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     contributions: &mut Vec<Contribution>,
 ) -> Result<HashMap<Vec<u8>, (u32, ContributionId)>> {
     let mut commons = BTreeMap::<Vec<u8>, u64>::new();
-    for object in objects {
-        for symbol in object.file().symbols() {
-            if symbol.is_common() && symbol.is_global() {
-                commons
-                    .entry(symbol.name_bytes()?.to_vec())
-                    .and_modify(|size| *size = (*size).max(symbol.size()))
-                    .or_insert(symbol.size());
-            }
-        }
+    for symbol in metadata.globals.iter().filter(|symbol| symbol.is_common) {
+        commons
+            .entry(symbol.name(objects)?.to_vec())
+            .and_modify(|size| *size = (*size).max(symbol.size))
+            .or_insert(symbol.size);
     }
     if commons.is_empty() {
         return Ok(HashMap::new());
@@ -3247,6 +3368,7 @@ type LocationMap = HashMap<(usize, object::SectionIndex), ContributionId>;
 
 fn definitions(
     objects: &[crate::coff::CoffObject<'_>],
+    metadata: &SelectedObjectMetadata,
     contributions: &[Contribution],
     layout: &SectionLayout,
     image_base: u64,
@@ -3254,31 +3376,26 @@ fn definitions(
 ) -> Result<(LocationMap, HashMap<Vec<u8>, u64>)> {
     let locations = source_locations(contributions);
     let mut definitions = HashMap::new();
-    for (object_index, input) in objects.iter().enumerate() {
-        for symbol in input.file().symbols() {
-            if !symbol.is_global() || symbol.is_common() {
-                continue;
-            }
-            let name = symbol.name_bytes()?.to_vec();
-            let address = if let Some(section) = symbol.section_index() {
-                let Some(id) = locations.get(&(object_index, section)) else {
-                    continue;
-                };
-                image_base + u64::from(layout.placements[id].rva) + symbol.address()
-            } else if symbol.is_definition() {
-                symbol.address()
-            } else {
+    for symbol in metadata.globals.iter().filter(|symbol| !symbol.is_common) {
+        let name = symbol.name(objects)?.to_vec();
+        let address = if let Some(section) = symbol.section {
+            let Some(id) = locations.get(&(symbol.object, section)) else {
                 continue;
             };
-            if let Some(old) = definitions.insert(name.clone(), address) {
-                ensure!(
-                    allow_multiple || old == address,
-                    "duplicate symbol `{}`",
-                    String::from_utf8_lossy(&name)
-                );
-                if allow_multiple {
-                    definitions.insert(name, old);
-                }
+            image_base + u64::from(layout.placements[id].rva) + symbol.address
+        } else if symbol.is_definition {
+            symbol.address
+        } else {
+            continue;
+        };
+        if let Some(old) = definitions.insert(name.clone(), address) {
+            ensure!(
+                allow_multiple || old == address,
+                "duplicate symbol `{}`",
+                String::from_utf8_lossy(&name)
+            );
+            if allow_multiple {
+                definitions.insert(name, old);
             }
         }
     }
