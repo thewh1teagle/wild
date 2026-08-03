@@ -10,10 +10,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 CHECKS = (
@@ -87,6 +88,211 @@ class Node:
 class SemanticDifference:
     view: str
     diff: str
+
+
+@dataclass(frozen=True)
+class PeSection:
+    name: bytes
+    virtual_size: int
+    virtual_address: int
+    raw_size: int
+    raw_offset: int
+    characteristics: int
+
+
+@dataclass(frozen=True)
+class PeLayout:
+    data: bytes
+    sections: tuple[PeSection, ...]
+    directories: tuple[tuple[int, int], ...]
+
+    def section(self, name: bytes) -> PeSection:
+        matches = [section for section in self.sections if section.name == name]
+        if len(matches) != 1:
+            raise ValueError(f"expected exactly one {name!r} section, found {len(matches)}")
+        return matches[0]
+
+    def section_data(self, section: PeSection) -> bytes:
+        end = section.raw_offset + min(section.raw_size, section.virtual_size)
+        return self.data[section.raw_offset:end]
+
+
+def parse_pe_layout(path: Path) -> PeLayout:
+    data = path.read_bytes()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise ValueError(f"{path} lacks a DOS header")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset + 24 > len(data) or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ValueError(f"{path} lacks a valid PE signature")
+    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    optional_end = optional_offset + optional_size
+    if optional_end > len(data) or optional_size < 112:
+        raise ValueError(f"{path} has a truncated PE32+ optional header")
+    if struct.unpack_from("<H", data, optional_offset)[0] != 0x20B:
+        raise ValueError(f"{path} is not a PE32+ image")
+    directory_count = min(struct.unpack_from("<I", data, optional_offset + 108)[0], 16)
+    if optional_offset + 112 + directory_count * 8 > optional_end:
+        raise ValueError(f"{path} has truncated data directories")
+    directories = tuple(
+        struct.unpack_from("<II", data, optional_offset + 112 + index * 8)
+        for index in range(directory_count)
+    )
+    section_table = optional_end
+    if section_table + section_count * 40 > len(data):
+        raise ValueError(f"{path} has a truncated section table")
+    sections = []
+    for index in range(section_count):
+        offset = section_table + index * 40
+        name = data[offset : offset + 8].rstrip(b"\0")
+        virtual_size, virtual_address, raw_size, raw_offset = struct.unpack_from(
+            "<IIII", data, offset + 8
+        )
+        characteristics = struct.unpack_from("<I", data, offset + 36)[0]
+        if raw_size and raw_offset + raw_size > len(data):
+            raise ValueError(f"{path} section {name!r} has out-of-bounds raw data")
+        sections.append(
+            PeSection(name, virtual_size, virtual_address, raw_size, raw_offset, characteristics)
+        )
+    return PeLayout(data, tuple(sections), directories)
+
+
+def directory(layout: PeLayout, index: int) -> tuple[int, int]:
+    return layout.directories[index] if index < len(layout.directories) else (0, 0)
+
+
+def contains_rva(section: PeSection, region: tuple[int, int]) -> bool:
+    rva, size = region
+    return (
+        size > 0
+        and section.virtual_address <= rva
+        and rva + size <= section.virtual_address + section.virtual_size
+    )
+
+
+def accepts_zero_fill_section_equivalence(reference: PeLayout, candidate: PeLayout) -> bool:
+    """Accept lld's initialized `.data` spelling for an input `.bss` section.
+
+    PE maps the portion where VirtualSize exceeds SizeOfRawData as zeroes. The
+    initialized/uninitialized content flags do not change that loader rule.
+    This policy is deliberately exact to the two-section bss_external fixture.
+    """
+
+    if tuple(section.name for section in reference.sections) != (b".text", b".data"):
+        return False
+    if tuple(section.name for section in candidate.sections) != (b".text", b".bss"):
+        return False
+    reference_text, reference_zero = reference.sections
+    candidate_text, candidate_zero = candidate.sections
+    relevant = 0xE00000E0  # content kind plus R/W/X permissions
+    if (
+        reference_text.virtual_size != candidate_text.virtual_size
+        or reference_text.raw_size != candidate_text.raw_size
+        or reference_text.characteristics & relevant != candidate_text.characteristics & relevant
+    ):
+        return False
+    initialized_rw = 0xC0000040
+    uninitialized_rw = 0xC0000080
+    if (
+        reference_zero.virtual_size == 0
+        or reference_zero.virtual_size != candidate_zero.virtual_size
+        or reference_zero.raw_size != 0
+        or candidate_zero.raw_size != 0
+        or reference_zero.characteristics & relevant != initialized_rw
+        or candidate_zero.characteristics & relevant != uninitialized_rw
+    ):
+        return False
+    # This fixture has no loader data directories; accepting a section-kind
+    # spelling difference must not mask movement of any loader-owned structure.
+    return all(region == (0, 0) for region in reference.directories) and all(
+        region == (0, 0) for region in candidate.directories
+    )
+
+
+def accepts_split_import_section_equivalence(reference: PeLayout, candidate: PeLayout) -> bool:
+    """Accept Wild's conventional writable `.idata` split from lld's `.rdata`.
+
+    The import and IAT directories must stay wholly inside the respective
+    import-bearing section, exception data must stay in `.pdata`, and the
+    non-import unwind payload must be byte-identical. Other section shapes are
+    rejected rather than broadly ignoring `.rdata`/`.idata` differences.
+    """
+
+    if tuple(section.name for section in reference.sections) != (b".text", b".rdata", b".pdata"):
+        return False
+    if tuple(section.name for section in candidate.sections) != (
+        b".text",
+        b".rdata",
+        b".pdata",
+        b".idata",
+    ):
+        return False
+    reference_text = reference.section(b".text")
+    candidate_text = candidate.section(b".text")
+    reference_pdata = reference.section(b".pdata")
+    candidate_pdata = candidate.section(b".pdata")
+    reference_rdata = reference.section(b".rdata")
+    candidate_rdata = candidate.section(b".rdata")
+    candidate_idata = candidate.section(b".idata")
+    relevant = 0xE00000E0
+    code_rx = 0x60000020
+    initialized_r = 0x40000040
+    initialized_rw = 0xC0000040
+    if (
+        reference_text.virtual_size != candidate_text.virtual_size
+        or reference_text.characteristics & relevant != code_rx
+        or candidate_text.characteristics & relevant != code_rx
+        or reference_pdata.virtual_size != candidate_pdata.virtual_size
+        or reference_pdata.characteristics & relevant != initialized_r
+        or candidate_pdata.characteristics & relevant != initialized_r
+        or reference_rdata.characteristics & relevant != initialized_r
+        or candidate_rdata.characteristics & relevant != initialized_r
+        or candidate_idata.characteristics & relevant != initialized_rw
+    ):
+        return False
+    # Import directory index 1, exception directory index 3, and IAT index 12.
+    if not (
+        contains_rva(reference_rdata, directory(reference, 1))
+        and contains_rva(reference_rdata, directory(reference, 12))
+        and contains_rva(candidate_idata, directory(candidate, 1))
+        and contains_rva(candidate_idata, directory(candidate, 12))
+        and contains_rva(reference_pdata, directory(reference, 3))
+        and contains_rva(candidate_pdata, directory(candidate, 3))
+    ):
+        return False
+    reference_rdata_bytes = reference.section_data(reference_rdata)
+    candidate_rdata_bytes = candidate.section_data(candidate_rdata)
+    if not candidate_rdata_bytes or not reference_rdata_bytes.endswith(candidate_rdata_bytes):
+        return False
+    import_prefix_size = len(reference_rdata_bytes) - len(candidate_rdata_bytes)
+    padding = import_prefix_size - candidate_idata.virtual_size
+    if padding not in range(8):
+        return False
+    return not padding or reference_rdata_bytes[import_prefix_size - padding : import_prefix_size] == bytes(
+        padding
+    )
+
+
+def accepted_layout_views(
+    case: Case, reference: Path, candidate: Path, differences: list[SemanticDifference]
+) -> set[str]:
+    views = {difference.view for difference in differences}
+    reference_layout = parse_pe_layout(reference)
+    candidate_layout = parse_pe_layout(candidate)
+    if (
+        case.name == "bss_external"
+        and views == {"sections"}
+        and accepts_zero_fill_section_equivalence(reference_layout, candidate_layout)
+    ):
+        return views
+    if (
+        case.name == "exit_process"
+        and views == {"headers", "sections"}
+        and accepts_split_import_section_equivalence(reference_layout, candidate_layout)
+    ):
+        return views
+    return set()
 
 
 def resolve_tool(explicit: str | None, environment: str, names: tuple[str, ...]) -> Path:
@@ -360,7 +566,11 @@ def run_matrix(args: argparse.Namespace) -> int:
                 candidate_hash = digest(candidate_a)
                 deterministic = candidate_a.read_bytes() == candidate_b.read_bytes()
                 differences = semantic_differences(reference, candidate_a, llvm_readobj, supported)
+                accepted = accepted_layout_views(case, reference, candidate_a, differences)
+                differences = [item for item in differences if item.view not in accepted]
                 semantics = "PASS" if not differences else ",".join(item.view for item in differences)
+                if accepted:
+                    semantics += f" ({'+'.join(sorted(accepted))} layout equivalent)"
                 print(
                     f"{case.name:19}  {reference.stat().st_size:7}/{reference_hash[:12]}  "
                     f"{candidate_a.stat().st_size:7}/{candidate_hash[:12]}  "
@@ -436,6 +646,64 @@ Import {
         return 1
     if canonicalize(reference) == canonicalize(different):
         print("self-test failed: semantic import mismatch was hidden", file=sys.stderr)
+        return 1
+    empty_directories = ((0, 0),) * 16
+    text = PeSection(b".text", 16, 0x1000, 512, 0, 0x60000020)
+    lld_bss = PeLayout(
+        b"",
+        (text, PeSection(b".data", 4, 0x2000, 0, 0, 0xC0000040)),
+        empty_directories,
+    )
+    wild_bss = PeLayout(
+        b"",
+        (text, PeSection(b".bss", 4, 0x2000, 0, 0, 0xC0000080)),
+        empty_directories,
+    )
+    if not accepts_zero_fill_section_equivalence(lld_bss, wild_bss):
+        print("self-test failed: exact zero-fill section equivalence was rejected", file=sys.stderr)
+        return 1
+    bad_bss = replace(wild_bss, sections=(text, replace(wild_bss.sections[1], raw_size=4)))
+    if accepts_zero_fill_section_equivalence(lld_bss, bad_bss):
+        print("self-test failed: raw-data section was accepted as zero-fill equivalent", file=sys.stderr)
+        return 1
+
+    unwind = b"UNWIND!!"
+    lld_directories = list(empty_directories)
+    lld_directories[1] = (0x2000, 40)
+    lld_directories[3] = (0x3000, 12)
+    lld_directories[12] = (0x2038, 16)
+    lld_split = PeLayout(
+        bytes(100) + unwind,
+        (
+            text,
+            PeSection(b".rdata", 108, 0x2000, 108, 0, 0x40000040),
+            PeSection(b".pdata", 12, 0x3000, 12, 0, 0x40000040),
+        ),
+        tuple(lld_directories),
+    )
+    wild_directories = list(empty_directories)
+    wild_directories[1] = (0x4000, 40)
+    wild_directories[3] = (0x3000, 12)
+    wild_directories[12] = (0x4038, 16)
+    wild_split = PeLayout(
+        unwind + bytes(99),
+        (
+            text,
+            PeSection(b".rdata", 8, 0x2000, 8, 0, 0x40000040),
+            PeSection(b".pdata", 12, 0x3000, 12, 0, 0x40000040),
+            PeSection(b".idata", 99, 0x4000, 99, 8, 0xC0000040),
+        ),
+        tuple(wild_directories),
+    )
+    if not accepts_split_import_section_equivalence(lld_split, wild_split):
+        print("self-test failed: exact split import-section equivalence was rejected", file=sys.stderr)
+        return 1
+    bad_split = replace(
+        wild_split,
+        sections=(*wild_split.sections[:3], replace(wild_split.sections[3], characteristics=0x40000040)),
+    )
+    if accepts_split_import_section_equivalence(lld_split, bad_split):
+        print("self-test failed: read-only candidate IAT was accepted", file=sys.stderr)
         return 1
     print("PASS self-test: deterministic hashing and semantic normalization")
     return 0

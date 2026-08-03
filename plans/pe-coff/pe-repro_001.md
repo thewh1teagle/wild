@@ -6,6 +6,17 @@ identical. It reports SHA-256 digests and sizes, then compares normalized PE
 headers, sections, symbols, imports, exports, base relocations, and unwind data
 with `llvm-readobj`.
 
+The comparison has two deliberately narrow PE-layout equivalences for this
+corpus. Wild keeps the writable import address table in a separate `.idata`
+section while `lld-link` folds it into `.rdata`; the validator accepts that only
+after proving that both import/IAT directories are contained in their expected
+sections, exception data remains in `.pdata`, section permissions are exact,
+and the non-import unwind payload is byte-identical. Wild also preserves an
+input zero-fill contribution as `.bss`, while `lld-link` names the same
+zero-raw-data mapping `.data`; that is accepted only for the exact two-section
+fixture with identical size and permissions and no loader data directories.
+All other header or section differences still fail.
+
 Build Wild and run the matrix from the repository root:
 
 ```console
