@@ -108,6 +108,18 @@ pub struct DataDirectoryRange {
     pub size: u32,
 }
 
+/// Address and file shifts caused by inserting a new synthetic `.reloc`
+/// output section without rebuilding an otherwise unchanged layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelocationSectionInsertion {
+    pub output_section: usize,
+    /// The old RVA at which custom output sections begin. RVAs at or above
+    /// this boundary move by [`Self::rva_delta`].
+    pub first_shifted_rva: u32,
+    pub rva_delta: u32,
+    pub file_delta: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContentClass {
     Code,
@@ -279,6 +291,218 @@ pub fn layout_sections_borrowed<'a>(
         file_size: next_file,
         size_of_image: next_rva,
     })
+}
+
+/// Tries to insert one new synthetic `.reloc` contribution into an existing
+/// layout without regrouping and sorting every input contribution.
+///
+/// The fast path is deliberately narrow. It applies only when `.reloc` does
+/// not already exist, adding its section header does not change the aligned
+/// header extent, and the section alignment is at least the 4 KiB PE base
+/// relocation page size. Under those conditions `.reloc` is inserted after
+/// every standard output section and shifts every custom section by one
+/// uniform page-multiple. Callers can therefore adjust already-discovered
+/// relocation RVAs using the returned boundary and delta.
+///
+/// `layout` must have been produced by [`layout_sections`] or
+/// [`layout_sections_borrowed`] with `options`. `Ok(None)` leaves it unchanged
+/// and requests a full relayout. Invalid relocation contributions are errors.
+pub fn try_insert_relocation_section(
+    layout: &mut SectionLayout,
+    contribution: &SectionContribution,
+    options: SectionLayoutOptions,
+) -> Result<Option<RelocationSectionInsertion>> {
+    const BASE_RELOCATION_PAGE_SIZE: u32 = 0x1000;
+    const SECTION_HEADER_SIZE: u32 = 40;
+
+    validate_options(options)?;
+    validate_contribution(contribution)?;
+    ensure!(
+        contribution.name == b".reloc",
+        "incremental relocation contribution must be named `.reloc`"
+    );
+    ensure!(
+        contribution.size != 0,
+        "incremental relocation contribution must not be empty"
+    );
+    ensure!(
+        content_class(contribution.characteristics, contribution.kind)? == ContentClass::Data,
+        "incremental relocation contribution must contain initialized data"
+    );
+    ensure!(
+        !layout.placements.contains_key(&contribution.id),
+        "duplicate contribution id {}",
+        contribution.id.0
+    );
+
+    if options.section_alignment < BASE_RELOCATION_PAGE_SIZE
+        || layout
+            .sections
+            .iter()
+            .any(|section| section.name == b".reloc")
+        || layout.sections.len() >= usize::from(u16::MAX)
+        || layout
+            .sections
+            .windows(2)
+            .any(|pair| section_order(&pair[0].name) >= section_order(&pair[1].name))
+    {
+        return Ok(None);
+    }
+
+    let next_headers_size = options
+        .headers_size
+        .checked_add(SECTION_HEADER_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("PE section headers overflow"))?;
+    if align_up(
+        options.headers_size,
+        options.section_alignment,
+        "current section headers",
+    )? != align_up(
+        next_headers_size,
+        options.section_alignment,
+        "expanded section headers",
+    )? || align_up(
+        options.headers_size,
+        options.file_alignment,
+        "current file headers",
+    )? != align_up(
+        next_headers_size,
+        options.file_alignment,
+        "expanded file headers",
+    )? {
+        return Ok(None);
+    }
+
+    let relocation_order = section_order(b".reloc");
+    let output_section = layout
+        .sections
+        .iter()
+        .position(|section| section_order(&section.name) > relocation_order)
+        .unwrap_or(layout.sections.len());
+    let first_shifted_rva = layout
+        .sections
+        .get(output_section)
+        .map_or(layout.size_of_image, |section| section.rva);
+    let relocation_file_offset = layout.sections[output_section..]
+        .iter()
+        .find_map(|section| section.file_offset)
+        .unwrap_or(layout.file_size);
+    if !first_shifted_rva.is_multiple_of(options.section_alignment)
+        || !relocation_file_offset.is_multiple_of(options.file_alignment)
+    {
+        return Ok(None);
+    }
+
+    let rva_delta = align_up(
+        contribution.size,
+        options.section_alignment,
+        "relocation section virtual size",
+    )?;
+    let file_delta = align_up(
+        contribution.size,
+        options.file_alignment,
+        "relocation section raw size",
+    )?;
+    let size_of_image = layout
+        .size_of_image
+        .checked_add(rva_delta)
+        .ok_or_else(|| anyhow::anyhow!("image RVA overflow"))?;
+    let file_size = layout
+        .file_size
+        .checked_add(file_delta)
+        .ok_or_else(|| anyhow::anyhow!("output file size overflow"))?;
+    first_shifted_rva
+        .checked_add(contribution.size)
+        .ok_or_else(|| anyhow::anyhow!("relocation section RVA overflow"))?;
+    relocation_file_offset
+        .checked_add(contribution.size)
+        .ok_or_else(|| anyhow::anyhow!("relocation section file offset overflow"))?;
+
+    // Check every update before mutating the layout so all fallback and error
+    // paths leave the caller's authoritative layout untouched.
+    for section in &layout.sections[output_section..] {
+        section
+            .rva
+            .checked_add(rva_delta)
+            .ok_or_else(|| anyhow::anyhow!("output section RVA overflow"))?;
+        if let Some(file_offset) = section.file_offset {
+            file_offset
+                .checked_add(file_delta)
+                .ok_or_else(|| anyhow::anyhow!("output section file offset overflow"))?;
+        }
+    }
+    for placement in layout
+        .placements
+        .values()
+        .filter(|placement| placement.output_section >= output_section)
+    {
+        placement
+            .output_section
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("output section index overflow"))?;
+        placement
+            .rva
+            .checked_add(rva_delta)
+            .ok_or_else(|| anyhow::anyhow!("contribution RVA overflow"))?;
+        if let Some(file_offset) = placement.file_offset {
+            file_offset
+                .checked_add(file_delta)
+                .ok_or_else(|| anyhow::anyhow!("contribution file offset overflow"))?;
+        }
+    }
+
+    for section in &mut layout.sections[output_section..] {
+        section.rva += rva_delta;
+        if let Some(file_offset) = &mut section.file_offset {
+            *file_offset += file_delta;
+        }
+    }
+    for placement in layout
+        .placements
+        .values_mut()
+        .filter(|placement| placement.output_section >= output_section)
+    {
+        placement.output_section += 1;
+        placement.rva += rva_delta;
+        if let Some(file_offset) = &mut placement.file_offset {
+            *file_offset += file_delta;
+        }
+    }
+
+    let mut characteristics = contribution.characteristics;
+    characteristics &= !(CONTENT_MASK | pe::IMAGE_SCN_ALIGN_MASK | LINK_ONLY_MASK);
+    characteristics |= pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0;
+    layout.sections.insert(
+        output_section,
+        OutputSection {
+            name: contribution.name.clone(),
+            characteristics,
+            rva: first_shifted_rva,
+            virtual_size: contribution.size,
+            file_offset: Some(relocation_file_offset),
+            raw_size: file_delta,
+            contributions: vec![contribution.id],
+        },
+    );
+    layout.placements.insert(
+        contribution.id,
+        ContributionPlacement {
+            output_section,
+            offset: 0,
+            rva: first_shifted_rva,
+            file_offset: Some(relocation_file_offset),
+            size: contribution.size,
+        },
+    );
+    layout.file_size = file_size;
+    layout.size_of_image = size_of_image;
+
+    Ok(Some(RelocationSectionInsertion {
+        output_section,
+        first_shifted_rva,
+        rva_delta,
+        file_delta,
+    }))
 }
 
 /// Returns the full non-empty output section range for a standard directory.
@@ -490,6 +714,27 @@ mod tests {
         }
     }
 
+    fn relocation_contribution(id: u32, size: u32) -> SectionContribution {
+        SectionContribution {
+            id: ContributionId(id),
+            name: b".reloc".to_vec(),
+            characteristics: (pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                | pe::IMAGE_SCN_MEM_READ
+                | pe::IMAGE_SCN_MEM_DISCARDABLE)
+                .0,
+            alignment: 8,
+            size,
+            kind: ContributionKind::Data,
+        }
+    }
+
+    fn expanded_header_options(options: SectionLayoutOptions) -> SectionLayoutOptions {
+        SectionLayoutOptions {
+            headers_size: options.headers_size + 40,
+            ..options
+        }
+    }
+
     #[test]
     fn groups_subsections_lexically_and_preserves_equal_suffix_order() {
         let inputs = [
@@ -547,6 +792,175 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(inputs[0].unrelated_payload, [1, 2, 3]);
+    }
+
+    #[test]
+    fn incrementally_inserts_reloc_exactly_like_a_full_layout() {
+        let options = options();
+        let inputs = vec![
+            contribution(0, b".text", ContributionKind::Data, 0x901, 16),
+            contribution(1, b".bss", ContributionKind::Bss, 0x123, 16),
+            contribution(2, b".00cfg", ContributionKind::Data, 0x38, 8),
+            contribution(3, b".midbss", ContributionKind::Bss, 0x20, 8),
+            contribution(4, b".rsrc", ContributionKind::Data, 0x701, 8),
+        ];
+        let relocation = relocation_contribution(5, 0x281c);
+        let mut actual = layout_sections(&inputs, options).unwrap();
+        let old_custom_rva = actual
+            .sections
+            .iter()
+            .find(|section| section.name == b".00cfg")
+            .unwrap()
+            .rva;
+        let old_file_size = actual.file_size;
+        let old_size_of_image = actual.size_of_image;
+
+        let insertion = try_insert_relocation_section(&mut actual, &relocation, options)
+            .unwrap()
+            .unwrap();
+        let mut complete_inputs = inputs;
+        complete_inputs.push(relocation);
+        let expected = layout_sections(&complete_inputs, expanded_header_options(options)).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(insertion.output_section, 2);
+        assert_eq!(insertion.first_shifted_rva, old_custom_rva);
+        assert_eq!(insertion.rva_delta, 0x3000);
+        assert_eq!(insertion.file_delta, 0x2a00);
+        assert_eq!(actual.file_size, old_file_size + insertion.file_delta);
+        assert_eq!(
+            actual.size_of_image,
+            old_size_of_image + insertion.rva_delta
+        );
+        assert_eq!(
+            actual.placements[&ContributionId(2)].output_section,
+            insertion.output_section + 1
+        );
+        assert_eq!(actual.placements[&ContributionId(3)].file_offset, None);
+    }
+
+    #[test]
+    fn incrementally_appends_reloc_when_there_are_no_custom_sections() {
+        let options = options();
+        let inputs = vec![
+            contribution(0, b".text", ContributionKind::Data, 0x80, 16),
+            contribution(1, b".data", ContributionKind::Data, 0x41, 8),
+        ];
+        let relocation = relocation_contribution(2, 12);
+        let mut actual = layout_sections(&inputs, options).unwrap();
+        let old_file_size = actual.file_size;
+        let old_size_of_image = actual.size_of_image;
+
+        let insertion = try_insert_relocation_section(&mut actual, &relocation, options)
+            .unwrap()
+            .unwrap();
+        let mut complete_inputs = inputs;
+        complete_inputs.push(relocation);
+        let expected = layout_sections(&complete_inputs, expanded_header_options(options)).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(insertion.first_shifted_rva, old_size_of_image);
+        assert_eq!(
+            actual.placements[&ContributionId(2)].file_offset,
+            Some(old_file_size)
+        );
+    }
+
+    #[test]
+    fn incremental_reloc_fallbacks_leave_layout_unchanged() {
+        let default_options = options();
+        let relocation = relocation_contribution(20, 12);
+
+        let existing_inputs = [
+            contribution(0, b".text", ContributionKind::Data, 8, 1),
+            contribution(1, b".reloc$input", ContributionKind::Data, 8, 8),
+        ];
+        let mut existing = layout_sections(&existing_inputs, default_options).unwrap();
+        let before = existing.clone();
+        assert_eq!(
+            try_insert_relocation_section(&mut existing, &relocation, default_options).unwrap(),
+            None
+        );
+        assert_eq!(existing, before);
+
+        let low_alignment = SectionLayoutOptions {
+            headers_size: 0x220,
+            section_alignment: 0x200,
+            file_alignment: 0x200,
+        };
+        let inputs = [contribution(0, b".custom", ContributionKind::Data, 8, 1)];
+        let mut low = layout_sections(&inputs, low_alignment).unwrap();
+        let before = low.clone();
+        assert_eq!(
+            try_insert_relocation_section(&mut low, &relocation, low_alignment).unwrap(),
+            None
+        );
+        assert_eq!(low, before);
+
+        let growing_headers = SectionLayoutOptions {
+            headers_size: 0x200,
+            ..default_options
+        };
+        let mut headers = layout_sections(&inputs, growing_headers).unwrap();
+        let before = headers.clone();
+        assert_eq!(
+            try_insert_relocation_section(&mut headers, &relocation, growing_headers).unwrap(),
+            None
+        );
+        assert_eq!(headers, before);
+
+        let unordered_inputs = [
+            contribution(0, b".text", ContributionKind::Data, 8, 1),
+            contribution(1, b".custom", ContributionKind::Data, 8, 1),
+        ];
+        let mut unordered = layout_sections(&unordered_inputs, default_options).unwrap();
+        unordered.sections.swap(0, 1);
+        let before = unordered.clone();
+        assert_eq!(
+            try_insert_relocation_section(&mut unordered, &relocation, default_options).unwrap(),
+            None
+        );
+        assert_eq!(unordered, before);
+    }
+
+    #[test]
+    fn incremental_reloc_errors_leave_layout_unchanged() {
+        let options = options();
+        let inputs = [contribution(0, b".custom", ContributionKind::Data, 8, 1)];
+        let layout = layout_sections(&inputs, options).unwrap();
+
+        let mut duplicate_layout = layout.clone();
+        let duplicate = relocation_contribution(0, 12);
+        assert!(try_insert_relocation_section(&mut duplicate_layout, &duplicate, options).is_err());
+        assert_eq!(duplicate_layout, layout);
+
+        let mut wrong_name_layout = layout.clone();
+        let mut wrong_name = relocation_contribution(2, 12);
+        wrong_name.name = b".not-reloc".to_vec();
+        assert!(
+            try_insert_relocation_section(&mut wrong_name_layout, &wrong_name, options).is_err()
+        );
+        assert_eq!(wrong_name_layout, layout);
+
+        let mut empty_layout = layout.clone();
+        let empty = relocation_contribution(2, 0);
+        assert!(try_insert_relocation_section(&mut empty_layout, &empty, options).is_err());
+        assert_eq!(empty_layout, layout);
+
+        let mut overflowing_layout = layout.clone();
+        let overflowing_options = SectionLayoutOptions {
+            headers_size: u32::MAX - 20,
+            ..options
+        };
+        assert!(
+            try_insert_relocation_section(
+                &mut overflowing_layout,
+                &relocation_contribution(2, 12),
+                overflowing_options,
+            )
+            .is_err()
+        );
+        assert_eq!(overflowing_layout, layout);
     }
 
     #[test]
