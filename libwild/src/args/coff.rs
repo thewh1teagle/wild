@@ -374,6 +374,10 @@ where
                 args.exports.push(parse_export(value)?);
             }
             "def" => {
+                ensure!(
+                    source == "command line",
+                    "/DEF is only valid on the command line"
+                );
                 let value = required_value("/DEF", inline_value, &mut input)?;
                 ensure!(
                     args.definition_files.is_empty(),
@@ -1027,6 +1031,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(parse_directives(&mut CoffArgs::default(), "/DEF:exports.def").is_err());
     }
 
     #[test]
