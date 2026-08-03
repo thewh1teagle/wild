@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
 import os
 import platform
 import random
-import resource
 import shutil
 import statistics
 import struct
@@ -19,14 +19,77 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+if os.name == "nt":
+    import msvcrt
+    from ctypes import wintypes
+
+    resource = None
+else:
+    import resource
+
 SCHEMA_VERSION = 1
 AMD64_MACHINE = 0x8664
 PE32_PLUS_MAGIC = 0x20B
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    CREATE_SUSPENDED = 0x00000004
+    CREATE_NO_WINDOW = 0x08000000
+    STARTF_USESTDHANDLES = 0x00000100
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    INFINITE = 0xFFFFFFFF
+    STILL_ACTIVE = 259
+
+    class _StartupInfo(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_ubyte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _ProcessInformation(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
 
 
 class BenchError(RuntimeError):
@@ -48,6 +111,15 @@ class Sample:
 
 
 @dataclass(frozen=True)
+class WindowsExecution:
+    sample: Sample
+    peak_working_set_kib: int
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
 class ThreadPair:
     wild: int
     lld_link: int
@@ -60,13 +132,51 @@ def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _program_files_roots(environ: Mapping[str, str]) -> list[Path]:
+    roots: list[Path] = []
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        value = environ.get(name)
+        if value:
+            path = Path(value)
+            if path not in roots:
+                roots.append(path)
+    return roots
+
+
+def llvm_lld_candidates(
+    environ: Mapping[str, str] = os.environ,
+) -> list[Path]:
+    """Return conventional LLVM lld-link locations in deterministic order."""
+    candidates: list[Path] = []
+    for root in _program_files_roots(environ):
+        candidates.append(root / "LLVM" / "bin" / "lld-link.exe")
+        visual_studio = root / "Microsoft Visual Studio"
+        if visual_studio.is_dir():
+            candidates.extend(
+                sorted(
+                    visual_studio.glob("*/*/VC/Tools/Llvm/x64/bin/lld-link.exe"),
+                    key=lambda path: str(path).casefold(),
+                    reverse=True,
+                )
+            )
+    return candidates
+
+
 def resolve_executable(value: str) -> Path:
     candidate = Path(value).expanduser()
     if candidate.is_file():
         return candidate.absolute()
+    if WINDOWS and not candidate.suffix:
+        executable_candidate = candidate.with_suffix(".exe")
+        if executable_candidate.is_file():
+            return executable_candidate.absolute()
     found = shutil.which(value)
     if found:
         return Path(found).absolute()
+    if WINDOWS and candidate.name.casefold() in {"lld-link", "lld-link.exe"}:
+        for llvm_candidate in llvm_lld_candidates():
+            if llvm_candidate.is_file():
+                return llvm_candidate.absolute()
     raise BenchError(f"executable not found: {value}")
 
 
@@ -196,7 +306,9 @@ def summarize(values: list[float]) -> dict[str, float | int]:
     }
 
 
-def paired_comparison(wild_samples: list[Sample], lld_samples: list[Sample]) -> dict[str, Any]:
+def paired_comparison(
+    wild_samples: list[Sample], lld_samples: list[Sample]
+) -> dict[str, Any]:
     paired_deltas = [
         wild.elapsed_seconds - lld.elapsed_seconds
         for wild, lld in zip(wild_samples, lld_samples, strict=True)
@@ -238,7 +350,212 @@ def unlink_output(path: Path) -> None:
         pass
 
 
-def run_sample(command: list[str], cwd: Path, timeout: float, label: str) -> Sample:
+def windows_affinity_mask(cpu_list: str | None) -> int | None:
+    if cpu_list is None:
+        return None
+    cpus = parse_cpu_list(cpu_list)
+    mask_bits = ctypes.sizeof(ctypes.c_size_t) * 8
+    if cpus[-1] >= mask_bits:
+        raise BenchError(
+            f"Windows affinity supports processor indices 0-{mask_bits - 1} in the "
+            f"process primary processor group; requested CPU {cpus[-1]}"
+        )
+    return sum(1 << cpu for cpu in cpus)
+
+
+def _filetime_seconds(value: Any) -> float:
+    ticks = (value.dwHighDateTime << 32) | value.dwLowDateTime
+    return ticks / 10_000_000.0
+
+
+def _start_windows_process(
+    kernel32: Any, process_handle: Any, thread_handle: Any, affinity_mask: int | None
+) -> None:
+    """Apply affinity while suspended, then permit the initial thread to run."""
+    if affinity_mask is not None and not kernel32.SetProcessAffinityMask(
+        process_handle, ctypes.c_size_t(affinity_mask)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if kernel32.ResumeThread(thread_handle) == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_execute(
+    command: list[str],
+    cwd: Path,
+    timeout: float,
+    label: str,
+    cpu_list: str | None,
+) -> WindowsExecution:
+    """Launch suspended, apply affinity, then collect native process metrics."""
+    if not WINDOWS:
+        raise BenchError("native Windows process execution is unavailable on this host")
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_StartupInfo),
+        ctypes.POINTER(_ProcessInformation),
+    ]
+    kernel32.CreateProcessW.restype = wintypes.BOOL
+    kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ProcessMemoryCounters),
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+    affinity_mask = windows_affinity_mask(cpu_list)
+    process = _ProcessInformation()
+    with (
+        tempfile.TemporaryFile() as stdin_file,
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
+        inherited_handles = [
+            msvcrt.get_osfhandle(file.fileno())
+            for file in (stdin_file, stdout_file, stderr_file)
+        ]
+        for handle in inherited_handles:
+            os.set_handle_inheritable(handle, True)
+        startup = _StartupInfo()
+        startup.cb = ctypes.sizeof(startup)
+        startup.dwFlags = STARTF_USESTDHANDLES
+        startup.hStdInput, startup.hStdOutput, startup.hStdError = inherited_handles
+        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(command))
+        started = time.perf_counter()
+        created = kernel32.CreateProcessW(
+            None,
+            command_line,
+            None,
+            None,
+            True,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            None,
+            str(cwd),
+            ctypes.byref(startup),
+            ctypes.byref(process),
+        )
+        if not created:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        process_finished = False
+        try:
+            _start_windows_process(
+                kernel32, process.hProcess, process.hThread, affinity_mask
+            )
+            wait_milliseconds = min(math.ceil(timeout * 1000), INFINITE - 1)
+            wait_result = kernel32.WaitForSingleObject(
+                process.hProcess, wait_milliseconds
+            )
+            elapsed = time.perf_counter() - started
+            if wait_result == WAIT_TIMEOUT:
+                kernel32.TerminateProcess(process.hProcess, 1)
+                kernel32.WaitForSingleObject(process.hProcess, INFINITE)
+                process_finished = True
+                raise BenchError(f"{label} exceeded {timeout:.3f} seconds")
+            if wait_result != WAIT_OBJECT_0:
+                raise ctypes.WinError(ctypes.get_last_error())
+            process_finished = True
+
+            exit_code = wintypes.DWORD(STILL_ACTIVE)
+            if not kernel32.GetExitCodeProcess(
+                process.hProcess, ctypes.byref(exit_code)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                process.hProcess,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            memory = _ProcessMemoryCounters()
+            memory.cb = ctypes.sizeof(memory)
+            if not psapi.GetProcessMemoryInfo(
+                process.hProcess, ctypes.byref(memory), memory.cb
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            return WindowsExecution(
+                sample=Sample(
+                    elapsed_seconds=elapsed,
+                    user_seconds=_filetime_seconds(user),
+                    system_seconds=_filetime_seconds(kernel),
+                ),
+                peak_working_set_kib=math.ceil(memory.PeakWorkingSetSize / 1024),
+                returncode=exit_code.value,
+                stdout=stdout_file.read(),
+                stderr=stderr_file.read(),
+            )
+        finally:
+            if not process_finished:
+                kernel32.TerminateProcess(process.hProcess, 1)
+                kernel32.WaitForSingleObject(process.hProcess, INFINITE)
+            kernel32.CloseHandle(process.hThread)
+            kernel32.CloseHandle(process.hProcess)
+
+
+def _check_windows_execution(execution: WindowsExecution, label: str) -> None:
+    if execution.returncode:
+        stderr = execution.stderr.decode(errors="replace")[-4000:]
+        stdout = execution.stdout.decode(errors="replace")[-2000:]
+        raise BenchError(
+            f"{label} exited with {execution.returncode}; "
+            f"stdout={stdout!r}; stderr={stderr!r}"
+        )
+
+
+def run_sample(
+    command: list[str],
+    cwd: Path,
+    timeout: float,
+    label: str,
+    cpu_list: str | None = None,
+) -> Sample:
+    if WINDOWS:
+        execution = _windows_execute(command, cwd, timeout, label, cpu_list)
+        _check_windows_execution(execution, label)
+        return execution.sample
+
+    assert resource is not None
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.perf_counter()
     try:
@@ -264,6 +581,20 @@ def run_sample(command: list[str], cwd: Path, timeout: float, label: str) -> Sam
         user_seconds=max(0.0, after.ru_utime - before.ru_utime),
         system_seconds=max(0.0, after.ru_stime - before.ru_stime),
     )
+
+
+def windows_peak_working_set(
+    command: list[str],
+    cwd: Path,
+    output: Path,
+    timeout: float,
+    label: str,
+    cpu_list: str | None,
+) -> int:
+    unlink_output(output)
+    execution = _windows_execute(command, cwd, timeout, label, cpu_list)
+    _check_windows_execution(execution, label)
+    return execution.peak_working_set_kib
 
 
 def evict_input_cache(paths: list[Path]) -> dict[str, int]:
@@ -329,6 +660,7 @@ def validate_outputs(
             response.parent,
             timeout,
             f"validate {tool.name}",
+            cpu_list,
         )
         inspections.append(inspect_pe(output))
     return {
@@ -394,7 +726,8 @@ def benchmark_configuration(
         )
         output_label = f"wild-{thread_pair.wild}-lld-{thread_pair.lld_link}"
     outputs = {
-        tool.name: work / f"sample-{mode}-{output_label}-{tool.name}.exe" for tool in tools
+        tool.name: work / f"sample-{mode}-{output_label}-{tool.name}.exe"
+        for tool in tools
     }
     eviction: dict[str, int] | None = None
 
@@ -411,6 +744,7 @@ def benchmark_configuration(
             response.parent,
             timeout,
             f"{tool.name} {mode} {configuration_label}",
+            cpu_list,
         )
         if measured:
             samples[tool.name].append(sample)
@@ -440,7 +774,11 @@ def benchmark_configuration(
         for tool in order:
             invoke(tool, True)
 
-    result: dict[str, Any] = {"mode": mode, "execution_order": execution_order, "tools": {}}
+    result: dict[str, Any] = {
+        "mode": mode,
+        "execution_order": execution_order,
+        "tools": {},
+    }
     if thread_pair is None:
         result["threads"] = threads
     else:
@@ -465,7 +803,7 @@ def benchmark_configuration(
             "raw_samples": [sample.__dict__ for sample in tool_samples],
         }
         if rss_samples:
-            if gnu_time is None:
+            if not WINDOWS and gnu_time is None:
                 raise BenchError("RSS samples requested but GNU time was not found")
             rss_values = []
             for index in range(rss_samples):
@@ -480,9 +818,24 @@ def benchmark_configuration(
                     taskset,
                     cpu_list,
                 )
-                rss_values.append(
-                    gnu_time_rss(gnu_time, command, response.parent, output, timeout)
-                )
+                if WINDOWS:
+                    rss_values.append(
+                        windows_peak_working_set(
+                            command,
+                            response.parent,
+                            output,
+                            timeout,
+                            "peak working set measurement",
+                            cpu_list,
+                        )
+                    )
+                else:
+                    assert gnu_time is not None
+                    rss_values.append(
+                        gnu_time_rss(
+                            gnu_time, command, response.parent, output, timeout
+                        )
+                    )
             tool_result["maximum_rss_kib"] = summarize(
                 [float(value) for value in rss_values]
             )
@@ -536,7 +889,22 @@ def thread_scaling(configurations: list[dict[str, Any]]) -> dict[str, Any]:
     return scaling
 
 
+def default_modes() -> list[str]:
+    return ["warm"] if WINDOWS else ["warm", "cold-input-cache"]
+
+
+def check_cache_modes(modes: list[str]) -> None:
+    if WINDOWS and "cold-input-cache" in modes:
+        raise BenchError(
+            "cold-input-cache mode is unavailable on Windows: Windows has no "
+            "per-file equivalent of POSIX_FADV_DONTNEED with the same advisory "
+            "semantics, and this harness will not purge the system-wide standby "
+            "list; use --mode warm"
+        )
+
+
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    check_cache_modes(args.mode)
     corpus = args.corpus.expanduser().resolve()
     if not corpus.is_dir():
         raise BenchError(f"corpus directory does not exist: {corpus}")
@@ -551,8 +919,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     wild = Tool("wild", resolve_executable(args.wild), ("-flavor", "link"))
     lld = Tool("lld-link", resolve_executable(args.lld_link), ())
     tools = [wild, lld]
-    taskset = resolve_executable("taskset") if args.cpu_list else None
-    gnu_time = resolve_executable(args.gnu_time) if args.rss_samples else None
+    taskset = resolve_executable("taskset") if args.cpu_list and not WINDOWS else None
+    gnu_time = (
+        resolve_executable(args.gnu_time) if args.rss_samples and not WINDOWS else None
+    )
     cache_paths = sorted({*files, wild.path, lld.path}, key=str)
     rng = random.Random(args.seed)
     report: dict[str, Any] = {
@@ -562,8 +932,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "cache_mode_definition": {
             "warm": "ordinary repeated process runs with no explicit cache eviction",
             "cold-input-cache": (
-                "advisory POSIX_FADV_DONTNEED for corpus files and linker executables; "
-                "not a global cold cache"
+                "unavailable on Windows; on POSIX, advisory POSIX_FADV_DONTNEED for "
+                "corpus files and linker executables, not a global cold cache"
             ),
         },
         "host": {
@@ -571,6 +941,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "machine": platform.machine(),
             "logical_cpus": os.cpu_count(),
             "cpu_list": args.cpu_list,
+            "affinity_semantics": (
+                "SetProcessAffinityMask before ResumeThread in the primary processor "
+                "group"
+                if WINDOWS and args.cpu_list
+                else "taskset --cpu-list wrapper"
+                if args.cpu_list
+                else "unrestricted"
+            ),
         },
         "corpus": corpus_metadata(corpus, response, files),
         "tools": {tool.name: tool_metadata(tool) for tool in tools},
@@ -585,6 +963,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "timeout_seconds": args.timeout,
             "random_seed": args.seed,
             "compilation_in_timed_region": False,
+            "timing_source": (
+                "QueryPerformanceCounter/perf_counter wall time and GetProcessTimes"
+                if WINDOWS
+                else "perf_counter wall time and getrusage(RUSAGE_CHILDREN)"
+            ),
+            "peak_memory_source": (
+                "GetProcessMemoryInfo PeakWorkingSetSize"
+                if WINDOWS
+                else "GNU time maximum resident set size"
+            ),
         },
         "configurations": [],
     }
@@ -657,7 +1045,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 for tool in tools:
                     threads = (
-                        thread_pair.wild if tool.name == "wild" else thread_pair.lld_link
+                        thread_pair.wild
+                        if tool.name == "wild"
+                        else thread_pair.lld_link
                     )
                     validation = validate_outputs(
                         tool,
@@ -732,7 +1122,10 @@ def parser() -> argparse.ArgumentParser:
         "--mode",
         action="append",
         choices=("warm", "cold-input-cache"),
-        help="repeatable; defaults to warm and cold-input-cache",
+        help=(
+            "repeatable; defaults to warm on Windows, and warm plus "
+            "cold-input-cache on POSIX"
+        ),
     )
     thread_selection = result.add_mutually_exclusive_group()
     thread_selection.add_argument(
@@ -804,9 +1197,11 @@ class HarnessTests(unittest.TestCase):
     def test_thread_pair(self) -> None:
         self.assertEqual(parse_thread_pair("10:1"), ThreadPair(wild=10, lld_link=1))
         for invalid in ("10", "1:2:3", "0:1", "1:-2", "wild:1"):
-            with self.subTest(invalid=invalid):
-                with self.assertRaises(argparse.ArgumentTypeError):
-                    parse_thread_pair(invalid)
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(argparse.ArgumentTypeError),
+            ):
+                parse_thread_pair(invalid)
 
     def test_thread_pair_cli_is_mutually_exclusive_with_sweep(self) -> None:
         parsed = parser().parse_args(["--thread-pair", "10:1"])
@@ -817,9 +1212,13 @@ class HarnessTests(unittest.TestCase):
         commands: list[list[str]] = []
 
         def fake_run_sample(
-            command: list[str], cwd: Path, timeout: float, label: str
+            command: list[str],
+            cwd: Path,
+            timeout: float,
+            label: str,
+            cpu_list: str | None = None,
         ) -> Sample:
-            del cwd, timeout, label
+            del cwd, timeout, label, cpu_list
             commands.append(command)
             elapsed = 1.0 if command[0] == "/bin/wild" else 2.0
             return Sample(elapsed, 0.0, 0.0)
@@ -828,30 +1227,34 @@ class HarnessTests(unittest.TestCase):
             Tool("wild", Path("/bin/wild"), ("-flavor", "link")),
             Tool("lld-link", Path("/bin/lld-link"), ()),
         ]
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(f"{__name__}.run_sample", side_effect=fake_run_sample):
-                result = benchmark_configuration(
-                    tools=tools,
-                    response=Path(directory) / "response.txt",
-                    work=Path(directory),
-                    mode="warm",
-                    threads=10,
-                    cache_paths=[],
-                    taskset=None,
-                    cpu_list=None,
-                    warmups=0,
-                    min_samples=2,
-                    min_seconds=0.0,
-                    max_samples=2,
-                    rss_samples=0,
-                    gnu_time=None,
-                    timeout=1.0,
-                    rng=random.Random(1),
-                    thread_pair=ThreadPair(wild=10, lld_link=1),
-                )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch(f"{__name__}.run_sample", side_effect=fake_run_sample),
+        ):
+            result = benchmark_configuration(
+                tools=tools,
+                response=Path(directory) / "response.txt",
+                work=Path(directory),
+                mode="warm",
+                threads=10,
+                cache_paths=[],
+                taskset=None,
+                cpu_list=None,
+                warmups=0,
+                min_samples=2,
+                min_seconds=0.0,
+                max_samples=2,
+                rss_samples=0,
+                gnu_time=None,
+                timeout=1.0,
+                rng=random.Random(1),
+                thread_pair=ThreadPair(wild=10, lld_link=1),
+            )
 
         wild_commands = [command for command in commands if command[0] == "/bin/wild"]
-        lld_commands = [command for command in commands if command[0] == "/bin/lld-link"]
+        lld_commands = [
+            command for command in commands if command[0] == "/bin/lld-link"
+        ]
         self.assertTrue(all("/threads:10" in command for command in wild_commands))
         self.assertTrue(all("/threads:1" in command for command in lld_commands))
         self.assertEqual(result["thread_pair"], {"wild": 10, "lld-link": 1})
@@ -876,11 +1279,11 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "/bin/wild",
+                str(Path("/bin/wild")),
                 "-flavor",
                 "link",
                 "@response.txt",
-                "/out:/tmp/out.exe",
+                f"/out:{Path('/tmp/out.exe')}",
                 "/threads:4",
             ],
         )
@@ -916,6 +1319,138 @@ class HarnessTests(unittest.TestCase):
             },
         )
 
+    def test_windows_affinity_mask(self) -> None:
+        self.assertEqual(windows_affinity_mask("0,2-3"), 0b1101)
+        with (
+            mock.patch(f"{__name__}.ctypes.sizeof", return_value=4),
+            self.assertRaisesRegex(BenchError, "0-31"),
+        ):
+            windows_affinity_mask("32")
+
+    def test_windows_affinity_is_applied_before_resume(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        class FakeKernel32:
+            def SetProcessAffinityMask(self, process: int, mask: Any) -> bool:
+                calls.append(("affinity", mask.value))
+                self.assert_process = process
+                return True
+
+            def ResumeThread(self, thread: int) -> int:
+                calls.append(("resume", thread))
+                return 1
+
+        kernel32 = FakeKernel32()
+        _start_windows_process(kernel32, 10, 20, 0b101)
+        self.assertEqual(calls, [("affinity", 0b101), ("resume", 20)])
+
+    def test_windows_run_sample_dispatch_and_process_metrics(self) -> None:
+        execution = WindowsExecution(
+            sample=Sample(0.25, 0.1, 0.05),
+            peak_working_set_kib=123,
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        with (
+            mock.patch(f"{__name__}.WINDOWS", True),
+            mock.patch(
+                f"{__name__}._windows_execute", return_value=execution
+            ) as execute,
+        ):
+            sample = run_sample(["lld-link.exe"], Path("C:/corpus"), 2.0, "lld", "1,3")
+        self.assertEqual(sample, execution.sample)
+        execute.assert_called_once_with(
+            ["lld-link.exe"], Path("C:/corpus"), 2.0, "lld", "1,3"
+        )
+
+    def test_windows_rss_samples_use_peak_working_set(self) -> None:
+        tools = [
+            Tool("wild", Path("C:/bin/wild.exe"), ("-flavor", "link")),
+            Tool("lld-link", Path("C:/bin/lld-link.exe"), ()),
+        ]
+
+        def fake_sample(*args: Any, **kwargs: Any) -> Sample:
+            command = args[0]
+            return Sample(1.0 if "wild.exe" in command[0] else 2.0, 0.1, 0.1)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch(f"{__name__}.WINDOWS", True),
+            mock.patch(f"{__name__}.run_sample", side_effect=fake_sample),
+            mock.patch(
+                f"{__name__}.windows_peak_working_set", side_effect=[100, 200]
+            ) as peak,
+        ):
+            result = benchmark_configuration(
+                tools=tools,
+                response=Path(directory) / "response.txt",
+                work=Path(directory),
+                mode="warm",
+                threads=1,
+                cache_paths=[],
+                taskset=None,
+                cpu_list="0",
+                warmups=0,
+                min_samples=1,
+                min_seconds=0.0,
+                max_samples=1,
+                rss_samples=1,
+                gnu_time=None,
+                timeout=1.0,
+                rng=random.Random(1),
+            )
+        self.assertEqual(peak.call_count, 2)
+        rss_values = sorted(
+            result["tools"][name]["maximum_rss_kib"]["raw_samples"]
+            for name in ("wild", "lld-link")
+        )
+        self.assertEqual(rss_values, [[100], [200]])
+
+    def test_windows_nonzero_exit_reports_captured_output(self) -> None:
+        execution = WindowsExecution(
+            sample=Sample(0.1, 0.0, 0.0),
+            peak_working_set_kib=1,
+            returncode=7,
+            stdout=b"out",
+            stderr=b"bad",
+        )
+        with self.assertRaisesRegex(BenchError, "exited with 7.*bad"):
+            _check_windows_execution(execution, "link")
+
+    def test_windows_rejects_cold_cache_with_actionable_message(self) -> None:
+        with mock.patch(f"{__name__}.WINDOWS", True):
+            self.assertEqual(default_modes(), ["warm"])
+            with self.assertRaisesRegex(BenchError, "use --mode warm"):
+                check_cache_modes(["cold-input-cache"])
+
+    def test_posix_defaults_remain_warm_and_cold(self) -> None:
+        with mock.patch(f"{__name__}.WINDOWS", False):
+            self.assertEqual(default_modes(), ["warm", "cold-input-cache"])
+            check_cache_modes(["warm", "cold-input-cache"])
+
+    def test_windows_discovers_llvm_under_program_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lld = Path(directory) / "LLVM" / "bin" / "lld-link.exe"
+            lld.parent.mkdir(parents=True)
+            lld.write_bytes(b"lld")
+            with (
+                mock.patch(f"{__name__}.WINDOWS", True),
+                mock.patch(f"{__name__}.shutil.which", return_value=None),
+                mock.patch(f"{__name__}.llvm_lld_candidates", return_value=[lld]),
+            ):
+                self.assertEqual(resolve_executable("lld-link"), lld.absolute())
+
+    @unittest.skipUnless(WINDOWS, "native Win32 smoke test")
+    def test_native_windows_process_measurement(self) -> None:
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "exit", "0"]
+        execution = _windows_execute(command, Path.cwd(), 10.0, "smoke", "0")
+        self.assertEqual(execution.returncode, 0)
+        self.assertGreater(execution.sample.elapsed_seconds, 0.0)
+        self.assertGreater(execution.peak_working_set_kib, 0)
+        self.assertGreaterEqual(execution.sample.user_seconds, 0.0)
+        self.assertGreaterEqual(execution.sample.system_seconds, 0.0)
+
 
 def main() -> int:
     args = parser().parse_args()
@@ -927,7 +1462,7 @@ def main() -> int:
     if args.corpus is None:
         parser().error("--corpus is required unless --self-test is used")
     if args.mode is None:
-        args.mode = ["warm", "cold-input-cache"]
+        args.mode = default_modes()
     if args.threads is None:
         args.threads = [] if args.thread_pair else [1, 2, 4, 8]
     if len(set(args.mode)) != len(args.mode):
