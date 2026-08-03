@@ -22,7 +22,7 @@ pub enum ExportTarget<'data> {
 pub struct Export<'data> {
     /// Public name used by clients and import libraries.
     pub name: &'data [u8],
-    /// Explicit ordinal, or `None` to assign the lowest available ordinal.
+    /// Explicit ordinal, or `None` to assign an ordinal after all explicit ordinals.
     pub ordinal: Option<u16>,
     /// Omit the export from the name tables, making it importable by ordinal only.
     pub noname: bool,
@@ -62,8 +62,8 @@ pub struct ExportDirectory {
 /// Builds one PE32+ export directory at `section_rva`.
 ///
 /// Explicit ordinals are preserved. Remaining ordinals are assigned by public
-/// name, starting at one and skipping explicit ordinals. The PE name table is
-/// sorted bytewise as required by the loader's binary search.
+/// name, starting after the greatest explicit ordinal to match link.exe/lld-link.
+/// The PE name table is sorted bytewise as required by the loader's binary search.
 pub fn build_export_directory(
     dll_name: &[u8],
     section_rva: u32,
@@ -79,7 +79,6 @@ pub fn build_export_directory(
 
     let mut names = BTreeSet::new();
     let mut explicit_ordinals = BTreeSet::new();
-    let mut explicit_targets = BTreeMap::new();
     for export in exports {
         validate_string(export.name, "export name")?;
         ensure!(
@@ -93,15 +92,10 @@ pub fn build_export_directory(
                 "export {:?} uses reserved ordinal zero",
                 display(export.name)
             );
-            explicit_ordinals.insert(ordinal);
-            if let Some((target, data)) =
-                explicit_targets.insert(ordinal, (export.target, export.data))
-            {
-                ensure!(
-                    target == export.target && data == export.data,
-                    "export ordinal {ordinal} is assigned to incompatible targets"
-                );
-            }
+            ensure!(
+                explicit_ordinals.insert(ordinal),
+                "duplicate export ordinal {ordinal}"
+            );
         }
         match export.target {
             ExportTarget::Rva(rva) => ensure!(
@@ -116,19 +110,15 @@ pub fn build_export_directory(
     let mut by_name = (0..exports.len()).collect::<Vec<_>>();
     by_name.sort_by(|&left, &right| exports[left].name.cmp(exports[right].name));
     let mut assigned = BTreeMap::<usize, u16>::new();
-    let mut next = 1u32;
+    let mut next = explicit_ordinals
+        .last()
+        .copied()
+        .map_or(1, |ordinal| u32::from(ordinal) + 1);
     for index in by_name.iter().copied() {
         let ordinal = if let Some(ordinal) = exports[index].ordinal {
             ordinal
         } else {
-            let ordinal = loop {
-                let candidate = u16::try_from(next).context("no PE export ordinals remain")?;
-                if !explicit_ordinals.contains(&candidate) {
-                    break candidate;
-                }
-                next += 1;
-            };
-            explicit_ordinals.insert(ordinal);
+            let ordinal = u16::try_from(next).context("no PE export ordinals remain")?;
             next += 1;
             ordinal
         };
@@ -354,13 +344,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(directory.ordinal_base, 1);
-        assert_eq!(u32_at(&directory.bytes, 16), 1);
-        assert_eq!(u32_at(&directory.bytes, 20), 7);
+        assert_eq!(directory.ordinal_base, 3);
+        assert_eq!(u32_at(&directory.bytes, 16), 3);
+        assert_eq!(u32_at(&directory.bytes, 20), 6);
         assert_eq!(u32_at(&directory.bytes, 24), 2);
         let eat = (u32_at(&directory.bytes, 28) - directory.rva) as usize;
-        assert_eq!(u32_at(&directory.bytes, eat), 0x3010);
-        assert_eq!(u32_at(&directory.bytes, eat + 6 * 4), 0x1020);
+        assert_eq!(u32_at(&directory.bytes, eat + 4 * 4), 0x1020);
+        assert_eq!(u32_at(&directory.bytes, eat + 5 * 4), 0x3010);
         let names = (u32_at(&directory.bytes, 32) - directory.rva) as usize;
         let alpha = (u32_at(&directory.bytes, names) - directory.rva) as usize;
         let zulu = (u32_at(&directory.bytes, names + 4) - directory.rva) as usize;
@@ -372,9 +362,9 @@ mod tests {
                 u16_at(&directory.bytes, ordinals),
                 u16_at(&directory.bytes, ordinals + 2)
             ),
-            (2, 0)
+            (0, 5)
         );
-        let forwarder = u32_at(&directory.bytes, eat + 2 * 4);
+        let forwarder = u32_at(&directory.bytes, eat);
         assert!((directory.rva..directory.rva + directory.size).contains(&forwarder));
     }
 
@@ -400,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn permits_named_aliases_for_the_same_ordinal_and_target() {
+    fn rejects_named_aliases_for_the_same_ordinal_and_target() {
         let first = Export {
             name: b"first",
             ordinal: Some(4),
@@ -415,12 +405,31 @@ mod tests {
             data: false,
             target: ExportTarget::Forwarder(b"OTHER.target"),
         };
-        let directory = build_export_directory(b"x.dll", 0x4000, &[second, first]).unwrap();
-        assert_eq!(directory.ordinal_base, 4);
-        assert_eq!(u32_at(&directory.bytes, 20), 1);
-        assert_eq!(u32_at(&directory.bytes, 24), 2);
-        assert_eq!(directory.exports[0].ordinal, directory.exports[1].ordinal);
-        assert_eq!(directory.exports[0].target, directory.exports[1].target);
+        let error = build_export_directory(b"x.dll", 0x4000, &[second, first]).unwrap_err();
+        assert!(error.to_string().contains("duplicate export ordinal 4"));
+    }
+
+    #[test]
+    fn implicit_ordinals_follow_the_highest_explicit_ordinal() {
+        let explicit = Export {
+            name: b"explicit",
+            ordinal: Some(1000),
+            noname: false,
+            data: false,
+            target: ExportTarget::Rva(0x1000),
+        };
+        let implicit = Export {
+            name: b"implicit",
+            ordinal: None,
+            noname: false,
+            data: false,
+            target: ExportTarget::Rva(0x2000),
+        };
+        let directory = build_export_directory(b"x.dll", 0x4000, &[implicit, explicit]).unwrap();
+        assert_eq!(directory.ordinal_base, 1000);
+        assert_eq!(u32_at(&directory.bytes, 20), 2);
+        assert_eq!(directory.exports[0].ordinal, 1000);
+        assert_eq!(directory.exports[1].ordinal, 1001);
     }
 
     #[test]
