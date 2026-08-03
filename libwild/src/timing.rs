@@ -9,6 +9,7 @@ use anyhow::Context;
 use anyhow::anyhow;
 use crossbeam_queue::ArrayQueue;
 use std::fmt::Display;
+use std::ops::AddAssign;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -44,6 +45,211 @@ macro_rules! timing_phase {
     };
 }
 
+/// A PE-specific timing scope with a fixed vocabulary of aggregate work counters. Keeping the
+/// fields here avoids ad-hoc logging in hot loops and makes the extra instrumentation removable as
+/// one unit. When tracing is disabled the span is disabled and elapsed timers don't read the clock.
+#[macro_export]
+macro_rules! pe_timing_guard {
+    ($name:expr) => {{
+        let span = tracing::info_span!(
+            $name,
+            objects = tracing::field::Empty,
+            archives = tracing::field::Empty,
+            waves = tracing::field::Empty,
+            sections = tracing::field::Empty,
+            events = tracing::field::Empty,
+            groups = tracing::field::Empty,
+            relocations = tracing::field::Empty,
+            names = tracing::field::Empty,
+            lookups = tracing::field::Empty,
+            queue_pushes = tracing::field::Empty,
+            imports = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            target_resolution_us = tracing::field::Empty,
+            import_collection_us = tracing::field::Empty,
+        );
+        (
+            $crate::timing::PeTimingGuard::new(span),
+            perfetto_recorder::start_span!($name),
+        )
+    }};
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PeMetric {
+    Objects,
+    Archives,
+    Waves,
+    Sections,
+    Events,
+    Groups,
+    Relocations,
+    Names,
+    Lookups,
+    QueuePushes,
+    Imports,
+    Bytes,
+    TargetResolutionUs,
+    ImportCollectionUs,
+}
+
+impl PeMetric {
+    const COUNT: usize = 14;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PeMetrics {
+    values: [u64; PeMetric::COUNT],
+    present: u16,
+}
+
+impl Default for PeMetrics {
+    fn default() -> Self {
+        Self {
+            values: [0; PeMetric::COUNT],
+            present: 0,
+        }
+    }
+}
+
+impl PeMetrics {
+    fn set(&mut self, metric: PeMetric, value: u64) {
+        self.present |= 1 << metric.index();
+        self.values[metric.index()] = value;
+    }
+
+    fn add(&mut self, metric: PeMetric, value: u64) {
+        self.present |= 1 << metric.index();
+        self.values[metric.index()] = self.values[metric.index()].saturating_add(value);
+    }
+
+    fn get(&self, metric: PeMetric) -> Option<u64> {
+        (self.present & (1 << metric.index()) != 0).then_some(self.values[metric.index()])
+    }
+}
+
+impl AddAssign<&Self> for PeMetrics {
+    fn add_assign(&mut self, other: &Self) {
+        for index in 0..PeMetric::COUNT {
+            if other.present & (1 << index) != 0 {
+                self.present |= 1 << index;
+                self.values[index] = self.values[index].saturating_add(other.values[index]);
+            }
+        }
+    }
+}
+
+/// Entered PE scope. Counts are recorded once when the scope closes, never logged per operation.
+pub(crate) struct PeTimingGuard {
+    span: tracing::Span,
+    entered: Option<tracing::span::EnteredSpan>,
+    metrics: PeMetrics,
+    enabled: bool,
+}
+
+impl PeTimingGuard {
+    pub(crate) fn new(span: tracing::Span) -> Self {
+        let enabled = !span.is_disabled();
+        let entered = enabled.then(|| span.clone().entered());
+        Self {
+            span,
+            entered,
+            metrics: PeMetrics::default(),
+            enabled,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    pub(crate) fn add(&mut self, metric: PeMetric, value: usize) {
+        if self.enabled() {
+            self.metrics.add(metric, value as u64);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, metric: PeMetric, value: usize) {
+        if self.enabled() {
+            self.metrics.set(metric, value as u64);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_u64(&mut self, metric: PeMetric, value: u64) {
+        if self.enabled() {
+            self.metrics.add(metric, value);
+        }
+    }
+
+    pub(crate) fn timer(&self) -> PeTimer {
+        PeTimer::start(self.enabled())
+    }
+
+    pub(crate) fn add_elapsed(&mut self, metric: PeMetric, timer: PeTimer) {
+        if let Some(elapsed) = timer.elapsed() {
+            self.metrics.add(
+                metric,
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    fn record_metrics(&self) {
+        let fields = [
+            (PeMetric::Objects, "objects"),
+            (PeMetric::Archives, "archives"),
+            (PeMetric::Waves, "waves"),
+            (PeMetric::Sections, "sections"),
+            (PeMetric::Events, "events"),
+            (PeMetric::Groups, "groups"),
+            (PeMetric::Relocations, "relocations"),
+            (PeMetric::Names, "names"),
+            (PeMetric::Lookups, "lookups"),
+            (PeMetric::QueuePushes, "queue_pushes"),
+            (PeMetric::Imports, "imports"),
+            (PeMetric::Bytes, "bytes"),
+            (PeMetric::TargetResolutionUs, "target_resolution_us"),
+            (PeMetric::ImportCollectionUs, "import_collection_us"),
+        ];
+        for (metric, field) in fields {
+            if let Some(value) = self.metrics.get(metric) {
+                self.span.record(field, value);
+            }
+        }
+    }
+}
+
+impl Drop for PeTimingGuard {
+    fn drop(&mut self) {
+        self.record_metrics();
+        // Leave before the span closes so TimingLayer observes every recorded field.
+        drop(self.entered.take());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeTimer(Option<Instant>);
+
+impl PeTimer {
+    #[inline]
+    fn start(enabled: bool) -> Self {
+        Self(enabled.then(Instant::now))
+    }
+
+    #[inline]
+    fn elapsed(self) -> Option<Duration> {
+        self.0.map(|start| start.elapsed())
+    }
+}
+
 /// More verbose timing instrumentation that by default doesn't show up in the output of --time.
 /// Suitable for use from threads other than main.
 #[macro_export]
@@ -60,11 +266,11 @@ struct TimingLayer {
 struct Data {
     start: Instant,
     child_count: u32,
-    attributes_string: String,
+    attributes: ValuesFormatter,
     counters: Option<CounterList>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ValuesFormatter {
     out: String,
 }
@@ -126,8 +332,20 @@ where
             start: Instant::now(),
             counters,
             child_count: 0,
-            attributes_string: formatted.finish(),
+            attributes: formatted,
         });
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<S>,
+    ) {
+        let span = ctx.span(id).expect("valid span ID");
+        if let Some(data) = span.extensions_mut().get_mut::<Data>() {
+            values.record(&mut data.attributes);
+        }
     }
 
     fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<S>) {
@@ -189,7 +407,10 @@ where
                 parent_child_count,
             };
 
-            println!("{indent}{reading} {name}{}", data.attributes_string);
+            println!(
+                "{indent}{reading} {name}{}",
+                data.attributes.clone().finish()
+            );
         }
     }
 }
@@ -307,4 +528,34 @@ pub(crate) fn finalise_perfetto_trace() -> Result {
         .with_context(|| format!("Failed to write perfetto trace to `{}`", path.display()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pe_metrics_aggregate_and_preserve_explicit_zeroes() {
+        let mut first = PeMetrics::default();
+        first.add(PeMetric::Sections, 7);
+        first.add(PeMetric::Imports, 0);
+        let mut second = PeMetrics::default();
+        second.add(PeMetric::Sections, 5);
+        second.add(PeMetric::Relocations, 11);
+
+        first += &second;
+        first.set(PeMetric::Imports, 3);
+
+        assert_eq!(first.get(PeMetric::Sections), Some(12));
+        assert_eq!(first.get(PeMetric::Imports), Some(3));
+        assert_eq!(first.get(PeMetric::Relocations), Some(11));
+        assert_eq!(first.get(PeMetric::Names), None);
+    }
+
+    #[test]
+    fn disabled_pe_timer_does_not_read_the_clock() {
+        let timer = PeTimer::start(false);
+        assert!(timer.elapsed().is_none());
+        assert!(PeTimer::start(true).elapsed().is_some());
+    }
 }

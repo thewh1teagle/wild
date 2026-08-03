@@ -556,7 +556,14 @@ impl<'data> SymbolDbBuilder<'data> {
     }
 
     pub(super) fn finish(self) -> Result<FinalizedSymbolDb<'data>, SymbolDbBuildError> {
+        let mut phase = crate::pe_timing_guard!("PE symbols: Finalize dense symbol database");
         let provider_count = self.provider_nodes.len();
+        phase
+            .0
+            .add(crate::timing::PeMetric::Names, self.provider_heads.len());
+        phase
+            .0
+            .add(crate::timing::PeMetric::Lookups, provider_count);
         note_nonempty_allocation(provider_count);
         let mut providers = Vec::with_capacity(provider_count);
         note_nonempty_allocation(self.provider_heads.len());
@@ -592,6 +599,7 @@ impl<'data> SymbolDbBuilder<'data> {
                     .map_or(SymbolEntry::NO_FALLBACK, NameId::get),
             });
         }
+        phase.0.add(crate::timing::PeMetric::Events, entries.len());
         Ok(FinalizedSymbolDb {
             names: self.names,
             symbols: SymbolDb {

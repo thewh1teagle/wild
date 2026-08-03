@@ -641,7 +641,16 @@ impl<'data> ResolverSession<'data> {
         roots: &[Vec<u8>],
         runtime_resolution: &mut RuntimeResolution,
     ) -> Result<BTreeSet<Vec<u8>>> {
-        crate::timing_phase!(super::PE_PHASE_RESOLVE_ARCHIVES);
+        let mut resolve_phase = crate::pe_timing_guard!(super::PE_PHASE_RESOLVE_ARCHIVES);
+        resolve_phase
+            .0
+            .add(crate::timing::PeMetric::Archives, self.archives.len());
+        resolve_phase
+            .0
+            .add(crate::timing::PeMetric::Objects, objects.len());
+        resolve_phase
+            .0
+            .add(crate::timing::PeMetric::Names, roots.len());
         let archives = parsed_archives(&self.archives)?;
         self.symbol_state.add_roots(roots);
         for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
@@ -664,8 +673,10 @@ impl<'data> ResolverSession<'data> {
         }
         self.symbol_state.sync_alternates(runtime_resolution);
 
+        let mut waves = 0usize;
         loop {
             let mut changed = false;
+            waves += 1;
             changed |= extract_pass(
                 &archives,
                 objects,
@@ -683,6 +694,7 @@ impl<'data> ResolverSession<'data> {
             if changed {
                 continue;
             }
+            waves += 1;
             changed |= extract_pass(
                 &archives,
                 objects,
@@ -715,6 +727,14 @@ impl<'data> ResolverSession<'data> {
                 );
                 let import_definitions = self.import_definitions.clone();
                 drop(snapshot_phase);
+                resolve_phase.0.add(crate::timing::PeMetric::Waves, waves);
+                resolve_phase
+                    .0
+                    .set(crate::timing::PeMetric::Objects, objects.len());
+                resolve_phase.0.add(
+                    crate::timing::PeMetric::Imports,
+                    self.selected_imports.len(),
+                );
                 return Ok(import_definitions);
             }
         }
@@ -757,13 +777,19 @@ fn extract_pass<'data>(
     archive_providers: &mut ArchiveProviderCache,
     use_alternates: bool,
 ) -> Result<bool> {
+    let mut pass_phase = crate::pe_timing_guard!("PE archive: Extraction pass");
+    pass_phase
+        .0
+        .add(crate::timing::PeMetric::Archives, archives.len());
     let mut changed = false;
+    let mut selected_count = 0usize;
+    let mut demand_count = 0usize;
     let mut next_archive = 0;
     while next_archive < archives.len() {
         // A demand snapshot remains valid until an archive selects a member and mutates the
         // symbol state. Reuse it across runs of archives that select nothing instead of cloning,
         // resolving and allocating the same names once per archive.
-        let demands_phase = crate::timing_guard!(super::PE_DETAIL_REBUILD_ARCHIVE_DEMANDS);
+        let mut demands_phase = crate::pe_timing_guard!(super::PE_DETAIL_REBUILD_ARCHIVE_DEMANDS);
         let fallback_names;
         let demands = if use_alternates {
             fallback_names = fallback_demands(symbol_state, runtime_resolution)?;
@@ -792,8 +818,20 @@ fn extract_pass<'data>(
             );
             demands
         };
+        demand_count += demands.len();
+        demands_phase
+            .0
+            .add(crate::timing::PeMetric::Names, demands.len());
         drop(demands_phase);
-        let candidates_phase = crate::timing_guard!(super::PE_DETAIL_SCAN_ARCHIVE_CANDIDATES);
+        let mut candidates_phase =
+            crate::pe_timing_guard!(super::PE_DETAIL_SCAN_ARCHIVE_CANDIDATES);
+        candidates_phase
+            .0
+            .add(crate::timing::PeMetric::Names, demands.len());
+        candidates_phase.0.add(
+            crate::timing::PeMetric::Archives,
+            archives.len().saturating_sub(next_archive),
+        );
         let selection = next_archive_selection(
             archives,
             whole_archive,
@@ -803,6 +841,9 @@ fn extract_pass<'data>(
             archive_providers,
             &symbol_state.names,
         );
+        candidates_phase
+            .0
+            .add(crate::timing::PeMetric::Lookups, demands.len());
         drop(candidates_phase);
         let Some((archive_index, selected)) = selection else {
             break;
@@ -810,6 +851,7 @@ fn extract_pass<'data>(
         next_archive = archive_index + 1;
         drop(demands);
         for member in selected {
+            selected_count += 1;
             if extracted.len() == extracted.capacity() {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
             }
@@ -897,6 +939,15 @@ fn extract_pass<'data>(
             }
         }
     }
+    pass_phase
+        .0
+        .add(crate::timing::PeMetric::Names, demand_count);
+    pass_phase
+        .0
+        .add(crate::timing::PeMetric::Events, selected_count);
+    pass_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
     Ok(changed)
 }
 

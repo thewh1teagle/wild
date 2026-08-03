@@ -433,7 +433,13 @@ pub(crate) fn link<F: FileSystem>(
         &roots,
     )?;
     {
-        crate::timing_phase!(PE_PHASE_WRITE_OUTPUT);
+        let mut write_phase = crate::pe_timing_guard!(PE_PHASE_WRITE_OUTPUT);
+        write_phase
+            .0
+            .add(crate::timing::PeMetric::Bytes, image.bytes.len());
+        write_phase
+            .0
+            .add(crate::timing::PeMetric::Events, image.exports.len());
         let mut output = fs.create_output(
             args.common.output.clone(),
             OutputOptions {
@@ -458,12 +464,37 @@ pub(crate) fn link<F: FileSystem>(
 /// order (and therefore deterministic error selection) while each independent object does its
 /// generic COFF traversal on the Rayon pool.
 fn materialize_selected_object_indices(objects: &[crate::coff::CoffObject<'_>]) -> Result<()> {
+    let mut phase = crate::pe_timing_guard!("PE index: Materialize full COFF indices");
+    phase.0.add(crate::timing::PeMetric::Objects, objects.len());
     let results = objects
         .par_iter()
         .map(crate::coff::CoffObject::materialize_full_index)
         .collect::<Vec<_>>();
     for result in results {
         result?;
+    }
+    if phase.0.enabled() {
+        phase.0.add(
+            crate::timing::PeMetric::Sections,
+            objects
+                .iter()
+                .map(|object| object.index().sections().len())
+                .sum(),
+        );
+        phase.0.add(
+            crate::timing::PeMetric::Relocations,
+            objects
+                .iter()
+                .map(|object| {
+                    object
+                        .index()
+                        .sections()
+                        .iter()
+                        .map(|section| object.index().relocations(section).len())
+                        .sum::<usize>()
+                })
+                .sum(),
+        );
     }
     Ok(())
 }
@@ -931,10 +962,22 @@ fn add_opened_inputs<'data, F: FileSystem>(
     inputs: &[OpenedInput<'data, F>],
     selection: &mut OpenSelection<'data>,
 ) -> Result<()> {
-    crate::timing_phase!(PE_PHASE_PARSE_INPUTS);
+    let mut parse_phase = crate::pe_timing_guard!(PE_PHASE_PARSE_INPUTS);
+    parse_phase
+        .0
+        .add(crate::timing::PeMetric::Events, inputs.len());
+    if parse_phase.0.enabled() {
+        parse_phase.0.add(
+            crate::timing::PeMetric::Bytes,
+            inputs.iter().map(|(_, data, _)| data.bytes().len()).sum(),
+        );
+    }
+    let mut object_count = 0usize;
+    let mut archive_count = 0usize;
     for (path, data, _is_default) in inputs {
         match object::FileKind::parse(data.bytes()) {
             Ok(object::FileKind::Coff | object::FileKind::CoffBig) => {
+                object_count += 1;
                 selection
                     .direct_object_indices
                     .push(selection.objects.len());
@@ -944,6 +987,7 @@ fn add_opened_inputs<'data, F: FileSystem>(
                 );
             }
             Ok(object::FileKind::Archive) => {
+                archive_count += 1;
                 let whole_archive = args.whole_archive
                     || args
                         .whole_archive_libraries
@@ -977,6 +1021,12 @@ fn add_opened_inputs<'data, F: FileSystem>(
             }
         }
     }
+    parse_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, object_count);
+    parse_phase
+        .0
+        .add(crate::timing::PeMetric::Archives, archive_count);
     Ok(())
 }
 
@@ -1247,6 +1297,11 @@ impl<'data> DenseProductionState<'data> {
         seed: pe_resolver::ResolverSeed<'data>,
         symbol_snapshot: &pe_resolver::SelectedSymbolSnapshot,
     ) -> Result<Self> {
+        let mut finalize_phase =
+            crate::pe_timing_guard!("PE symbols: Finalize dense production state");
+        finalize_phase
+            .0
+            .add(crate::timing::PeMetric::Objects, objects.len());
         let pe_resolver::ResolverSeedParts {
             names,
             states,
@@ -1254,6 +1309,12 @@ impl<'data> DenseProductionState<'data> {
             alternate_fallbacks,
             providers,
         } = seed.into_parts();
+        finalize_phase
+            .0
+            .add(crate::timing::PeMetric::Names, names.len());
+        finalize_phase
+            .0
+            .add(crate::timing::PeMetric::Events, providers.len());
         let seed_name_count = names.len();
         ensure!(
             states.len() == seed_name_count,
@@ -1281,6 +1342,13 @@ impl<'data> DenseProductionState<'data> {
             *slot = fallback.target.get();
         }
 
+        let mut providers_phase = crate::pe_timing_guard!("PE symbols: Add resolver providers");
+        providers_phase
+            .0
+            .add(crate::timing::PeMetric::Events, providers.len());
+        providers_phase
+            .0
+            .add(crate::timing::PeMetric::Names, weak_fallbacks.len());
         let mut builder = pe_symbol_db::SymbolDbBuilder::new(names);
         let mut has_import_providers = false;
         for provider in providers {
@@ -1338,6 +1406,7 @@ impl<'data> DenseProductionState<'data> {
                 .set_weak_fallback(fallback.symbol, fallback.target)
                 .map_err(|error| error!("failed to add weak fallback: {error:?}"))?;
         }
+        drop(providers_phase);
         let finalized = builder
             .finish()
             .map_err(|error| error!("failed to finalize PE symbol database: {error:?}"))?;
@@ -1681,13 +1750,14 @@ fn build_image_with_delay_loads(
     gc_roots.sort();
     gc_roots.dedup();
     drop(roots_phase);
-    let (mut contributions, comdat_redirects, dense_gc) = collect_contributions_with_roots_metadata(
-        objects,
-        symbol_metadata,
-        args,
-        &gc_roots,
-        runtime_resolution,
-    )?;
+    let (mut contributions, comdat_redirects, dense_gc) =
+        collect_contributions_with_roots_metadata(
+            objects,
+            symbol_metadata,
+            args,
+            &gc_roots,
+            runtime_resolution,
+        )?;
     if opt_ref_enabled(args) {
         let import_selection_phase = crate::timing_guard!(PE_DETAIL_IMPORT_SELECTION);
         let live_imports = if let (Some(dense), Some(gc)) = (dense, dense_gc.as_ref())
@@ -1730,8 +1800,21 @@ fn build_image_with_delay_loads(
     }
     drop(comdat_phase);
 
-    let layout_phase = crate::timing_guard!(PE_PHASE_LAYOUT);
-    let layout_prepare_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_PREPARE);
+    let mut layout_phase = crate::pe_timing_guard!(PE_PHASE_LAYOUT);
+    layout_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
+    layout_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    let mut layout_prepare_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_PREPARE);
+    layout_prepare_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    layout_prepare_phase.0.add(
+        crate::timing::PeMetric::Imports,
+        imports.len() + delay_imports.len(),
+    );
     let absolute_symbols = absolute_symbol_values(objects, symbol_metadata, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, symbol_metadata, &mut contributions)?;
@@ -1812,10 +1895,19 @@ fn build_image_with_delay_loads(
     )?;
     let dynamic_base = args.dynamic_base && !args.fixed;
     drop(layout_prepare_phase);
-    let initial_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
+    let mut initial_layout_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
+    initial_layout_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
     let mut layout = make_layout(&contributions, config)?;
+    initial_layout_phase
+        .0
+        .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
     drop(initial_layout_phase);
-    let relocation_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELOCATIONS);
+    let mut relocation_layout_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_RELOCATIONS);
+    relocation_layout_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
     let dir64_sites = if dynamic_base {
         discover_dir64_sites(objects, &contributions, &absolute_symbols)?
     } else {
@@ -1837,6 +1929,12 @@ fn build_image_with_delay_loads(
     } else {
         (layout, None, false, 0)
     };
+    relocation_layout_phase
+        .0
+        .add(crate::timing::PeMetric::Waves, relocation_relayouts);
+    relocation_layout_phase
+        .0
+        .add(crate::timing::PeMetric::Relocations, dir64_sites.len());
     layout = next_layout;
     debug_assert!(relocation_relayouts <= MAX_RELOCATION_RELAYOUTS);
     drop(relocation_layout_phase);
@@ -2086,12 +2184,25 @@ fn build_image_with_delay_loads(
     };
     drop(definitions_phase);
 
-    let assemble_image_phase = crate::timing_guard!(PE_PHASE_COPY_IMAGE);
-    let image_allocate_phase = crate::timing_guard!(PE_DETAIL_IMAGE_ALLOCATE);
+    let mut assemble_image_phase = crate::pe_timing_guard!(PE_PHASE_COPY_IMAGE);
+    assemble_image_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    assemble_image_phase
+        .0
+        .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
+    let mut image_allocate_phase = crate::pe_timing_guard!(PE_DETAIL_IMAGE_ALLOCATE);
+    image_allocate_phase
+        .0
+        .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
     count_pe_hot_allocation();
     let mut image = vec![0; layout.file_size as usize];
     drop(image_allocate_phase);
-    let image_copy_phase = crate::timing_guard!(PE_DETAIL_IMAGE_COPY);
+    let mut image_copy_phase = crate::pe_timing_guard!(PE_DETAIL_IMAGE_COPY);
+    image_copy_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    let mut synthetic_bytes = 0usize;
     for contribution in &contributions {
         if !matches!(contribution.source, Source::Synthetic) {
             continue;
@@ -2101,13 +2212,26 @@ fn build_image_with_delay_loads(
             let start = file_offset as usize;
             image[start..start + contribution.synthetic_data.len()]
                 .copy_from_slice(&contribution.synthetic_data);
+            synthetic_bytes += contribution.synthetic_data.len();
             count_pe_bytes_copied(contribution.synthetic_data.len());
         }
     }
+    image_copy_phase
+        .0
+        .add(crate::timing::PeMetric::Bytes, synthetic_bytes);
     drop(image_copy_phase);
     drop(assemble_image_phase);
 
-    let relocations_phase = crate::timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
+    let mut relocations_phase = crate::pe_timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
+    relocations_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    if relocations_phase.0.enabled() {
+        relocations_phase.0.add(
+            crate::timing::PeMetric::Relocations,
+            dense.map_or(0, |dense| dense.ir.relocations.records.len()),
+        );
+    }
     copy_and_apply_relocations(
         objects,
         dense,
@@ -2493,8 +2617,13 @@ fn collect_contributions_with_roots(
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     let snapshot = selected_symbol_snapshot(objects)?;
     let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
-    let (contributions, redirects, _) =
-        collect_contributions_with_roots_metadata(objects, &metadata, args, roots, runtime_resolution)?;
+    let (contributions, redirects, _) = collect_contributions_with_roots_metadata(
+        objects,
+        &metadata,
+        args,
+        roots,
+        runtime_resolution,
+    )?;
     Ok((contributions, redirects))
 }
 
@@ -2504,11 +2633,7 @@ fn collect_contributions_with_roots_metadata(
     args: &crate::args::coff::CoffArgs,
     roots: &[Vec<u8>],
     _runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
-) -> Result<(
-    Vec<Contribution>,
-    SectionRedirects,
-    Option<pe_gc::GcOutput>,
-)> {
+) -> Result<(Vec<Contribution>, SectionRedirects, Option<pe_gc::GcOutput>)> {
     if args.guard.control_flow == crate::args::coff::OptSetting::Enabled {
         return Err(error!(
             "explicit /GUARD:CF is not yet supported; refusing to emit incomplete CFG/load-config metadata"
@@ -2545,7 +2670,10 @@ fn collect_contributions_with_roots_metadata(
         .dense
         .zip(dense_gc.as_ref())
         .map(|(dense, gc)| (&dense.ir, gc));
-    let contributions_phase = crate::timing_guard!(PE_DETAIL_CONTRIBUTIONS);
+    let mut contributions_phase = crate::pe_timing_guard!(PE_DETAIL_CONTRIBUTIONS);
+    contributions_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
     if rayon::current_num_threads() == 1 {
         // Avoid Rayon and retaining every per-object descriptor vector at once for the required
         // single-thread baseline. IDs are assigned authoritatively after empty-group filtering.
@@ -2568,13 +2696,7 @@ fn collect_contributions_with_roots_metadata(
             .par_iter()
             .enumerate()
             .map(|(object_index, input)| {
-                materialize_object_contributions(
-                    object_index,
-                    input,
-                    &comdats,
-                    args,
-                    dense_gc_view,
-                )
+                materialize_object_contributions(object_index, input, &comdats, args, dense_gc_view)
             })
             .collect::<Vec<_>>();
         let object_contributions = object_results
@@ -2618,6 +2740,9 @@ fn collect_contributions_with_roots_metadata(
     for (index, contribution) in output.iter_mut().enumerate() {
         contribution.spec.id = ContributionId(index as u32);
     }
+    contributions_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, output.len());
     drop(contributions_phase);
     Ok((output, comdats.redirects, dense_gc))
 }
@@ -3134,9 +3259,7 @@ struct ComdatResolution {
 
 fn dense_section_id(ir: &pe_ir::PeIr<'_>, key: ObjectSectionKey) -> Result<pe_ir::SectionId> {
     ir.section_by_raw(
-        pe_ir::ObjectId::from_u32(
-            u32::try_from(key.0).context("PE object index exceeds u32")?,
-        ),
+        pe_ir::ObjectId::from_u32(u32::try_from(key.0).context("PE object index exceeds u32")?),
         u32::try_from(key.1.0).context("raw COFF section index exceeds u32")?,
     )
     .context("COFF section has no dense section record")
@@ -3150,16 +3273,51 @@ fn collect_dense_gc(
     comdats: &ComdatResolution,
     roots: &[Vec<u8>],
 ) -> Result<pe_gc::GcOutput> {
+    let mut input_phase = crate::pe_timing_guard!("PE dense GC: Construct input");
+    input_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, dense.ir.sections.len());
+    input_phase.0.add(
+        crate::timing::PeMetric::Groups,
+        comdats.analysis.groups.len(),
+    );
+    input_phase
+        .0
+        .add(crate::timing::PeMetric::Names, dense.names.len());
+    input_phase.0.add(
+        crate::timing::PeMetric::Relocations,
+        dense.ir.relocations.records.len(),
+    );
+
+    let mut mapping_phase = crate::pe_timing_guard!("PE dense GC: Map raw sections to dense IDs");
+    mapping_phase.0.add(
+        crate::timing::PeMetric::Sections,
+        comdats.analysis.keys.len(),
+    );
+    let dense_sections = comdats
+        .analysis
+        .keys
+        .iter()
+        .copied()
+        .map(|key| dense_section_id(&dense.ir, key))
+        .collect::<Result<Vec<_>>>()?;
+    drop(mapping_phase);
+
+    let mut events_phase = crate::pe_timing_guard!("PE dense GC: Build selection events");
     let mut events = Vec::new();
     for (node, &key) in comdats.analysis.keys.iter().enumerate() {
-        let section = dense_section_id(&dense.ir, key)?;
+        let section = dense_sections[node];
         if comdats.discarded.contains(&key) {
             events.push(pe_gc::GcEvent::Discard { section });
         }
         if let Some(&target) = comdats.redirects.get(&key) {
+            let target_node = comdats
+                .analysis
+                .node(target)
+                .context("COMDAT redirect target has no analysis node")?;
             events.push(pe_gc::GcEvent::Redirect {
                 from: section,
-                to: dense_section_id(&dense.ir, target)?,
+                to: dense_sections[target_node],
             });
         }
         if !comdats.analysis.is_comdat[node] {
@@ -3179,6 +3337,19 @@ fn collect_dense_gc(
             });
         }
     }
+    events_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, dense_sections.len());
+    events_phase
+        .0
+        .add(crate::timing::PeMetric::Events, events.len());
+    events_phase
+        .0
+        .add(crate::timing::PeMetric::Lookups, comdats.redirects.len());
+    drop(events_phase);
+
+    let mut roots_phase = crate::pe_timing_guard!("PE dense GC: Build root events");
+    let events_before_roots = events.len();
     for root in roots {
         let hash = crate::hash::hash_bytes(root);
         if let Some(name) = dense.names.lookup_prehashed(root, hash) {
@@ -3188,13 +3359,25 @@ fn collect_dense_gc(
             });
         }
     }
+    roots_phase
+        .0
+        .add(crate::timing::PeMetric::Names, roots.len());
+    roots_phase.0.add(
+        crate::timing::PeMetric::Events,
+        events.len() - events_before_roots,
+    );
+    roots_phase
+        .0
+        .add(crate::timing::PeMetric::Lookups, roots.len());
+    drop(roots_phase);
 
+    let mut groups_phase = crate::pe_timing_guard!("PE dense GC: Build group input");
     let mut groups = Vec::with_capacity(comdats.analysis.groups.len());
     let mut group_members = Vec::new();
     for group in &comdats.analysis.groups {
         let start = u32::try_from(group_members.len()).context("too many COMDAT group members")?;
         for &node in group {
-            group_members.push(dense_section_id(&dense.ir, comdats.analysis.keys[node])?);
+            group_members.push(dense_sections[node]);
         }
         let Some(&leader) = group_members.get(start as usize) else {
             return Err(error!("empty COMDAT reachability group"));
@@ -3205,10 +3388,20 @@ fn collect_dense_gc(
             member_len: u32::try_from(group.len()).context("COMDAT group is too large")?,
         });
     }
+    groups_phase
+        .0
+        .add(crate::timing::PeMetric::Groups, groups.len());
+    groups_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, group_members.len());
+    drop(groups_phase);
 
-    let section_count = u32::try_from(dense.ir.sections.len())
-        .context("dense PE section count exceeds u32")?;
+    let section_count =
+        u32::try_from(dense.ir.sections.len()).context("dense PE section count exceeds u32")?;
     let mut collector = pe_gc::DenseEventGc::new(&dense.ir, &dense.alternate_targets);
+    input_phase
+        .0
+        .add(crate::timing::PeMetric::Events, events.len());
     pe_gc::EventDrivenGc::collect(
         &mut collector,
         pe_gc::GcInput {
@@ -3313,7 +3506,10 @@ fn discarded_comdat_sections_with_metadata(
     use linker_utils::coff_symbols::ComdatSelection;
     use linker_utils::coff_symbols::select_comdat;
 
-    let classify_phase = crate::timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
+    let mut classify_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
     // Classifying one object's COMDAT topology neither reads nor mutates another object's
     // state. Keep the indexed result slots in input order, then unwrap them serially so a
     // malformed input still reports the first object-order error regardless of thread count.
@@ -3325,6 +3521,12 @@ fn discarded_comdat_sections_with_metadata(
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
     let analysis = CompactComdatAnalysis::new(objects, &section_groups)?;
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, analysis.keys.len());
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Groups, analysis.groups.len());
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
     for symbol in metadata.globals {
         if !symbol.is_definition {
@@ -3341,7 +3543,10 @@ fn discarded_comdat_sections_with_metadata(
     }
     drop(classify_phase);
 
-    let selection_phase = crate::timing_guard!(PE_DETAIL_COMDAT_SELECT);
+    let mut selection_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_SELECT);
+    selection_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
     let mut resolution = ComdatResolution {
         analysis,
@@ -3535,6 +3740,16 @@ fn discarded_comdat_sections_with_metadata(
             "COFF COMDAT section groups were not matched to leaders"
         );
     }
+    selection_phase
+        .0
+        .add(crate::timing::PeMetric::Groups, selected.len());
+    selection_phase.0.add(
+        crate::timing::PeMetric::Sections,
+        resolution.discarded.len(),
+    );
+    selection_phase
+        .0
+        .add(crate::timing::PeMetric::Events, resolution.redirects.len());
     drop(selection_phase);
     Ok(resolution)
 }

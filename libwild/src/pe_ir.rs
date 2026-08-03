@@ -322,9 +322,27 @@ impl<'data> PeIr<'data> {
         seed: OrderedNameInterner<'data>,
         globals: &[SelectedGlobalSymbol],
     ) -> Result<SelectedObjectFinalization<'data>> {
+        let mut index_phase = crate::pe_timing_guard!("PE index: Finalize selected COFF objects");
+        index_phase
+            .0
+            .add(crate::timing::PeMetric::Objects, objects.len());
+        index_phase
+            .0
+            .add(crate::timing::PeMetric::Names, seed.len());
         let sources = SourceFiles::new(objects.iter().map(CoffObject::bytes).collect());
+        let mut names_phase = crate::pe_timing_guard!("PE index: Canonicalize names");
         let (canonical_names, occurrence_names) = finalize_selected_names(objects, seed, globals)?;
         let names = name_records(objects, &canonical_names, &occurrence_names)?;
+        names_phase
+            .0
+            .add(crate::timing::PeMetric::Objects, objects.len());
+        names_phase
+            .0
+            .add(crate::timing::PeMetric::Names, occurrence_names.len());
+        names_phase
+            .0
+            .add(crate::timing::PeMetric::Lookups, globals.len());
+        drop(names_phase);
         let section_count = objects
             .iter()
             .try_fold(0usize, |count, object| {
@@ -338,6 +356,17 @@ impl<'data> PeIr<'data> {
             })
             .ok_or_else(|| crate::error!("Selected COFF symbol count overflow"))?;
 
+        let mut records_phase =
+            crate::pe_timing_guard!("PE index: Build dense records and relocation CSR");
+        records_phase
+            .0
+            .add(crate::timing::PeMetric::Objects, objects.len());
+        records_phase
+            .0
+            .add(crate::timing::PeMetric::Sections, section_count);
+        records_phase
+            .0
+            .add(crate::timing::PeMetric::Names, symbol_count);
         let mut object_records = Vec::with_capacity(objects.len());
         let mut sections = Vec::with_capacity(section_count);
         let mut symbols = Vec::with_capacity(symbol_count);
@@ -460,6 +489,21 @@ impl<'data> PeIr<'data> {
             starts: starts.into_boxed_slice(),
             records: relocations.into_boxed_slice(),
         };
+        records_phase.0.add(
+            crate::timing::PeMetric::Relocations,
+            relocations.records.len(),
+        );
+        index_phase
+            .0
+            .add(crate::timing::PeMetric::Sections, section_count);
+        index_phase
+            .0
+            .set(crate::timing::PeMetric::Names, canonical_names.len());
+        index_phase.0.add(
+            crate::timing::PeMetric::Relocations,
+            relocations.records.len(),
+        );
+        drop(records_phase);
         let ir = Self {
             sources,
             names: names.into_boxed_slice(),
