@@ -129,7 +129,14 @@ enum ContentClass {
 
 struct Group<'a> {
     name: Vec<u8>,
-    contributions: Vec<(usize, &'a SectionContribution)>,
+    contributions: Vec<GroupedContribution<'a>>,
+}
+
+struct GroupedContribution<'a> {
+    input_index: usize,
+    contribution: &'a SectionContribution,
+    suffix: &'a [u8],
+    has_separator: bool,
 }
 
 /// Groups `$` subsections and lays out all contributions with checked arithmetic.
@@ -164,7 +171,7 @@ pub fn layout_sections_borrowed<'a>(
             contribution.id.0
         );
         validate_contribution(contribution)?;
-        let (base, _) = split_name(&contribution.name);
+        let (base, suffix) = split_name(&contribution.name);
         ensure!(
             !base.is_empty(),
             "contribution {} has an empty canonical section name",
@@ -177,7 +184,12 @@ pub fn layout_sections_borrowed<'a>(
                 contributions: Vec::new(),
             })
             .contributions
-            .push((input_index, contribution));
+            .push(GroupedContribution {
+                input_index,
+                contribution,
+                suffix,
+                has_separator: base.len() != contribution.name.len(),
+            });
     }
 
     let mut groups = groups.into_values().collect::<Vec<_>>();
@@ -197,19 +209,15 @@ pub fn layout_sections_borrowed<'a>(
     let mut placements = BTreeMap::new();
 
     for mut group in groups {
-        group
-            .contributions
-            .sort_by(|(left_index, left), (right_index, right)| {
-                let (_, left_suffix) = split_name(&left.name);
-                let (_, right_suffix) = split_name(&right.name);
-                left_suffix
-                    .cmp(right_suffix)
-                    // An exact base name sorts before a `$` subsection with an
-                    // empty suffix. This distinction is significant for the
-                    // CRT's `.tls` sentinel versus compiler-emitted `.tls$`.
-                    .then_with(|| left.name.contains(&b'$').cmp(&right.name.contains(&b'$')))
-                    .then(left_index.cmp(right_index))
-            });
+        group.contributions.sort_unstable_by(|left, right| {
+            left.suffix
+                .cmp(right.suffix)
+                // An exact base name sorts before a `$` subsection with an
+                // empty suffix. This distinction is significant for the
+                // CRT's `.tls` sentinel versus compiler-emitted `.tls$`.
+                .then_with(|| left.has_separator.cmp(&right.has_separator))
+                .then_with(|| left.input_index.cmp(&right.input_index))
+        });
         let characteristics = merged_characteristics(&group)?;
         let section_index = sections.len();
         let section_rva = next_rva;
@@ -218,7 +226,8 @@ pub fn layout_sections_borrowed<'a>(
         let mut initialized_extent = 0u32;
         let mut placed_ids = Vec::with_capacity(group.contributions.len());
 
-        for (_, contribution) in group.contributions {
+        for grouped in group.contributions {
+            let contribution = grouped.contribution;
             let offset = align_up(
                 virtual_cursor,
                 contribution.alignment,
@@ -641,7 +650,8 @@ fn merged_characteristics(group: &Group<'_>) -> Result<u32> {
     let mut has_code = false;
     let mut has_data = false;
     let mut has_bss = false;
-    for (_, contribution) in &group.contributions {
+    for grouped in &group.contributions {
+        let contribution = grouped.contribution;
         match content_class(contribution.characteristics, contribution.kind)? {
             ContentClass::Code => has_code = true,
             ContentClass::Data => has_data = true,
@@ -760,6 +770,52 @@ mod tests {
         assert_eq!(layout.placements[&ContributionId(2)].offset, 4);
         assert_eq!(layout.placements[&ContributionId(3)].offset, 16);
         assert_eq!(layout.placements[&ContributionId(1)].offset, 18);
+    }
+
+    #[test]
+    fn cached_subsection_keys_match_the_previous_comparator() {
+        let inputs = vec![
+            contribution(90, b".text$a", ContributionKind::Data, 3, 1),
+            contribution(7, b".text$$", ContributionKind::Data, 5, 2),
+            contribution(130, b".text", ContributionKind::Data, 7, 4),
+            contribution(2, b".text$a$z", ContributionKind::Data, 11, 8),
+            contribution(88, b".text$a", ContributionKind::Data, 13, 16),
+            contribution(41, b".text$", ContributionKind::Data, 17, 1),
+            contribution(5, b".text$\x80", ContributionKind::Data, 19, 2),
+            contribution(77, b".text$\x7f", ContributionKind::Data, 23, 4),
+        ];
+
+        let actual = layout_sections(&inputs, options()).unwrap();
+        assert_eq!(
+            actual.sections[0].contributions,
+            [
+                ContributionId(130),
+                ContributionId(41),
+                ContributionId(7),
+                ContributionId(90),
+                ContributionId(88),
+                ContributionId(2),
+                ContributionId(77),
+                ContributionId(5),
+            ]
+        );
+
+        let mut old_order = inputs.iter().enumerate().collect::<Vec<_>>();
+        old_order.sort_by(|(left_index, left), (right_index, right)| {
+            let (_, left_suffix) = split_name(&left.name);
+            let (_, right_suffix) = split_name(&right.name);
+            left_suffix
+                .cmp(right_suffix)
+                .then_with(|| left.name.contains(&b'$').cmp(&right.name.contains(&b'$')))
+                .then_with(|| left_index.cmp(right_index))
+        });
+        let old_sorted_inputs = old_order
+            .into_iter()
+            .map(|(_, contribution)| contribution.clone())
+            .collect::<Vec<_>>();
+        let expected = layout_sections(&old_sorted_inputs, options()).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
