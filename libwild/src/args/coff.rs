@@ -5,6 +5,7 @@ use crate::alignment::Alignment;
 use crate::bail;
 use crate::error::{Context, Result};
 use crate::platform;
+use linker_utils::coff_runtime::{RuntimeDirective, RuntimeResolution};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -76,6 +77,18 @@ pub(crate) struct SectionAttributes {
     pub(crate) attributes: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuardOptions {
+    pub(crate) control_flow: OptSetting,
+    pub(crate) no_long_jump: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestDependency {
+    /// The link.exe manifest dependency payload, preserving symbol and assembly-name case.
+    pub(crate) value: String,
+}
+
 /// One `/EXPORT:` directive in its link.exe-compatible form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExportSpec {
@@ -122,6 +135,11 @@ pub struct CoffArgs {
     pub(crate) import_library: Option<Box<Path>>,
     pub(crate) pdb: Option<Box<Path>>,
     pub(crate) manifest: bool,
+    pub(crate) manifest_dependencies: Vec<ManifestDependency>,
+    pub(crate) runtime_resolution: RuntimeResolution,
+    pub(crate) guard: GuardOptions,
+    pub(crate) edit_and_continue: bool,
+    pub(crate) disallowed_libraries: Vec<String>,
     pub(crate) merges: Vec<SectionMerge>,
     pub(crate) section_attributes: Vec<SectionAttributes>,
 }
@@ -177,6 +195,14 @@ impl Default for CoffArgs {
             import_library: None,
             pdb: None,
             manifest: true,
+            manifest_dependencies: Vec::new(),
+            runtime_resolution: RuntimeResolution::new(),
+            guard: GuardOptions {
+                control_flow: OptSetting::Default,
+                no_long_jump: false,
+            },
+            edit_and_continue: false,
+            disallowed_libraries: Vec::new(),
             merges: Vec::new(),
             section_attributes: Vec::new(),
         }
@@ -255,7 +281,7 @@ impl platform::Args for CoffArgs {
 
 pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, input: I) -> Result {
     let expanded = expand_response_files(input)?;
-    parse_tokens(args, expanded.iter().map(String::as_str))?;
+    parse_tokens(args, expanded.iter().map(String::as_str), "command line")?;
     validate_alignments(args)?;
     args.common.report_unrecognized()
 }
@@ -267,12 +293,12 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, i
 /// differing from their command-line equivalents.
 pub(crate) fn parse_directives(args: &mut CoffArgs, directives: &str) -> Result {
     let tokens = windows_command_line_args(directives)?;
-    parse_tokens(args, tokens.iter().map(String::as_str))?;
+    parse_tokens(args, tokens.iter().map(String::as_str), ".drectve section")?;
     validate_alignments(args)?;
     args.common.report_unrecognized()
 }
 
-fn parse_tokens<'a, I>(args: &mut CoffArgs, input: I) -> Result
+fn parse_tokens<'a, I>(args: &mut CoffArgs, input: I, source: &str) -> Result
 where
     I: Iterator<Item = &'a str>,
 {
@@ -327,6 +353,48 @@ where
             "include" => {
                 let value = required_value("/INCLUDE", inline_value, &mut input)?;
                 args.force_undefined.push(value.to_owned());
+                args.runtime_resolution
+                    .apply(RuntimeDirective::Include(value.to_owned()), source)?;
+            }
+            "alternatename" => {
+                let value = required_value("/ALTERNATENAME", inline_value, &mut input)?;
+                let (symbol, target) = parse_assignment("/ALTERNATENAME", value)?;
+                if symbol == target {
+                    bail!("/ALTERNATENAME `{symbol}` aliases a symbol to itself");
+                }
+                args.runtime_resolution.apply(
+                    RuntimeDirective::AlternateName {
+                        symbol: symbol.to_owned(),
+                        target: target.to_owned(),
+                    },
+                    source,
+                )?;
+            }
+            "failifmismatch" => {
+                let value = required_value("/FAILIFMISMATCH", inline_value, &mut input)?;
+                let (key, value) = parse_assignment("/FAILIFMISMATCH", value)?;
+                args.runtime_resolution.apply(
+                    RuntimeDirective::FailIfMismatch {
+                        key: key.to_owned(),
+                        value: value.to_owned(),
+                    },
+                    source,
+                )?;
+            }
+            "guard" => parse_guard(
+                &mut args.guard,
+                required_value("/GUARD", inline_value, &mut input)?,
+            )?,
+            "manifestdependency" => {
+                let value = required_value("/MANIFESTDEPENDENCY", inline_value, &mut input)?;
+                args.manifest_dependencies.push(ManifestDependency {
+                    value: value.to_owned(),
+                });
+            }
+            "editandcontinue" if inline_value.is_none() => args.edit_and_continue = true,
+            "disallowlib" => {
+                let value = required_value("/DISALLOWLIB", inline_value, &mut input)?;
+                args.disallowed_libraries.push(value.to_owned());
             }
             "machine" => {
                 let value = required_value("/MACHINE", inline_value, &mut input)?;
@@ -484,6 +552,38 @@ fn parse_export(value: &str) -> Result<ExportSpec> {
         data,
         private,
     })
+}
+
+fn parse_assignment<'a>(option: &str, value: &'a str) -> Result<(&'a str, &'a str)> {
+    let (left, right) = value
+        .split_once('=')
+        .with_context(|| format!("{option} expects name=value"))?;
+    if left.is_empty() || right.is_empty() {
+        bail!("{option} expects non-empty values in name=value");
+    }
+    Ok((left, right))
+}
+
+fn parse_guard(options: &mut GuardOptions, value: &str) -> Result {
+    for setting in value.split(',') {
+        match setting.to_ascii_lowercase().as_str() {
+            "cf" => set_guard_control_flow(options, OptSetting::Enabled)?,
+            "no" => set_guard_control_flow(options, OptSetting::Disabled)?,
+            "nolongjmp" => options.no_long_jump = true,
+            _ => bail!(
+                "unsupported /GUARD value `{setting}`; supported values are CF, NO, and NOLONGJMP"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn set_guard_control_flow(options: &mut GuardOptions, setting: OptSetting) -> Result {
+    if options.control_flow != OptSetting::Default && options.control_flow != setting {
+        bail!("conflicting /GUARD control-flow settings: CF and NO");
+    }
+    options.control_flow = setting;
+    Ok(())
 }
 
 fn required_value<'a, I>(
@@ -998,6 +1098,119 @@ mod tests {
         assert_eq!(args.force_undefined, [r#"symbol"quoted"#]);
         assert_eq!(args.optimization.ref_, OptSetting::Disabled);
         assert_eq!(args.optimization.icf, OptSetting::Enabled);
+    }
+
+    #[test]
+    fn parses_real_msvc_crt_directives_into_runtime_state() {
+        let mut args = CoffArgs::default();
+        parse_directives(
+            &mut args,
+            r#" /DEFAULTLIB:libcmt /alternatename:__pRawDllMain=__pDefaultRawDllMain /FAILIFMISMATCH:"RuntimeLibrary=MT_StaticRelease" /include:"forced symbol" /EDITANDCONTINUE /DISALLOWLIB:libcmtd"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.runtime_resolution.alternate_target("__pRawDllMain"),
+            Some("__pDefaultRawDllMain")
+        );
+        assert_eq!(
+            args.runtime_resolution.mismatch_value("RuntimeLibrary"),
+            Some("MT_StaticRelease")
+        );
+        assert_eq!(
+            args.runtime_resolution.include_roots().collect::<Vec<_>>(),
+            ["forced symbol"]
+        );
+        assert!(args.edit_and_continue);
+        assert_eq!(args.disallowed_libraries, ["libcmtd"]);
+    }
+
+    #[test]
+    fn command_line_and_directives_share_runtime_validation() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            [
+                "/ALTERNATENAME:CaseSensitive=TargetName",
+                "/FAILIFMISMATCH:RuntimeLibrary=MD",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        parse_directives(
+            &mut args,
+            "/alternatename:CaseSensitive=TargetName /failifmismatch:RuntimeLibrary=MT",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            args.runtime_resolution.alternate_target("CaseSensitive"),
+            Some("TargetName")
+        );
+        assert_eq!(
+            args.runtime_resolution.alternate_target("casesensitive"),
+            None
+        );
+    }
+
+    #[test]
+    fn fail_if_mismatch_diagnostic_is_independent_of_value_order() {
+        fn conflict(first: &str, second: &str) -> String {
+            let mut args = CoffArgs::default();
+            parse(
+                &mut args,
+                [
+                    format!("/FAILIFMISMATCH:RuntimeLibrary={first}"),
+                    format!("/FAILIFMISMATCH:RuntimeLibrary={second}"),
+                ]
+                .into_iter(),
+            )
+            .unwrap_err()
+            .to_string()
+        }
+
+        assert_eq!(conflict("MD", "MT"), conflict("MT", "MD"));
+    }
+
+    #[test]
+    fn parses_guard_and_manifest_dependency_options() {
+        let dependency = "type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0'";
+        let mut args = CoffArgs::default();
+        parse_directives(
+            &mut args,
+            &format!(r#"/GuArD:CF,NOLONGJMP /MANIFESTDEPENDENCY:"{dependency}""#),
+        )
+        .unwrap();
+
+        assert_eq!(args.guard.control_flow, OptSetting::Enabled);
+        assert!(args.guard.no_long_jump);
+        assert_eq!(
+            args.manifest_dependencies,
+            [ManifestDependency {
+                value: dependency.to_owned()
+            }]
+        );
+
+        let mut disabled = CoffArgs::default();
+        parse(&mut disabled, ["/GUARD:NO"].into_iter()).unwrap();
+        assert_eq!(disabled.guard.control_flow, OptSetting::Disabled);
+    }
+
+    #[test]
+    fn rejects_malformed_runtime_and_conflicting_guard_options() {
+        for invalid in [
+            "/ALTERNATENAME:missing-target",
+            "/ALTERNATENAME:same=same",
+            "/FAILIFMISMATCH:=value",
+            "/GUARD:CF,NO",
+            "/GUARD:UNKNOWN",
+        ] {
+            let mut args = CoffArgs::default();
+            assert!(
+                parse(&mut args, [invalid].into_iter()).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
