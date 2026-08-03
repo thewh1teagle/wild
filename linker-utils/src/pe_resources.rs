@@ -60,6 +60,27 @@ pub struct ResourceSection {
     pub resource_count: u32,
 }
 
+/// Conservatively identifies the standard null record at the start of a Win32 `.res` stream.
+///
+/// Unlike COFF and archives, `.res` files have no general-purpose magic number. Microsoft resource
+/// compilers begin the stream with this exact empty record. Requiring all 32 bytes makes this probe
+/// suitable for recognizing resources whose file name has a non-`.res` extension, while callers
+/// should still classify known object and archive formats first.
+#[must_use]
+pub fn has_res_null_header(data: &[u8]) -> bool {
+    const NULL_HEADER: [u8; 32] = [
+        0, 0, 0, 0, // DataSize
+        32, 0, 0, 0, // HeaderSize
+        0xff, 0xff, 0, 0, // Type ordinal zero
+        0xff, 0xff, 0, 0, // Name ordinal zero
+        0, 0, 0, 0, // DataVersion
+        0, 0, 0, 0, // MemoryFlags and LanguageId
+        0, 0, 0, 0, // Version
+        0, 0, 0, 0, // Characteristics
+    ];
+    data.starts_with(&NULL_HEADER)
+}
+
 /// Parses all non-null records from a Microsoft Win32 `.res` byte stream.
 ///
 /// Resource compilers normally place one all-zero null record first. It is a
@@ -580,6 +601,7 @@ mod tests {
         };
         let mut input = Vec::new();
         append_res_record(&mut input, &null);
+        assert!(has_res_null_header(&input));
         for item in &expected {
             append_res_record(&mut input, item);
         }
@@ -598,6 +620,23 @@ mod tests {
                 .windows(b"<assembly/>".len())
                 .any(|window| window == b"<assembly/>")
         );
+    }
+
+    #[test]
+    fn null_header_probe_does_not_claim_coff_or_archives() {
+        assert!(!has_res_null_header(&object::archive::MAGIC));
+        assert!(!has_res_null_header(&[
+            object::pe::IMAGE_FILE_MACHINE_AMD64.0 as u8,
+            (object::pe::IMAGE_FILE_MACHINE_AMD64.0 >> 8) as u8,
+        ]));
+
+        let mut malformed = vec![0; 32];
+        malformed[4..8].copy_from_slice(&32_u32.to_le_bytes());
+        malformed[8..12].copy_from_slice(&[0xff, 0xff, 0, 0]);
+        malformed[12..16].copy_from_slice(&[0xff, 0xff, 0, 0]);
+        malformed.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(has_res_null_header(&malformed));
+        assert!(parse_res(&malformed).is_err());
     }
 
     #[test]
