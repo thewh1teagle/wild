@@ -9,6 +9,7 @@ use crate::fs::FileSystem;
 use crate::fs::InputFileData;
 use crate::fs::OutputFileData;
 use crate::fs::OutputOptions;
+use hashbrown::HashMap;
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
 use linker_utils::pe_exports::Export;
 use linker_utils::pe_exports::ExportTarget;
@@ -32,7 +33,6 @@ use object::SectionFlags;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -2504,7 +2504,7 @@ fn record_comdat_redirects(
                     .enumerate()
                     .find(|(position, winner)| {
                         !winner_used[*position]
-                            && winner_parents.get(winner) == Some(&Some(mapped_parent))
+                            && winner_parents.get(*winner) == Some(&Some(mapped_parent))
                             && objects[winner_object]
                                 .file()
                                 .section_by_index(**winner)
