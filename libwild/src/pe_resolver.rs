@@ -92,9 +92,12 @@ struct LazyArchive<'data> {
 
 impl<'data> LazyArchive<'data> {
     fn new(bytes: &'data [u8]) -> Result<Self> {
+        let probe_phase = crate::timing_guard!(super::PE_DETAIL_PROBE_ARCHIVE_INDICES);
+        let indexed = CoffArchive::has_symbol_index(bytes).context("invalid AMD64 COFF archive")?;
+        drop(probe_phase);
         Ok(Self {
             bytes,
-            indexed: CoffArchive::has_symbol_index(bytes).context("invalid AMD64 COFF archive")?,
+            indexed,
             parsed: OnceLock::new(),
         })
     }
@@ -206,7 +209,9 @@ impl<'data> ResolverSession<'data> {
         let archives = parsed_archives(&self.archives)?;
         self.symbol_state.add_roots(roots);
         for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
+            let absorb_phase = crate::timing_guard!(super::PE_DETAIL_ABSORB_SELECTED_SYMBOLS);
             self.symbol_state.absorb_object(object, index)?;
+            drop(absorb_phase);
         }
         self.scanned_objects = objects.len();
 
@@ -254,7 +259,11 @@ impl<'data> ResolverSession<'data> {
             )?;
             self.scanned_objects = objects.len();
             if !changed {
-                return Ok(self.import_definitions.clone());
+                let snapshot_phase =
+                    crate::timing_guard!(super::PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS);
+                let import_definitions = self.import_definitions.clone();
+                drop(snapshot_phase);
+                return Ok(import_definitions);
             }
         }
     }
@@ -301,6 +310,7 @@ fn extract_pass<'data>(
         // A demand snapshot remains valid until an archive selects a member and mutates the
         // symbol state. Reuse it across runs of archives that select nothing instead of cloning,
         // resolving and allocating the same names once per archive.
+        let demands_phase = crate::timing_guard!(super::PE_DETAIL_REBUILD_ARCHIVE_DEMANDS);
         let fallback_names;
         let demands = if use_alternates {
             fallback_names = fallback_demands(
@@ -340,14 +350,18 @@ fn extract_pass<'data>(
             );
             demands
         };
-        let Some((archive_index, selected)) = next_archive_selection(
+        drop(demands_phase);
+        let candidates_phase = crate::timing_guard!(super::PE_DETAIL_SCAN_ARCHIVE_CANDIDATES);
+        let selection = next_archive_selection(
             archives,
             whole_archive,
             extracted,
             &symbol_state.defined,
             &demands,
             next_archive,
-        ) else {
+        );
+        drop(candidates_phase);
+        let Some((archive_index, selected)) = selection else {
             break;
         };
         next_archive = archive_index + 1;
@@ -365,7 +379,10 @@ fn extract_pass<'data>(
                                 String::from_utf8_lossy(member.name())
                             )
                         })?;
+                    let absorb_phase =
+                        crate::timing_guard!(super::PE_DETAIL_ABSORB_SELECTED_SYMBOLS);
                     symbol_state.absorb_object(&object, objects.len())?;
+                    drop(absorb_phase);
                     objects.push(object);
                     changed = true;
                 }

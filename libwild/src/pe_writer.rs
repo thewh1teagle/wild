@@ -74,6 +74,17 @@ const PE_DETAIL_LAYOUT_INITIAL: &str = "PE detail: Initial section layout";
 const PE_DETAIL_LAYOUT_PREPARE: &str = "PE detail: Prepare layout inputs";
 const PE_DETAIL_LAYOUT_RELOCATIONS: &str = "PE detail: Converge relocation layout";
 const PE_DETAIL_LAYOUT_RELAYOUT: &str = "PE detail: Re-layout relocation section";
+const PE_DETAIL_PROBE_ARCHIVE_INDICES: &str = "PE detail: Probe archive indices";
+const PE_DETAIL_REBUILD_ARCHIVE_DEMANDS: &str = "PE detail: Rebuild archive demands";
+const PE_DETAIL_SCAN_ARCHIVE_CANDIDATES: &str = "PE detail: Scan archive candidates";
+const PE_DETAIL_ABSORB_SELECTED_SYMBOLS: &str = "PE detail: Absorb selected symbols";
+const PE_DETAIL_REBUILD_SELECTION_ROOTS: &str = "PE detail: Rebuild selection roots";
+const PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES: &str = "PE detail: Evaluate default libraries";
+const PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS: &str = "PE detail: Snapshot resolver outputs";
+const PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA: &str = "PE detail: Scan selected symbol metadata";
+const PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS: &str = "PE detail: Resolve alternate symbols";
+const PE_DETAIL_SCAN_WEAK_METADATA: &str = "PE detail: Scan weak metadata";
+const PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS: &str = "PE detail: Materialize selected imports";
 const PE_DETAIL_REF_CLASSIFY: &str = "PE detail: Classify unreachable COMDATs";
 const PE_DETAIL_REF_DEFINITIONS: &str = "PE detail: Build REF definition graph";
 const PE_DETAIL_REF_REACHABILITY: &str = "PE detail: Traverse REF relocations";
@@ -353,10 +364,11 @@ pub(crate) fn link<F: FileSystem>(
             &archive_definitions,
             &runtime_resolution,
         )?;
-        (
-            pe_imports::select_from_records(&selected_imports, &undefined),
-            symbol_metadata,
-        )
+        let materialize_imports_phase =
+            crate::timing_guard!(PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS);
+        let imports = pe_imports::select_from_records(&selected_imports, &undefined);
+        drop(materialize_imports_phase);
+        (imports, symbol_metadata)
     };
     let dll_name = if let Some(name) = definition.module_name.as_deref() {
         name
@@ -686,6 +698,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
         &excluded_default_libraries,
     )?;
     loop {
+        let default_libraries_phase = crate::timing_guard!(PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES);
         let old_policy = (no_default_libraries, excluded_default_libraries.len());
         no_default_libraries |= selection.directives.no_default_libraries;
         for excluded in &selection.directives.excluded_default_libraries {
@@ -699,6 +712,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
         if old_policy != (no_default_libraries, excluded_default_libraries.len()) {
             // Policy changes can remove previously active default libraries, so only this
             // non-monotonic case invalidates the incremental resolver cache.
+            drop(default_libraries_phase);
             selection = select_opened_inputs::<F>(
                 args,
                 command_exports,
@@ -760,6 +774,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
                     .any(|(path, _, _)| path_matches(path, library))
             })
             .collect::<Vec<_>>();
+        drop(default_libraries_phase);
         if missing.is_empty() {
             return Ok(selection.finish());
         }
@@ -793,7 +808,9 @@ impl<'data> OpenSelection<'data> {
     fn finish(self) -> SelectedInputs<'data> {
         #[cfg(test)]
         let resolver_object_scans = self.resolver.object_scan_count();
+        let snapshot_phase = crate::timing_guard!(PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS);
         let selected_imports = self.resolver.selected_imports().to_vec();
+        drop(snapshot_phase);
         SelectedInputs {
             objects: self.objects,
             resources: self.resources,
@@ -927,6 +944,7 @@ fn resolve_open_selection(
             crate::timing_phase!(PE_PHASE_PARSE_DIRECTIVES);
             directive_args(args, &selection.objects)?
         };
+        let selection_roots_phase = crate::timing_guard!(PE_DETAIL_REBUILD_SELECTION_ROOTS);
         let mut exports = command_exports.to_vec();
         for export in &directives.exports {
             merge_export(
@@ -977,6 +995,7 @@ fn resolve_open_selection(
         }
         roots.sort();
         roots.dedup();
+        drop(selection_roots_phase);
 
         let old_len = selection.objects.len();
         let archive_definitions = selection.resolver.resolve(
@@ -1331,8 +1350,11 @@ fn resolved_undefined_symbols(
     archive_definitions: &BTreeSet<Vec<u8>>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<(HashSet<Vec<u8>>, SelectedObjectMetadata)> {
+    let symbol_metadata_phase = crate::timing_guard!(PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA);
     let (metadata, undefined) = SelectedObjectMetadata::new_with_undefined(objects, roots)?;
+    drop(symbol_metadata_phase);
     let object_definitions = metadata.definition_names(objects)?;
+    let alternate_symbols_phase = crate::timing_guard!(PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS);
     let mut undefined = undefined
         .into_iter()
         .map(|name| {
@@ -1353,6 +1375,8 @@ fn resolved_undefined_symbols(
                 .map_err(Into::into)
         })
         .collect::<Result<HashSet<_>>>()?;
+    drop(alternate_symbols_phase);
+    let weak_metadata_phase = crate::timing_guard!(PE_DETAIL_SCAN_WEAK_METADATA);
     let weak = metadata.weak(objects)?;
     for (symbol, _, _) in weak.records() {
         if object_definitions.contains(symbol) {
@@ -1369,6 +1393,7 @@ fn resolved_undefined_symbols(
             undefined.insert(target.to_vec());
         }
     }
+    drop(weak_metadata_phase);
     undefined.retain(|name| !LINKER_ABSOLUTE_ZERO_SYMBOLS.contains(&name.as_slice()));
     Ok((undefined, metadata))
 }
@@ -5009,6 +5034,17 @@ mod tests {
             PE_DETAIL_LAYOUT_PREPARE,
             PE_DETAIL_LAYOUT_RELOCATIONS,
             PE_DETAIL_LAYOUT_RELAYOUT,
+            PE_DETAIL_PROBE_ARCHIVE_INDICES,
+            PE_DETAIL_REBUILD_ARCHIVE_DEMANDS,
+            PE_DETAIL_SCAN_ARCHIVE_CANDIDATES,
+            PE_DETAIL_ABSORB_SELECTED_SYMBOLS,
+            PE_DETAIL_REBUILD_SELECTION_ROOTS,
+            PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES,
+            PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS,
+            PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA,
+            PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS,
+            PE_DETAIL_SCAN_WEAK_METADATA,
+            PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS,
             PE_DETAIL_REF_CLASSIFY,
             PE_DETAIL_REF_DEFINITIONS,
             PE_DETAIL_REF_REACHABILITY,
