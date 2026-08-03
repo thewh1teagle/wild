@@ -1669,7 +1669,7 @@ fn record_comdat_redirects(
     // Match children by both section name and direct association parent. This preserves nested
     // association topology even when two objects order same-named children differently.
     let mut winner_used = vec![false; winner_children.len()];
-    let mut pending = loser_children.iter().copied().collect::<Vec<_>>();
+    let mut pending = loser_children.to_vec();
     while !pending.is_empty() {
         let before = pending.len();
         pending.retain(|loser| {
@@ -3468,6 +3468,7 @@ mod tests {
         assert!(
             collect_contributions(&[object], &crate::args::coff::CoffArgs::default())
                 .unwrap()
+                .0
                 .is_empty()
         );
     }
