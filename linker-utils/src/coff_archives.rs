@@ -18,6 +18,7 @@ use object::read::archive::ArchiveFile;
 use object::read::archive::ArchiveKind;
 use object::read::coff::CoffHeader;
 use object::read::coff::Symbol as _;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -113,9 +114,8 @@ pub struct CoffArchiveMember<'data> {
     data: &'data [u8],
     kind: CoffArchiveMemberKind<'data>,
     opaque_error: Option<CoffArchiveError>,
-    definitions: Vec<Vec<u8>>,
+    definitions: Vec<Cow<'data, [u8]>>,
     demands: OnceLock<Result<Vec<OwnedArchiveDemand>>>,
-    file_range: (u64, u64),
 }
 
 impl<'data> CoffArchiveMember<'data> {
@@ -147,7 +147,7 @@ impl<'data> CoffArchiveMember<'data> {
 
     #[must_use]
     pub fn definitions(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.definitions.iter().map(Vec::as_slice)
+        self.definitions.iter().map(AsRef::as_ref)
     }
 
     fn demands(&self) -> &[OwnedArchiveDemand] {
@@ -233,7 +233,13 @@ impl<'archive, 'data> CoffArchivePlan<'archive, 'data> {
 #[derive(Clone, Debug)]
 pub struct CoffArchive<'data> {
     members: Vec<CoffArchiveMember<'data>>,
-    definition_members: HashMap<Vec<u8>, Vec<usize>>,
+    definition_members: HashMap<Cow<'data, [u8]>, DefinitionMember>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DefinitionMember {
+    first: usize,
+    has_object: bool,
 }
 
 impl<'data> CoffArchive<'data> {
@@ -260,16 +266,15 @@ impl<'data> CoffArchive<'data> {
             }
         }
 
-        let has_symbol_index = archive
-            .symbols()
-            .map_err(|error| {
-                CoffArchiveError::archive(
-                    CoffArchiveErrorKind::InvalidSymbolIndex,
-                    format!("invalid archive symbol index: {error}"),
-                )
-            })?
-            .is_some();
+        let symbols = archive.symbols().map_err(|error| {
+            CoffArchiveError::archive(
+                CoffArchiveErrorKind::InvalidSymbolIndex,
+                format!("invalid archive symbol index: {error}"),
+            )
+        })?;
+        let has_symbol_index = symbols.is_some();
         let mut members = Vec::new();
+        let mut member_indices_by_offset = HashMap::new();
         for raw_member in archive.members() {
             let raw_member = raw_member.map_err(|error| {
                 CoffArchiveError::archive(
@@ -296,29 +301,24 @@ impl<'data> CoffArchive<'data> {
                     .set(Ok(parsed_demands))
                     .expect("new archive-member demand cell is empty");
             }
+            let member_index = members.len();
             members.push(CoffArchiveMember {
-                index: members.len(),
+                index: member_index,
                 name,
                 data: member_data,
                 kind: parsed.kind,
                 opaque_error: parsed.opaque_error,
                 definitions: parsed.definitions,
                 demands,
-                file_range: raw_member.file_range(),
             });
+            if let Some(header) = raw_member.header() {
+                let header_offset =
+                    std::ptr::from_ref(header).cast::<u8>() as usize - data.as_ptr() as usize;
+                member_indices_by_offset.insert(header_offset as u64, member_index);
+            }
         }
 
-        let member_indices_by_range = members
-            .iter()
-            .enumerate()
-            .map(|(index, member)| (member.file_range, index))
-            .collect::<HashMap<_, _>>();
-        if let Some(symbols) = archive.symbols().map_err(|error| {
-            CoffArchiveError::archive(
-                CoffArchiveErrorKind::InvalidSymbolIndex,
-                format!("invalid archive symbol index: {error}"),
-            )
-        })? {
+        if let Some(symbols) = symbols {
             for symbol in symbols {
                 let symbol = symbol.map_err(|error| {
                     CoffArchiveError::archive(
@@ -326,31 +326,33 @@ impl<'data> CoffArchive<'data> {
                         format!("invalid archive symbol entry: {error}"),
                     )
                 })?;
-                let indexed_member = archive.member(symbol.offset()).map_err(|error| {
-                    CoffArchiveError::archive(
-                        CoffArchiveErrorKind::InvalidSymbolIndex,
-                        format!("archive symbol points to an invalid member: {error}"),
-                    )
-                })?;
-                let range = indexed_member.file_range();
-                let Some(member_index) = member_indices_by_range.get(&range).copied() else {
+                let Some(member_index) = member_indices_by_offset.get(&symbol.offset().0).copied()
+                else {
                     return Err(CoffArchiveError::archive(
                         CoffArchiveErrorKind::InvalidSymbolIndex,
                         "archive symbol points outside the ordinary member list",
                     ));
                 };
                 let member = &mut members[member_index];
-                add_unique(&mut member.definitions, symbol.name());
+                if !contains_name(&member.definitions, symbol.name()) {
+                    member.definitions.push(Cow::Borrowed(symbol.name()));
+                }
             }
         }
 
-        let mut definition_members = HashMap::<Vec<u8>, Vec<usize>>::new();
+        let mut definition_members = HashMap::<Cow<'data, [u8]>, DefinitionMember>::new();
         for member in &members {
             for definition in &member.definitions {
                 definition_members
                     .entry(definition.clone())
-                    .or_default()
-                    .push(member.index);
+                    .and_modify(|entry| {
+                        entry.has_object |=
+                            matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. });
+                    })
+                    .or_insert(DefinitionMember {
+                        first: member.index,
+                        has_object: matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. }),
+                    });
             }
         }
 
@@ -387,14 +389,9 @@ impl<'data> CoffArchive<'data> {
     /// Returns whether the archive index associates `name` with a regular COFF object.
     #[must_use]
     pub fn has_object_definition(&self, name: &[u8]) -> bool {
-        self.definition_members.get(name).is_some_and(|members| {
-            members.iter().any(|&index| {
-                matches!(
-                    self.members[index].kind,
-                    CoffArchiveMemberKind::CoffObject { .. }
-                )
-            })
-        })
+        self.definition_members
+            .get(name)
+            .is_some_and(|entry| entry.has_object)
     }
 
     /// Selects members to a fixpoint.
@@ -483,9 +480,8 @@ impl<'data> CoffArchive<'data> {
                 let candidate = unresolved.iter().find_map(|demand| {
                     self.definition_members
                         .get(demand.name())
-                        .and_then(|indices| {
-                            indices.iter().copied().find(|index| !was_selected[*index])
-                        })
+                        .map(|entry| entry.first)
+                        .filter(|index| !was_selected[*index])
                         .map(|index| &self.members[index])
                         .map(|member| (member, demand.clone()))
                 });
@@ -516,10 +512,16 @@ impl<'data> CoffArchive<'data> {
 
 struct ParsedMember<'data> {
     kind: CoffArchiveMemberKind<'data>,
-    definitions: Vec<Vec<u8>>,
+    definitions: Vec<Cow<'data, [u8]>>,
     demands: Option<Vec<OwnedArchiveDemand>>,
     opaque_error: Option<CoffArchiveError>,
 }
+
+type ParsedMemberParts<'data> = (
+    CoffArchiveMemberKind<'data>,
+    Vec<Cow<'data, [u8]>>,
+    Vec<OwnedArchiveDemand>,
+);
 
 fn eagerly_parse_member<'data>(name: &[u8], data: &'data [u8]) -> Result<ParsedMember<'data>> {
     match parse_member(name, data) {
@@ -582,14 +584,7 @@ fn classify_member<'data>(name: &[u8], data: &'data [u8]) -> ParsedMember<'data>
     }
 }
 
-fn parse_member<'data>(
-    name: &[u8],
-    data: &'data [u8],
-) -> Result<(
-    CoffArchiveMemberKind<'data>,
-    Vec<Vec<u8>>,
-    Vec<OwnedArchiveDemand>,
-)> {
+fn parse_member<'data>(name: &[u8], data: &'data [u8]) -> Result<ParsedMemberParts<'data>> {
     let kind = FileKind::parse(data).map_err(|error| {
         CoffArchiveError::member(
             CoffArchiveErrorKind::UnsupportedMember,
@@ -608,7 +603,7 @@ fn parse_member<'data>(
             })?;
             Ok((
                 CoffArchiveMemberKind::ShortImport(import),
-                vec![import.symbol().to_vec()],
+                vec![Cow::Owned(import.symbol().to_vec())],
                 Vec::new(),
             ))
         }
@@ -626,11 +621,7 @@ fn parse_coff<'data, Coff: CoffHeader>(
     name: &[u8],
     data: &'data [u8],
     is_bigobj: bool,
-) -> Result<(
-    CoffArchiveMemberKind<'data>,
-    Vec<Vec<u8>>,
-    Vec<OwnedArchiveDemand>,
-)> {
+) -> Result<ParsedMemberParts<'data>> {
     let file = object::read::coff::CoffFile::<_, Coff>::parse(data).map_err(|error| {
         CoffArchiveError::member(
             CoffArchiveErrorKind::InvalidMember,
@@ -719,7 +710,7 @@ fn absorb_member_with_lookup(
     expand_demands: bool,
 ) {
     for definition in &member.definitions {
-        definitions.insert(definition.clone());
+        definitions.insert(definition.as_ref().to_vec());
     }
     unresolved.retain(|demand| !definitions.contains(demand.name()) && !is_defined(demand.name()));
     if !expand_demands {
@@ -759,14 +750,14 @@ fn add_owned_demand(demands: &mut Vec<OwnedArchiveDemand>, name: &[u8], kind: Ar
     }
 }
 
-fn add_unique(names: &mut Vec<Vec<u8>>, name: &[u8]) {
+fn add_unique(names: &mut Vec<Cow<'_, [u8]>>, name: &[u8]) {
     if !contains_name(names, name) {
-        names.push(name.to_vec());
+        names.push(Cow::Owned(name.to_vec()));
     }
 }
 
-fn contains_name(names: &[Vec<u8>], needle: &[u8]) -> bool {
-    names.iter().any(|name| name == needle)
+fn contains_name(names: &[Cow<'_, [u8]>], needle: &[u8]) -> bool {
+    names.iter().any(|name| name.as_ref() == needle)
 }
 
 #[cfg(test)]
