@@ -189,7 +189,7 @@ jobs:
       - run: cargo test --profile ci --workspace --features macho
 
   windows-build:
-    name: Build Windows (x86_64)
+    name: Build and test Windows (x86_64)
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -198,8 +198,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         id: rust-toolchain
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --profile ci --workspace --no-default-features
+      - name: Execute reference PE/COFF smoke test
+        run: cargo test --profile ci -p wild-linker --test windows_pe_smoke
 
   minimal-versions:
     runs-on: ubuntu-24.04

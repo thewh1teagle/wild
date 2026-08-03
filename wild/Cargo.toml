@@ -17,6 +17,10 @@ name = "integration_tests"
 path = "tests/integration_tests.rs"
 harness = false
 
+[[test]]
+name = "windows_pe_smoke"
+path = "tests/windows_pe_smoke.rs"
+
 [dependencies]
 libwild = { path = "../libwild", version = "0.9.0", default-features = false }
 
