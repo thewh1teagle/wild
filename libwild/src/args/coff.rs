@@ -504,6 +504,11 @@ where
                 // Stored for compatibility and diagnostics; v1 intentionally does not emit PDBs.
                 args.pdb = Some(Box::from(Path::new(value)));
             }
+            "pdbaltpath" => {
+                // rustc passes this in both debug and release builds. PDB emission is outside
+                // the PE v1 scope, so accept a non-empty value without claiming to apply it.
+                let _ = required_value("/PDBALTPATH", inline_value, &mut input)?;
+            }
             "manifest" => args.manifest = parse_yes_no("/MANIFEST", inline_value)?,
             "merge" => args.merges.push(parse_merge(required_value(
                 "/MERGE",
@@ -1001,6 +1006,30 @@ mod tests {
         let mut args = CoffArgs::default();
         assert!(parse(&mut args, ["/machine:arm64"].into_iter()).is_err());
         assert!(parse(&mut args, ["/not-a-real-option"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn accepts_ignored_pdb_alt_path_without_changing_debug_policy() {
+        let mut args = CoffArgs::default();
+        parse(&mut args, ["/PDBALTPATH:%_PDB%"].into_iter()).unwrap();
+        assert!(!args.debug);
+        assert!(args.pdb.is_none());
+
+        parse(
+            &mut args,
+            ["/DEBUG", "/PDBALTPATH", "symbols\\vibe.pdb"].into_iter(),
+        )
+        .unwrap();
+        assert!(args.debug);
+
+        parse(
+            &mut args,
+            ["/DEBUG:NONE", "/PDBALTPATH:ignored.pdb"].into_iter(),
+        )
+        .unwrap();
+        assert!(!args.debug);
+
+        assert!(parse(&mut CoffArgs::default(), ["/PDBALTPATH:"].into_iter()).is_err());
     }
 
     #[test]
