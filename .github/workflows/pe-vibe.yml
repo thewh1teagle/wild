@@ -193,25 +193,21 @@ jobs:
             exit 0
           }
 
+          # WILD_SAVE_BASE allocates monotonically numbered directories when
+          # each linker starts. Cargo links the final application only after
+          # every dependency and build script has completed, so the highest
+          # completed invocation is the Vibe executable. The output name is
+          # deliberately rewritten to $OUT in saved replays and cannot be
+          # discovered reliably by searching the recorded arguments.
           $candidate = Get-ChildItem $base -Directory |
             Where-Object {
-              $runWith = Join-Path $_.FullName 'run-with'
-              if (-not (Test-Path $runWith)) {
-                return $false
-              }
-              $argumentFiles = @($runWith) + @(
-                Get-ChildItem $_.FullName -File -Filter 'at-*.txt' |
-                  Select-Object -ExpandProperty FullName
-              )
-              # Cargo links a hashed artifact in target/.../deps and then
-              # copies it to the stable target/.../vibe.exe path.
-              return Select-String -Path $argumentFiles `
-                -Pattern '(?i)vibe(?:-[0-9a-f]+)?\.exe' -Quiet
+              (Test-Path (Join-Path $_.FullName 'run-with')) -and
+              ($_.Name -match '^\d+$')
             } |
-            Sort-Object LastWriteTimeUtc -Descending |
+            Sort-Object { [int]$_.Name } -Descending |
             Select-Object -First 1
           if ($null -eq $candidate) {
-            Write-Warning "No saved link invocation targets vibe.exe under $base"
+            Write-Warning "No completed saved link invocation under $base"
             Get-ChildItem $base -Directory | Select-Object -ExpandProperty FullName
             exit 0
           }
