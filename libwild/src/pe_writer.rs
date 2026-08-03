@@ -1362,39 +1362,20 @@ fn canonicalize_exception_directory(
         canonical_pdata_name == b".pdata",
         "/MERGE of .pdata is not yet supported because the exception directory requires an exact range"
     );
-    let xdata_name = merged_name(b".xdata", args)?;
-    let xdata_base = xdata_name
-        .split(|byte| *byte == b'$')
-        .next()
-        .unwrap_or(&xdata_name);
-    let xdata = layout
-        .sections
-        .iter()
-        .find(|section| section.name == xdata_base)
-        .context(".pdata is present but its merged .xdata output section is missing")?;
     let pdata_file = pdata
         .file_offset
         .context(".pdata unexpectedly has no file contents")? as usize;
     let pdata_size = usize::try_from(pdata.virtual_size).context(".pdata size exceeds usize")?;
-    let xdata_file = xdata
-        .file_offset
-        .context(".xdata unexpectedly has no file contents")? as usize;
-    let xdata_size = usize::try_from(xdata.virtual_size).context(".xdata size exceeds usize")?;
     let pdata_bytes = image
         .get(pdata_file..pdata_file + pdata_size)
         .context(".pdata lies outside the PE file")?
         .to_vec();
-    let xdata_bytes = image
-        .get(xdata_file..xdata_file + xdata_size)
-        .context(".xdata lies outside the PE file")?;
-    let table = linker_utils::pe_unwind::build_amd64_exception_table(
+    let table = linker_utils::pe_unwind::sort_amd64_exception_table(
         &pdata_bytes,
         pdata.rva,
-        xdata_bytes,
-        xdata.rva,
         layout.size_of_image,
     )
-    .context("invalid AMD64 exception metadata")?;
+    .context("invalid AMD64 exception table")?;
     let output = image
         .get_mut(pdata_file..pdata_file + pdata_size)
         .context(".pdata lies outside the PE file")?;
@@ -4631,38 +4612,30 @@ mod tests {
     }
 
     #[test]
-    fn validates_and_publishes_exact_exception_directory() {
+    fn sorts_opaque_pdata_and_publishes_exact_exception_directory() {
         use linker_utils::pe_sections::OutputSection;
         use linker_utils::pe_sections::SectionLayout;
 
         let mut image = vec![0; 0x600];
-        image[0x200..0x204].copy_from_slice(&[1, 0, 0, 0]);
-        let pdata = [0x1000u32, 0x1010, 0x2000]
+        let later = [0x1000u32, 0, 0xdead_beef]
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<_>>();
-        image[0x400..0x40c].copy_from_slice(&pdata);
+        let earlier = [0x200u32, 1, 0xffff_fff1]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        image[0x400..0x418].copy_from_slice(&[later.as_slice(), earlier.as_slice()].concat());
         let layout = SectionLayout {
-            sections: vec![
-                OutputSection {
-                    name: b".rdata".to_vec(),
-                    characteristics: readonly_data_characteristics(),
-                    rva: 0x2000,
-                    virtual_size: 4,
-                    file_offset: Some(0x200),
-                    raw_size: 0x200,
-                    contributions: Vec::new(),
-                },
-                OutputSection {
-                    name: b".pdata".to_vec(),
-                    characteristics: readonly_data_characteristics(),
-                    rva: 0x3000,
-                    virtual_size: 12,
-                    file_offset: Some(0x400),
-                    raw_size: 0x200,
-                    contributions: Vec::new(),
-                },
-            ],
+            sections: vec![OutputSection {
+                name: b".pdata".to_vec(),
+                characteristics: readonly_data_characteristics(),
+                rva: 0x3000,
+                virtual_size: 24,
+                file_offset: Some(0x400),
+                raw_size: 0x200,
+                contributions: Vec::new(),
+            }],
             placements: BTreeMap::new(),
             file_size: 0x600,
             size_of_image: 0x4000,
@@ -4674,7 +4647,41 @@ mod tests {
                 &crate::args::coff::CoffArgs::default()
             )
             .unwrap(),
-            Some((0x3000, 12))
+            Some((0x3000, 24))
         );
+        assert_eq!(
+            &image[0x400..0x418],
+            [earlier.as_slice(), later.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_pdata_shape_before_publishing_directory() {
+        use linker_utils::pe_sections::OutputSection;
+        use linker_utils::pe_sections::SectionLayout;
+
+        let mut image = vec![0; 0x600];
+        let layout = SectionLayout {
+            sections: vec![OutputSection {
+                name: b".pdata".to_vec(),
+                characteristics: readonly_data_characteristics(),
+                rva: 0x3000,
+                virtual_size: 13,
+                file_offset: Some(0x400),
+                raw_size: 0x200,
+                contributions: Vec::new(),
+            }],
+            placements: BTreeMap::new(),
+            file_size: 0x600,
+            size_of_image: 0x4000,
+        };
+
+        let error = canonicalize_exception_directory(
+            &mut image,
+            &layout,
+            &crate::args::coff::CoffArgs::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("not a multiple of 12"));
     }
 }
