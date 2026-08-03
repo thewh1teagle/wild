@@ -181,8 +181,8 @@ jobs:
           pnpm exec tauri build ${{ matrix.build-flag }} --no-bundle
           --target x86_64-pc-windows-msvc
 
-      - name: Locate failing Vibe linker repro
-        if: failure()
+      - name: Locate Vibe linker repro
+        if: always()
         shell: pwsh
         env:
           VIBE_PROFILE: ${{ matrix.profile }}
@@ -215,15 +215,30 @@ jobs:
           "VIBE_LINK_REPRO=$($candidate.FullName)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Upload failing Vibe linker repro
-        if: failure() && env.VIBE_LINK_REPRO != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: vibe-${{ matrix.profile }}-link-repro
-          path: ${{ env.VIBE_LINK_REPRO }}
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 9
+      - name: Configure scoped Vibe crash dumps
+        shell: pwsh
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          $dumpDirectory = Join-Path $env:RUNNER_TEMP "vibe-dumps-$env:VIBE_PROFILE"
+          New-Item -ItemType Directory -Force $dumpDirectory | Out-Null
+
+          # WER documents LocalDumps under HKLM. The application-name subkey
+          # keeps this runner-wide setting scoped to vibe.exe.
+          $key = 'HKLM:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\vibe.exe'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name DumpFolder -PropertyType ExpandString `
+            -Value $dumpDirectory -Force | Out-Null
+          New-ItemProperty -Path $key -Name DumpType -PropertyType DWord `
+            -Value 2 -Force | Out-Null
+          New-ItemProperty -Path $key -Name DumpCount -PropertyType DWord `
+            -Value 4 -Force | Out-Null
+
+          "VIBE_DUMP_DIRECTORY=$dumpDirectory" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $startFile = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.started.txt"
+          "VIBE_RUNTIME_START_FILE=$startFile" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify Vibe ${{ matrix.profile }} executable on Windows
         shell: pwsh
@@ -283,12 +298,15 @@ jobs:
 
           $stdout = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stdout.txt"
           $stderr = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stderr.txt"
+          [DateTime]::UtcNow.ToString('o') |
+            Set-Content -Path $env:VIBE_RUNTIME_START_FILE -Encoding utf8
           $process = Start-Process -FilePath $resolvedExecutable `
             -ArgumentList '--help' -PassThru `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 
           if (-not $process.WaitForExit(30000)) {
             & taskkill.exe /PID $process.Id /T /F | Out-Host
+            $process.WaitForExit(10000) | Out-Null
             throw "Vibe $env:VIBE_PROFILE did not finish its --help smoke test within 30 seconds"
           }
           $process.Refresh()
@@ -296,3 +314,92 @@ jobs:
             Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | Out-Host
             throw "Vibe $env:VIBE_PROFILE exited with code $($process.ExitCode)"
           }
+
+      - name: Capture Vibe ${{ matrix.profile }} failure evidence
+        if: failure()
+        shell: pwsh
+        working-directory: vibe-source
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE-failure-evidence"
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+
+          $targetDirectory = Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
+          foreach ($name in @('vibe.exe', 'sona.exe', 'ffmpeg.exe')) {
+            $source = Join-Path $targetDirectory $name
+            if (Test-Path $source) {
+              Copy-Item $source $evidence
+            }
+          }
+
+          foreach ($suffix in @('stdout.txt', 'stderr.txt', 'started.txt')) {
+            $source = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.$suffix"
+            if (Test-Path $source) {
+              Copy-Item $source $evidence
+            }
+          }
+
+          if ($env:VIBE_DUMP_DIRECTORY -and (Test-Path $env:VIBE_DUMP_DIRECTORY)) {
+            Copy-Item $env:VIBE_DUMP_DIRECTORY (Join-Path $evidence 'crash-dumps') -Recurse
+          }
+          if ($env:VIBE_LINK_REPRO -and (Test-Path $env:VIBE_LINK_REPRO)) {
+            Copy-Item $env:VIBE_LINK_REPRO (Join-Path $evidence 'link-repro') -Recurse
+          }
+
+          $started = (Get-Date).ToUniversalTime().AddMinutes(-10)
+          if ($env:VIBE_RUNTIME_START_FILE -and (Test-Path $env:VIBE_RUNTIME_START_FILE)) {
+            $recorded = Get-Content $env:VIBE_RUNTIME_START_FILE -Raw
+            $parsed = [DateTime]::MinValue
+            if ([DateTime]::TryParse($recorded, [ref]$parsed)) {
+              $started = $parsed.ToUniversalTime().AddMinutes(-1)
+            }
+          }
+
+          # WER and Application Error records can arrive just after process
+          # termination. Give the event service a moment, then retain only
+          # records that identify this executable.
+          Start-Sleep -Seconds 2
+          $events = Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            StartTime = $started
+          } -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProviderName -in @(
+              'Application Error',
+              'Application Hang',
+              'Windows Error Reporting'
+            ) -and $_.Message -match '(?i)(^|[^a-z])vibe(?:\.exe)?([^a-z]|$)'
+          }
+          $eventLog = Join-Path $evidence 'windows-application-events.txt'
+          if ($events) {
+            $events |
+              Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+              Format-List | Out-File $eventLog -Encoding utf8 -Width 4096
+          } else {
+            "No Vibe Application event records found since $($started.ToString('o'))." |
+              Set-Content $eventLog -Encoding utf8
+          }
+
+          $manifest = Join-Path $evidence 'manifest.txt'
+          @(
+            "profile=$env:VIBE_PROFILE"
+            "captured_utc=$([DateTime]::UtcNow.ToString('o'))"
+            "link_repro=$env:VIBE_LINK_REPRO"
+            "dump_directory=$env:VIBE_DUMP_DIRECTORY"
+          ) | Set-Content $manifest -Encoding utf8
+          Get-ChildItem $evidence -File -Recurse |
+            Where-Object FullName -ne $manifest |
+            ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "{0}  {1}  {2}" -f $hash.Hash, $_.Length, $_.FullName
+            } | Add-Content $manifest -Encoding utf8
+
+      - name: Upload Vibe ${{ matrix.profile }} failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-${{ matrix.profile }}-failure-evidence
+          path: ${{ runner.temp }}\vibe-${{ matrix.profile }}-failure-evidence
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
