@@ -6,7 +6,7 @@ use super::pe_ir::NameId;
 use super::pe_ir::PeIr;
 use super::pe_ir::RelocationCsr;
 use super::pe_ir::RelocationRecord;
-use super::pe_ir::ResolvedRelocationCsr;
+use super::pe_ir::ResolvedSymbolTargets;
 use super::pe_ir::ResolvedTargetKind;
 use super::pe_ir::SectionId;
 use super::pe_ir::SymbolId;
@@ -141,7 +141,7 @@ pub(super) trait EventDrivenGc {
 pub(super) struct DenseEventGc<'ir, 'data> {
     ir: &'ir PeIr<'data>,
     alternate_targets: &'ir [u32],
-    resolved: Option<&'ir ResolvedRelocationCsr>,
+    resolved: Option<&'ir ResolvedSymbolTargets>,
 }
 
 pub(super) struct ProductionGcInput<'a> {
@@ -165,7 +165,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
     pub(super) fn new_resolved(
         ir: &'ir PeIr<'data>,
         alternate_targets: &'ir [u32],
-        resolved: &'ir ResolvedRelocationCsr,
+        resolved: &'ir ResolvedSymbolTargets,
     ) -> Self {
         Self {
             ir,
@@ -197,6 +197,44 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             ResolvedTargetKind::Name => ResolvedTarget::default(),
             ResolvedTargetKind::Diagnostic => {
                 return Err(error!("Invalid COFF relocation symbol {}", target.target));
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn unpack_symbol_target(
+        resolved: &ResolvedSymbolTargets,
+        symbol: SymbolId,
+    ) -> Result<ResolvedTarget> {
+        let (kind, target) = resolved
+            .kind_target(symbol)
+            .context("relocation target is outside resolved symbol table")?;
+        Ok(match kind {
+            ResolvedTargetKind::Section => ResolvedTarget {
+                section: Some(SectionId::from_u32(target)),
+                import: None,
+                import_name: None,
+                absolute: false,
+            },
+            ResolvedTargetKind::Import => ResolvedTarget {
+                section: None,
+                import: Some(super::pe_ir::ImportId::from_u32(
+                    resolved
+                        .value(symbol)
+                        .context("resolved import has no import ID")?,
+                )),
+                import_name: Some(NameId::from_u32(target)),
+                absolute: false,
+            },
+            ResolvedTargetKind::Absolute => ResolvedTarget {
+                section: None,
+                import: None,
+                import_name: None,
+                absolute: true,
+            },
+            ResolvedTargetKind::Name => ResolvedTarget::default(),
+            ResolvedTargetKind::Diagnostic => {
+                return Err(error!("Invalid COFF relocation symbol {target}"));
             }
         })
     }
@@ -289,9 +327,10 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         collect_phase
             .0
             .add(crate::timing::PeMetric::Sections, section_count);
-        collect_phase
-            .0
-            .add(crate::timing::PeMetric::Relocations, resolved.records.len());
+        collect_phase.0.add(
+            crate::timing::PeMetric::Relocations,
+            self.ir.relocations.records.len(),
+        );
         collect_phase
             .0
             .add(crate::timing::PeMetric::Groups, input.groups.len());
@@ -445,11 +484,13 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                 )?;
                 child = associative_next[child as usize];
             }
-            for relocation in resolved
+            for relocation in self
+                .ir
+                .relocations
                 .for_section(section)
-                .context("live section has no resolved relocation CSR row")?
+                .context("live section has no relocation CSR row")?
             {
-                let target = Self::unpack_target(relocation.target)?;
+                let target = Self::unpack_symbol_target(resolved, relocation.target)?;
                 if relocation.typ == 1 && !target.absolute {
                     dir64_needs.push(Dir64Need {
                         section,
@@ -470,8 +511,8 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         if traversal_phase.0.enabled() {
             let relocation_count = visitation_order
                 .iter()
-                .filter_map(|&section| resolved.for_section(section))
-                .map(<[super::pe_ir::ResolvedRelocationRecord]>::len)
+                .filter_map(|&section| self.ir.relocations.for_section(section))
+                .map(<[RelocationRecord]>::len)
                 .sum();
             traversal_phase
                 .0
@@ -782,11 +823,13 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
             }
 
             if let Some(resolved) = self.resolved {
-                let relocations = resolved
+                let relocations = self
+                    .ir
+                    .relocations
                     .for_section(section)
-                    .context("live section has no resolved relocation CSR row")?;
+                    .context("live section has no relocation CSR row")?;
                 for relocation in relocations {
-                    let target = Self::unpack_target(relocation.target)?;
+                    let target = Self::unpack_symbol_target(resolved, relocation.target)?;
                     if relocation.typ == 1 && !target.absolute {
                         dir64_needs.push(Dir64Need {
                             section,

@@ -318,28 +318,36 @@ impl ResolvedTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub(super) struct ResolvedRelocationRecord {
-    pub(super) offset: u32,
-    pub(super) target: ResolvedTarget,
-    pub(super) typ: u16,
-    pub(super) flags: u16,
-}
-
 #[derive(Debug)]
-pub(super) struct ResolvedRelocationCsr {
-    pub(super) starts: Box<[u32]>,
-    pub(super) records: Box<[ResolvedRelocationRecord]>,
+pub(super) struct ResolvedSymbolTargets {
+    kinds: Box<[ResolvedTargetKind]>,
+    targets: Box<[u32]>,
+    values: Box<[u32]>,
     pub(super) names: Box<[ResolvedTarget]>,
 }
 
-impl ResolvedRelocationCsr {
-    pub(super) fn for_section(&self, section: SectionId) -> Option<&[ResolvedRelocationRecord]> {
-        let next = section.index().checked_add(1)?;
-        let start = *self.starts.get(section.index())? as usize;
-        let end = *self.starts.get(next)? as usize;
-        self.records.get(start..end)
+impl ResolvedSymbolTargets {
+    #[inline(always)]
+    pub(super) fn kind_target(&self, symbol: SymbolId) -> Option<(ResolvedTargetKind, u32)> {
+        let index = symbol.index();
+        Some((*self.kinds.get(index)?, *self.targets.get(index)?))
+    }
+
+    #[inline(always)]
+    pub(super) fn value(&self, symbol: SymbolId) -> Option<u32> {
+        self.values.get(symbol.index()).copied()
+    }
+
+    #[inline(always)]
+    pub(super) fn symbol(&self, symbol: SymbolId) -> Option<ResolvedTarget> {
+        let index = symbol.index();
+        Some(ResolvedTarget {
+            kind: *self.kinds.get(index)?,
+            target: *self.targets.get(index)?,
+            value: *self.values.get(index)?,
+            flags: 0,
+            reserved: 0,
+        })
     }
 
     pub(super) fn name(&self, name: NameId) -> Option<ResolvedTarget> {
@@ -387,54 +395,44 @@ pub(super) struct SelectedObjectFinalization<'data> {
 }
 
 impl<'data> PeIr<'data> {
-    pub(super) fn resolve_relocations(
+    pub(super) fn resolve_symbol_targets(
         &self,
         symbols: &SymbolDb,
         alternate_targets: &[u32],
-    ) -> ResolvedRelocationCsr {
+    ) -> ResolvedSymbolTargets {
         let names = (0..symbols.entries.len())
             .map(|index| {
                 self.resolve_name_target(symbols, alternate_targets, NameId::from_u32(index as u32))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let records = self
-            .relocations
-            .records
-            .iter()
-            .map(|relocation| {
-                let target = self.symbols.get(relocation.target.index()).map_or_else(
-                    || ResolvedTarget::diagnostic(relocation.target.get()),
-                    |symbol| {
-                        if symbol.diagnostic == SymbolDiagnostic::InvalidRelocationTarget {
-                            return ResolvedTarget::diagnostic(symbol.raw_index);
-                        }
-                        if symbol.flags & 1 == 0
-                            && let Some(section) = symbol.section.get()
-                        {
-                            return u32::try_from(symbol.value).map_or_else(
-                                |_| ResolvedTarget::diagnostic(symbol.raw_index),
-                                |value| ResolvedTarget::section(section, value),
-                            );
-                        }
-                        names
-                            .get(symbol.name.index())
-                            .copied()
-                            .unwrap_or_else(|| ResolvedTarget::diagnostic(symbol.raw_index))
-                    },
-                );
-                ResolvedRelocationRecord {
-                    offset: relocation.offset,
-                    target,
-                    typ: relocation.typ,
-                    flags: relocation.flags,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        ResolvedRelocationCsr {
-            starts: self.relocations.starts.clone(),
-            records,
+        let mut kinds = Vec::with_capacity(self.symbols.len());
+        let mut targets = Vec::with_capacity(self.symbols.len());
+        let mut values = Vec::with_capacity(self.symbols.len());
+        for symbol in &self.symbols {
+            let target = if symbol.diagnostic == SymbolDiagnostic::InvalidRelocationTarget {
+                ResolvedTarget::diagnostic(symbol.raw_index)
+            } else if symbol.flags & 1 == 0
+                && let Some(section) = symbol.section.get()
+            {
+                u32::try_from(symbol.value).map_or_else(
+                    |_| ResolvedTarget::diagnostic(symbol.raw_index),
+                    |value| ResolvedTarget::section(section, value),
+                )
+            } else {
+                names
+                    .get(symbol.name.index())
+                    .copied()
+                    .unwrap_or_else(|| ResolvedTarget::diagnostic(symbol.raw_index))
+            };
+            kinds.push(target.kind);
+            targets.push(target.target);
+            values.push(target.value);
+        }
+        ResolvedSymbolTargets {
+            kinds: kinds.into_boxed_slice(),
+            targets: targets.into_boxed_slice(),
+            values: values.into_boxed_slice(),
             names,
         }
     }

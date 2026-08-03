@@ -1284,7 +1284,7 @@ struct DenseProductionState<'data> {
     ir: pe_ir::PeIr<'data>,
     names: pe_symbol_db::OrderedNameInterner<'data>,
     symbols: pe_symbol_db::SymbolDb,
-    resolved_relocations: pe_ir::ResolvedRelocationCsr,
+    resolved_targets: pe_ir::ResolvedSymbolTargets,
     resolver_states: Box<[pe_resolver::ResolverNameState]>,
     alternate_targets: Box<[u32]>,
     has_import_providers: bool,
@@ -1413,12 +1413,22 @@ impl<'data> DenseProductionState<'data> {
             finalized.names.len() == resolver_states.len(),
             "canonical name and symbol-state cardinality mismatch"
         );
-        let resolved_relocations = ir.resolve_relocations(&finalized.symbols, &alternate_targets);
+        let mut resolve_targets_phase =
+            crate::pe_timing_guard!("PE symbols: Resolve symbol targets");
+        resolve_targets_phase
+            .0
+            .add(crate::timing::PeMetric::Symbols, ir.symbols.len());
+        resolve_targets_phase.0.add(
+            crate::timing::PeMetric::Names,
+            finalized.symbols.entries.len(),
+        );
+        let resolved_targets = ir.resolve_symbol_targets(&finalized.symbols, &alternate_targets);
+        drop(resolve_targets_phase);
         Ok(Self {
             ir,
             names: finalized.names,
             symbols: finalized.symbols,
-            resolved_relocations,
+            resolved_targets,
             resolver_states: resolver_states.into_boxed_slice(),
             alternate_targets: alternate_targets.into_boxed_slice(),
             has_import_providers,
@@ -3342,7 +3352,7 @@ fn collect_dense_gc(
     let collector = pe_gc::DenseEventGc::new_resolved(
         &dense.ir,
         &dense.alternate_targets,
-        &dense.resolved_relocations,
+        &dense.resolved_targets,
     );
     input_phase
         .0
@@ -4637,9 +4647,10 @@ fn copy_and_relocate_dense_contribution(
         .context("real contribution has no dense PE section")?;
     let record = &dense.ir.sections[section.index()];
     let relocations = dense
-        .resolved_relocations
+        .ir
+        .relocations
         .for_section(section)
-        .context("dense PE section has no resolved relocation row")?;
+        .context("dense PE section has no relocation row")?;
     let placement = &layout.placements[&contribution.spec.id];
     let Some(file_offset) = placement.file_offset else {
         ensure!(
@@ -4703,15 +4714,19 @@ fn prepare_dense_relocation(
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     placement: &linker_utils::pe_sections::ContributionPlacement,
-    relocation: pe_ir::ResolvedRelocationRecord,
+    relocation: pe_ir::RelocationRecord,
 ) -> Result<PreparedRelocation> {
     use linker_utils::coff::Amd64RelocationInputs;
     use linker_utils::coff::ImageBase;
     use linker_utils::coff::Rva;
     use linker_utils::coff::SectionIndex;
 
+    let resolved_target = dense
+        .resolved_targets
+        .symbol(relocation.target)
+        .context("relocation target is outside resolved symbol table")?;
     let (target, target_section, target_section_index, absolute_value) = if let Some(section) =
-        relocation.target.section_id()
+        resolved_target.section_id()
     {
         if let Some(targets) = dense_targets {
             let target = targets
@@ -4720,13 +4735,13 @@ fn prepare_dense_relocation(
                 .flatten()
                 .context("relocation targets a discarded dense section")?;
             ensure!(
-                relocation.target.value <= target.size,
+                resolved_target.value <= target.size,
                 "symbol offset exceeds selected COMDAT section"
             );
             (
                 target
                     .rva
-                    .checked_add(relocation.target.value)
+                    .checked_add(resolved_target.value)
                     .context("COFF symbol RVA overflow")?,
                 target.output_section_rva,
                 target.output_section_index,
@@ -4783,13 +4798,13 @@ fn prepare_dense_relocation(
                 (selected, id)
             };
             ensure!(
-                u64::from(relocation.target.value) <= u64::from(selected.size),
+                u64::from(resolved_target.value) <= u64::from(selected.size),
                 "symbol offset exceeds selected COMDAT section"
             );
             let target_placement = &layout.placements[&id];
             let target = target_placement
                 .rva
-                .checked_add(relocation.target.value)
+                .checked_add(resolved_target.value)
                 .context("COFF symbol RVA overflow")?;
             (
                 target,
@@ -4800,14 +4815,13 @@ fn prepare_dense_relocation(
             )
         }
     } else {
-        if relocation.target.kind == pe_ir::ResolvedTargetKind::Diagnostic {
+        if resolved_target.kind == pe_ir::ResolvedTargetKind::Diagnostic {
             return Err(error!(
                 "Invalid COFF relocation symbol {}",
-                relocation.target.target
+                resolved_target.target
             ));
         }
-        let name = relocation
-            .target
+        let name = resolved_target
             .name_id()
             .and_then(|name| dense.names.bytes(name))
             .context("relocation target has an invalid canonical name")?;

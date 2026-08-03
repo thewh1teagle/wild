@@ -60,6 +60,7 @@ macro_rules! pe_timing_guard {
             events = tracing::field::Empty,
             groups = tracing::field::Empty,
             relocations = tracing::field::Empty,
+            symbols = tracing::field::Empty,
             names = tracing::field::Empty,
             lookups = tracing::field::Empty,
             queue_pushes = tracing::field::Empty,
@@ -82,6 +83,7 @@ pub(crate) enum PeMetric {
     Events,
     Groups,
     Relocations,
+    Symbols,
     Names,
     Lookups,
     QueuePushes,
@@ -90,7 +92,7 @@ pub(crate) enum PeMetric {
 }
 
 impl PeMetric {
-    const COUNT: usize = 12;
+    const COUNT: usize = 13;
 
     const fn index(self) -> usize {
         self as usize
@@ -194,6 +196,7 @@ impl PeTimingGuard {
             (PeMetric::Events, "events"),
             (PeMetric::Groups, "groups"),
             (PeMetric::Relocations, "relocations"),
+            (PeMetric::Symbols, "symbols"),
             (PeMetric::Names, "names"),
             (PeMetric::Lookups, "lookups"),
             (PeMetric::QueuePushes, "queue_pushes"),
