@@ -23,7 +23,7 @@ use linker_utils::pe_sections::SectionContribution;
 use linker_utils::pe_sections::SectionLayout;
 use linker_utils::pe_sections::SectionLayoutOptions;
 use linker_utils::pe_sections::directory_range_for_section;
-use linker_utils::pe_sections::layout_sections;
+use linker_utils::pe_sections::layout_sections_borrowed;
 use object::Object;
 use object::ObjectComdat;
 use object::ObjectSection;
@@ -81,6 +81,7 @@ const PE_DETAIL_ROOTS: &str = "PE detail: Prepare GC roots";
 const PE_DETAIL_SOURCE_LOCATIONS: &str = "PE detail: Build source-location map";
 const PE_DETAIL_TLS_DIRECTORY: &str = "PE detail: Build TLS directory";
 const PE_DETAIL_WRITE_HEADERS: &str = "PE detail: Write PE headers";
+const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
@@ -1576,6 +1577,7 @@ fn build_image_with_delay_loads(
     let load_config_directory = load_config_directory(
         objects,
         &contributions,
+        &locations,
         &layout,
         &definitions,
         config.image_base,
@@ -1877,6 +1879,7 @@ fn canonicalize_exception_directory(
 fn load_config_directory(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
+    locations: &LocationMap,
     layout: &SectionLayout,
     definitions: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -1884,7 +1887,6 @@ fn load_config_directory(
     let Some(&selected_va) = definitions.get(LOAD_CONFIG_SYMBOL) else {
         return Ok(None);
     };
-    let locations = source_locations(contributions);
     for (object_index, object) in objects.iter().enumerate() {
         for symbol in object.file().symbols() {
             if !symbol.is_global() || symbol.name_bytes()? != LOAD_CONFIG_SYMBOL {
@@ -3108,16 +3110,13 @@ fn converge_relocation_layout(
 fn make_layout(contributions: &[Contribution], config: PeWriterConfig) -> Result<SectionLayout> {
     let section_count = contributions
         .iter()
-        .map(|c| c.spec.name.split(|b| *b == b'$').next().unwrap().to_vec())
+        .map(|c| c.spec.name.split(|b| *b == b'$').next().unwrap())
         .collect::<HashSet<_>>()
         .len();
     ensure!(u16::try_from(section_count).is_ok(), "too many PE sections");
     let headers = 0x80 + 4 + 20 + 240 + u32::try_from(section_count).unwrap() * 40;
-    let layout = layout_sections(
-        &contributions
-            .iter()
-            .map(|c| c.spec.clone())
-            .collect::<Vec<_>>(),
+    let layout = layout_sections_borrowed(
+        contributions.iter().map(|contribution| &contribution.spec),
         SectionLayoutOptions {
             headers_size: headers,
             section_alignment: config.section_alignment,
@@ -3132,13 +3131,11 @@ fn source_locations(
     contributions: &[Contribution],
 ) -> HashMap<(usize, object::SectionIndex), ContributionId> {
     let locations_phase = crate::timing_guard!(PE_DETAIL_SOURCE_LOCATIONS);
-    let locations = contributions
-        .iter()
-        .filter_map(|c| match c.source {
-            Source::Object { object, section } => Some(((object, section), c.spec.id)),
-            Source::Synthetic => None,
-        })
-        .collect();
+    let mut locations = HashMap::with_capacity(contributions.len());
+    locations.extend(contributions.iter().filter_map(|c| match c.source {
+        Source::Object { object, section } => Some(((object, section), c.spec.id)),
+        Source::Synthetic => None,
+    }));
     drop(locations_phase);
     locations
 }
@@ -3166,34 +3163,70 @@ fn discover_dir64_sites(
     absolute_symbols: &HashMap<Vec<u8>, u64>,
 ) -> Result<Vec<Dir64Site>> {
     let dir64_phase = crate::timing_guard!(PE_DETAIL_DIR64_SITES);
-    let locations = source_locations(contributions);
+    let chunk_results = if rayon::current_num_threads() > 1
+        && contributions.len() > DIR64_DISCOVERY_CHUNK_SIZE
+    {
+        contributions
+            .par_chunks(DIR64_DISCOVERY_CHUNK_SIZE)
+            .map(|chunk| discover_dir64_sites_in_contributions(objects, chunk, absolute_symbols))
+            .collect::<Vec<_>>()
+    } else {
+        vec![discover_dir64_sites_in_contributions(
+            objects,
+            contributions,
+            absolute_symbols,
+        )]
+    };
     let mut sites = Vec::new();
-    for (object_index, input) in objects.iter().enumerate() {
-        for section in input.file().sections() {
-            let Some(id) = locations.get(&(object_index, section.index())) else {
-                continue;
-            };
-            for (offset, relocation) in section.relocations() {
-                if relocation.kind() == RelocationKind::Absolute && relocation.size() == 64 {
-                    if let RelocationTarget::Symbol(index) = relocation.target() {
-                        let symbol = input
-                            .file()
-                            .symbol_by_index(index)
-                            .context("invalid relocation symbol")?;
-                        let name = symbol.name_bytes()?;
-                        if absolute_symbols.contains_key(name) {
-                            continue;
-                        }
+    // Indexed parallel collection preserves contribution order. Checking chunk results in that
+    // same order keeps both relocation-table bytes and the first reported error deterministic.
+    for chunk in chunk_results {
+        sites.extend(chunk?);
+    }
+    drop(dir64_phase);
+    Ok(sites)
+}
+
+fn discover_dir64_sites_in_contributions(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+) -> Result<Vec<Dir64Site>> {
+    let mut sites = Vec::new();
+    for contribution in contributions {
+        let Source::Object {
+            object: object_index,
+            section: section_index,
+        } = contribution.source
+        else {
+            continue;
+        };
+        let input = objects
+            .get(object_index)
+            .context("selected COFF contribution references an invalid object")?;
+        let section = input
+            .file()
+            .section_by_index(section_index)
+            .context("selected COFF contribution references an invalid section")?;
+        for (offset, relocation) in section.relocations() {
+            if relocation.kind() == RelocationKind::Absolute && relocation.size() == 64 {
+                if let RelocationTarget::Symbol(index) = relocation.target() {
+                    let symbol = input
+                        .file()
+                        .symbol_by_index(index)
+                        .context("invalid relocation symbol")?;
+                    let name = symbol.name_bytes()?;
+                    if absolute_symbols.contains_key(name) {
+                        continue;
                     }
-                    sites.push(Dir64Site {
-                        contribution: *id,
-                        offset: u32::try_from(offset).context("relocation offset too large")?,
-                    });
                 }
+                sites.push(Dir64Site {
+                    contribution: contribution.spec.id,
+                    offset: u32::try_from(offset).context("relocation offset too large")?,
+                });
             }
         }
     }
-    drop(dir64_phase);
     Ok(sites)
 }
 
@@ -4345,6 +4378,53 @@ mod tests {
             )
             .unwrap(),
             dir64_rvas(&sites, &layout).unwrap()
+        );
+    }
+
+    #[test]
+    fn parallel_dir64_discovery_preserves_contribution_order() {
+        let bytes = crt_load_config_object(312, 8);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let section_index = object
+            .file()
+            .sections()
+            .find(|section| section.relocations().next().is_some())
+            .unwrap()
+            .index();
+        let contributions = (0..(DIR64_DISCOVERY_CHUNK_SIZE * 3))
+            .map(|index| Contribution {
+                source: Source::Object {
+                    object: 0,
+                    section: section_index,
+                },
+                spec: SectionContribution {
+                    id: ContributionId(index as u32),
+                    name: b".rdata".to_vec(),
+                    characteristics: readonly_data_characteristics(),
+                    alignment: 8,
+                    size: 8,
+                    kind: ContributionKind::Data,
+                },
+                data: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let objects = [object];
+        let absolute_symbols = HashMap::new();
+        let expected =
+            discover_dir64_sites_in_contributions(&objects, &contributions, &absolute_symbols)
+                .unwrap();
+        let actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| discover_dir64_sites(&objects, &contributions, &absolute_symbols))
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .windows(2)
+                .all(|pair| pair[0].contribution <= pair[1].contribution)
         );
     }
 
