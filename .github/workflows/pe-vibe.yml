@@ -181,9 +181,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "cargo clean failed with exit code $LASTEXITCODE"
           }
-          $executable = Join-Path `
-            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE) `
-            'vibe.exe'
+          $profileDirectory = Join-Path `
+            'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
+          $executable = Join-Path $profileDirectory 'vibe.exe'
+          if (Test-Path -LiteralPath $executable) {
+            Remove-Item -LiteralPath $executable -Force
+          }
           if (Test-Path $executable) {
             throw "cargo clean left a cached Vibe executable at $executable"
           }
@@ -225,9 +228,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "cargo clean failed with exit code $LASTEXITCODE"
           }
-          $executable = Join-Path `
-            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE) `
-            'vibe.exe'
+          $profileDirectory = Join-Path `
+            'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
+          $executable = Join-Path $profileDirectory 'vibe.exe'
+          if (Test-Path -LiteralPath $executable) {
+            Remove-Item -LiteralPath $executable -Force
+          }
           if (Test-Path $executable) {
             throw "cargo clean left the previous Vibe executable at $executable"
           }
