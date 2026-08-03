@@ -95,6 +95,7 @@ impl<'data> LazyArchive<'data> {
 }
 
 fn prepare_archives(archives: &[LazyArchive<'_>]) {
+    crate::timing_phase!("PE detail: Prepare archive indices");
     if rayon::current_num_threads() == 1 {
         for archive in archives {
             let _ = archive.parsed();
