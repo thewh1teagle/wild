@@ -245,12 +245,10 @@ fn extract_pass<'data>(
             );
             demands
         };
-        let defined_refs = symbol_state
-            .defined
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let plan = archive.plan(&demands, &defined_refs, whole_archive[archive_index]);
+        let plan =
+            archive.plan_with_defined_lookup(&demands, whole_archive[archive_index], |name| {
+                symbol_state.defined.contains(name)
+            });
         for selected in plan.selected() {
             let member = selected.member();
             if !extracted.insert((archive_index, member.index())) {
