@@ -23,15 +23,16 @@ uv run plans/pe-coff/pe-repro_001.py --wild target/debug/wild
 uv run plans/pe-coff/pe-perf_001.py --wild-budget-seconds 30
 ```
 
-The Rust unit run executes 209 `libwild` tests and 132 `linker-utils` tests;
+The Rust unit run executes 223 `libwild` tests and 137 `linker-utils` tests;
 one opt-in local xwin archive probe remains ignored. The reproducibility matrix
 links all six freestanding fixtures with `lld-link` and twice with Wild, checks
 the bounded PE-layout equivalences documented in `pe-repro_001.md`, and passes
 all semantic and byte-determinism checks. The performance probe passes its
-30-second budget; the captured warm run measured complete Rust compile/link
-times of 0.98 seconds for Wild and 0.21 seconds for `lld-link`.
+30-second budget; the final captured run measured complete Rust compile/link
+times of 0.98 seconds for Wild and 0.18 seconds for `lld-link`. This is a
+correctness gate, not evidence that the experimental PE linker is faster.
 
-The full xwin-backed candidate command also passes at `7381d52a`:
+The full xwin-backed candidate command also passes at `a242d132`:
 
 ```console
 cargo +1.95.0 build -p wild-linker --no-default-features --features pe
@@ -47,23 +48,28 @@ macOS validates their PE structure; execution is covered by Windows below.
 ## Real Windows x86-64 verification
 
 - Focused freestanding/TLS workflow: run
-  [30781828633](https://github.com/thewh1teagle/wild/actions/runs/30781828633),
-  commit `7381d52a`, passed. It copies Wild to `link.exe`, sets both candidate
+  [30787127729](https://github.com/thewh1teagle/wild/actions/runs/30787127729),
+  commit `a242d132`, passed. It copies Wild to `link.exe`, sets both candidate
   environment variables, and executes the `lld-link` and Wild images.
 - Full C, C++, DLL, Rust-std, and TLS runtime workflow: run
-  [30782264599](https://github.com/thewh1teagle/wild/actions/runs/30782264599),
-  commit `7381d52a`, passed. It builds Wild, selects it as `link.exe`, then links
-  and executes both reference and candidate corpora with stdout and exit-code
-  assertions.
+  [30787127495](https://github.com/thewh1teagle/wild/actions/runs/30787127495),
+  commit `a242d132`, passed. It builds Wild, selects it as `link.exe`, then links
+  and executes both reference and candidate corpora with exact stdout and
+  exit-code assertions. The corpus includes C and C++ executables, C and C++
+  DLLs and consumers, a Rust-std executable, a Rust cdylib and C consumer, and
+  compiler TLS/callback behavior.
 - Minimal Tauri debug and release workflow: run
-  [30781450278](https://github.com/thewh1teagle/wild/actions/runs/30781450278),
-  commit `fae3aeab`, passed. Both profiles use Wild as Cargo's x86-64 MSVC
+  [30787128668](https://github.com/thewh1teagle/wild/actions/runs/30787128668),
+  commit `a242d132`, passed. Both profiles use Wild as Cargo's x86-64 MSVC
   linker and must reach Tauri's Ready event and exit with code 73.
 - Real Vibe debug and release workflow: run
-  [30782027875](https://github.com/thewh1teagle/wild/actions/runs/30782027875),
-  commit `7381d52a`, is pending. Completion requires both profile jobs to build
-  with the uploaded Wild `link.exe`, produce AMD64 executables and sidecars,
-  and pass the real-Windows `vibe.exe --help` smoke test.
-
-Vibe remains an open acceptance gate until both matrix jobs complete
-successfully. No result in this document claims otherwise.
+  [30789529875](https://github.com/thewh1teagle/wild/actions/runs/30789529875),
+  commit `fee26749`, passed. Both isolated jobs remove the pinned Vibe package
+  from Cargo's restored target cache, then compile and link it with the Wild
+  artifact built by the same workflow. The resulting debug (79,326,720-byte)
+  and release (12,269,568-byte) executables are valid AMD64 PE images; their
+  real sona and ffmpeg sidecars pass native probes; and each no-argument Vibe
+  process creates a top-level GUI window and remains alive on real Windows.
+  Vibe's separate undocumented `--help` forwarding path is diagnostic-only at
+  this revision: it times out in debug and exits with `0xc0000409` in release,
+  while the supported GUI application path passes in both profiles.
