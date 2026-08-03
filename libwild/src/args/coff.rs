@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::platform;
 use linker_utils::coff_runtime::RuntimeDirective;
 use linker_utils::coff_runtime::RuntimeResolution;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -384,6 +385,28 @@ where
 
         match name.as_str() {
             "nologo" if inline_value.is_none() => args.no_logo = true,
+            "time" => {
+                args.common.time_phase_options = match inline_value {
+                    Some("") => bail!("missing argument to /TIME"),
+                    Some(value) => Some(super::parse_time_phase_options(value)?),
+                    None => Some(Vec::new()),
+                };
+                // The forked runner closes its standard streams as soon as the image is ready,
+                // before timing guards are dropped. Keep profiling in-process so `/TIME` can
+                // report every PE phase as intended.
+                args.common.should_fork = false;
+            }
+            "threads" => {
+                let value = required_value("/THREADS", inline_value, &mut input)?;
+                args.common.num_threads = Some(
+                    NonZeroUsize::new(
+                        value
+                            .parse::<usize>()
+                            .with_context(|| format!("invalid /THREADS count `{value}`"))?,
+                    )
+                    .context("/THREADS count must be greater than zero")?,
+                );
+            }
             "out" => {
                 let value = required_value("/OUT", inline_value, &mut input)?;
                 args.common.output = Arc::from(Path::new(value));
@@ -1366,6 +1389,52 @@ mod tests {
         .unwrap();
         assert_eq!(&*args.common.output, Path::new("separate.exe"));
         assert!(args.no_default_libraries);
+    }
+
+    #[test]
+    fn parses_pe_profiling_and_thread_controls() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            ["/TIME:cycles,page-faults", "/THREADS:7"].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            format!("{:?}", args.common.time_phase_options),
+            "Some([Cycles, PageFaults])"
+        );
+        assert_eq!(args.common.num_threads, NonZeroUsize::new(7));
+        assert!(!args.common.should_fork());
+
+        let mut defaults = CoffArgs::default();
+        parse(&mut defaults, ["-time", "-threads", "3"].into_iter()).unwrap();
+        assert!(
+            defaults
+                .common
+                .time_phase_options
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(defaults.common.num_threads, NonZeroUsize::new(3));
+    }
+
+    #[test]
+    fn rejects_invalid_pe_thread_counts_and_time_counters() {
+        for option in ["/THREADS:0", "/THREADS:not-a-number"] {
+            assert!(
+                parse(&mut CoffArgs::default(), [option].into_iter()).is_err(),
+                "{option}"
+            );
+        }
+        assert!(parse(&mut CoffArgs::default(), ["/TIME:"].into_iter()).is_err());
+        assert!(
+            parse(
+                &mut CoffArgs::default(),
+                ["/TIME:not-a-counter"].into_iter()
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -37,6 +37,22 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const LOAD_CONFIG_SYMBOL: &[u8] = b"_load_config_used";
+const PE_PHASE_LOAD_DEFINITION: &str = "PE: Load definition";
+const PE_PHASE_OPEN_INPUTS: &str = "PE: Open inputs";
+const PE_PHASE_SELECT_INPUTS: &str = "PE: Select inputs";
+const PE_PHASE_PARSE_INPUTS: &str = "PE: Parse inputs";
+const PE_PHASE_PARSE_DIRECTIVES: &str = "PE: Parse directives";
+const PE_PHASE_RESOLVE_ARCHIVES: &str = "PE: Resolve archives";
+const PE_PHASE_PREPARE_RESOURCES: &str = "PE: Prepare resources";
+const PE_PHASE_RESOLVE_IMPORTS: &str = "PE: Resolve imports";
+const PE_PHASE_SELECT_COMDATS: &str = "PE: Select COMDATs and OPT:REF";
+const PE_PHASE_LAYOUT: &str = "PE: Build contributions and layout";
+const PE_PHASE_BUILD_SYNTHETIC: &str = "PE: Build synthetic sections";
+const PE_PHASE_DEFINE_SYMBOLS: &str = "PE: Build symbol definitions";
+const PE_PHASE_COPY_IMAGE: &str = "PE: Copy image contributions";
+const PE_PHASE_APPLY_RELOCATIONS: &str = "PE: Apply relocations";
+const PE_PHASE_FINALIZE_IMAGE: &str = "PE: Finalize image metadata";
+const PE_PHASE_WRITE_OUTPUT: &str = "PE: Write output";
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
@@ -133,6 +149,7 @@ pub(crate) fn link<F: FileSystem>(
     fs: &F,
     args: &crate::args::coff::CoffArgs,
 ) -> Result<crate::LinkerOutput<'static>> {
+    crate::timing_phase!("PE link");
     ensure!(!args.common.inputs.is_empty(), "no COFF input files");
     ensure!(
         !(args.no_entry && args.entry.is_some()),
@@ -143,7 +160,10 @@ pub(crate) fn link<F: FileSystem>(
         "/NOENTRY is only valid with /DLL"
     );
 
-    let definition = load_definition_file(fs, args)?;
+    let definition = {
+        crate::timing_phase!(PE_PHASE_LOAD_DEFINITION);
+        load_definition_file(fs, args)?
+    };
 
     let mut requested = Vec::new();
     for input in &args.common.inputs {
@@ -157,13 +177,19 @@ pub(crate) fn link<F: FileSystem>(
     // The arena owns every opened input until linking finishes. Its stable allocations let the
     // resolver retain borrowed COFF/archive views while later default-library waves are appended.
     let input_storage = colosseum::sync::Arena::new();
-    for request in requested {
-        open_input(fs, &request, args, &input_storage, &mut inputs, false)?;
+    {
+        crate::timing_phase!(PE_PHASE_OPEN_INPUTS);
+        for request in requested {
+            open_input(fs, &request, args, &input_storage, &mut inputs, false)?;
+        }
     }
     let selected =
         select_inputs_to_fixpoint(fs, args, &definition.exports, &input_storage, &mut inputs)?;
     let mut resources = selected.resources;
-    prepare_manifest(fs, args, &selected.directives, &mut resources)?;
+    {
+        crate::timing_phase!(PE_PHASE_PREPARE_RESOURCES);
+        prepare_manifest(fs, args, &selected.directives, &mut resources)?;
+    }
     let objects = selected.objects;
     let archive_bytes = selected.archive_bytes;
     let entry_name = selected.entry_name;
@@ -184,9 +210,16 @@ pub(crate) fn link<F: FileSystem>(
     roots.dedup();
     ensure!(!objects.is_empty(), "no COFF object files selected");
 
-    let undefined =
-        resolved_undefined_symbols(&objects, &roots, &archive_definitions, &runtime_resolution)?;
-    let imports = pe_imports::select_from_libraries(&archive_bytes, &undefined)?;
+    let imports = {
+        crate::timing_phase!(PE_PHASE_RESOLVE_IMPORTS);
+        let undefined = resolved_undefined_symbols(
+            &objects,
+            &roots,
+            &archive_definitions,
+            &runtime_resolution,
+        )?;
+        pe_imports::select_from_libraries(&archive_bytes, &undefined)?
+    };
     let dll_name = if let Some(name) = definition.module_name.as_deref() {
         name
     } else {
@@ -209,21 +242,24 @@ pub(crate) fn link<F: FileSystem>(
         &delay_load_dlls,
         &roots,
     )?;
-    let mut output = fs.create_output(
-        args.common.output.clone(),
-        OutputOptions {
-            size: image.bytes.len() as u64,
-            file_replacement_mode: args
-                .common
-                .file_replacement_mode
-                .unwrap_or(FileReplacementMode::UnlinkAndReplace),
-            write_mode: args.common.file_write_mode,
-        },
-    )?;
-    output.bytes_mut().copy_from_slice(&image.bytes);
-    output.finish()?;
-    if !image.exports.is_empty() {
-        write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
+    {
+        crate::timing_phase!(PE_PHASE_WRITE_OUTPUT);
+        let mut output = fs.create_output(
+            args.common.output.clone(),
+            OutputOptions {
+                size: image.bytes.len() as u64,
+                file_replacement_mode: args
+                    .common
+                    .file_replacement_mode
+                    .unwrap_or(FileReplacementMode::UnlinkAndReplace),
+                write_mode: args.common.file_write_mode,
+            },
+        )?;
+        output.bytes_mut().copy_from_slice(&image.bytes);
+        output.finish()?;
+        if !image.exports.is_empty() {
+            write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
+        }
     }
     Ok(crate::LinkerOutput { layout: None })
 }
@@ -498,7 +534,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
     input_storage: &'data colosseum::sync::Arena<F::Input>,
     inputs: &mut Vec<OpenedInput<'data, F>>,
 ) -> Result<SelectedInputs<'data>> {
-    crate::timing_phase!("Select PE inputs");
+    crate::timing_phase!(PE_PHASE_SELECT_INPUTS);
     let mut no_default_libraries = args.no_default_libraries;
     let mut excluded_default_libraries = args.excluded_default_libraries.clone();
     let mut selection = select_opened_inputs::<F>(
@@ -681,6 +717,7 @@ fn add_opened_inputs<'data, F: FileSystem>(
     inputs: &[OpenedInput<'data, F>],
     selection: &mut OpenSelection<'data>,
 ) -> Result<()> {
+    crate::timing_phase!(PE_PHASE_PARSE_INPUTS);
     for (path, data, _is_default) in inputs {
         match object::FileKind::parse(data.bytes()) {
             Ok(object::FileKind::Coff | object::FileKind::CoffBig) => {
@@ -734,7 +771,6 @@ fn resolve_open_selection(
     command_exports: &[crate::args::coff::ExportSpec],
     selection: &mut OpenSelection<'_>,
 ) -> Result<()> {
-    crate::verbose_timing_phase!("Resolve PE archives");
     selection.entry_name = pe_entry::select_from_objects(
         args,
         selection
@@ -743,7 +779,10 @@ fn resolve_open_selection(
             .map(|&index| &selection.objects[index]),
     )?;
     loop {
-        let mut directives = directive_args(args, &selection.objects)?;
+        let mut directives = {
+            crate::timing_phase!(PE_PHASE_PARSE_DIRECTIVES);
+            directive_args(args, &selection.objects)?
+        };
         let mut exports = command_exports.to_vec();
         for export in &directives.exports {
             merge_export(
@@ -1158,6 +1197,7 @@ fn build_image_with_delay_loads(
 ) -> Result<BuiltImage> {
     let (mut imports, mut delay_imports) =
         pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
+    let comdat_phase = crate::timing_guard!(PE_PHASE_SELECT_COMDATS);
     // Archive selection and section GC deliberately remain separate: resolution must see every
     // undefined reference in order to extract the right archive members, while /OPT:REF only
     // decides which already-selected COMDAT contributions reach the image.
@@ -1206,6 +1246,9 @@ fn build_image_with_delay_loads(
         pe_imports::retain_referenced(&mut imports, &live_imports);
         pe_imports::retain_referenced(&mut delay_imports, &live_imports);
     }
+    drop(comdat_phase);
+
+    let layout_phase = crate::timing_guard!(PE_PHASE_LAYOUT);
     let absolute_symbols = absolute_symbol_values(objects, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
@@ -1356,7 +1399,9 @@ fn build_image_with_delay_loads(
         .image_base
         .checked_add(u64::from(layout.size_of_image))
         .context("PE virtual address space overflows u64")?;
+    drop(layout_phase);
 
+    let assemble_synthetic_phase = crate::timing_guard!(PE_PHASE_BUILD_SYNTHETIC);
     let emitted_delay_unwind = match (delay_thunk_id, delay_xdata_id, delay_pdata_id) {
         (Some(thunks), Some(xdata), Some(_)) => pe_imports::emit_delay_unwind(
             &delay_imports,
@@ -1446,7 +1491,9 @@ fn build_image_with_delay_loads(
     } else {
         None
     };
+    drop(assemble_synthetic_phase);
 
+    let definitions_phase = crate::timing_guard!(PE_PHASE_DEFINE_SYMBOLS);
     let (locations, mut definitions) = definitions(
         objects,
         &contributions,
@@ -1577,7 +1624,9 @@ fn build_image_with_delay_loads(
     } else {
         None
     };
+    drop(definitions_phase);
 
+    let assemble_image_phase = crate::timing_guard!(PE_PHASE_COPY_IMAGE);
     let mut image = vec![0; layout.file_size as usize];
     for contribution in &contributions {
         let placement = &layout.placements[&contribution.spec.id];
@@ -1586,6 +1635,9 @@ fn build_image_with_delay_loads(
             image[start..start + contribution.data.len()].copy_from_slice(&contribution.data);
         }
     }
+    drop(assemble_image_phase);
+
+    let relocations_phase = crate::timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
     apply_relocations(
         objects,
         &layout,
@@ -1596,6 +1648,9 @@ fn build_image_with_delay_loads(
         config.image_base,
         &mut image,
     )?;
+    drop(relocations_phase);
+
+    let final_image_phase = crate::timing_guard!(PE_PHASE_FINALIZE_IMAGE);
     let tls_directory = prepare_tls_directory(
         objects,
         &contributions,
@@ -1665,6 +1720,7 @@ fn build_image_with_delay_loads(
         )?;
         image[start..start + encoded.bytes.len()].copy_from_slice(&encoded.bytes);
     }
+    drop(final_image_phase);
     Ok(BuiltImage {
         bytes: image,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
@@ -3811,6 +3867,33 @@ mod tests {
     use object::write::Relocation;
     use object::write::Symbol;
     use object::write::SymbolSection;
+
+    #[test]
+    fn pe_timing_phase_labels_are_stable_and_unique() {
+        let phases = [
+            PE_PHASE_LOAD_DEFINITION,
+            PE_PHASE_OPEN_INPUTS,
+            PE_PHASE_SELECT_INPUTS,
+            PE_PHASE_PARSE_INPUTS,
+            PE_PHASE_PARSE_DIRECTIVES,
+            PE_PHASE_RESOLVE_ARCHIVES,
+            PE_PHASE_PREPARE_RESOURCES,
+            PE_PHASE_RESOLVE_IMPORTS,
+            PE_PHASE_SELECT_COMDATS,
+            PE_PHASE_LAYOUT,
+            PE_PHASE_BUILD_SYNTHETIC,
+            PE_PHASE_DEFINE_SYMBOLS,
+            PE_PHASE_COPY_IMAGE,
+            PE_PHASE_APPLY_RELOCATIONS,
+            PE_PHASE_FINALIZE_IMAGE,
+            PE_PHASE_WRITE_OUTPUT,
+        ];
+        assert!(phases.iter().all(|phase| phase.starts_with("PE: ")));
+        assert_eq!(
+            phases.into_iter().collect::<BTreeSet<_>>().len(),
+            phases.len()
+        );
+    }
 
     #[test]
     fn loads_rustc_style_definition_exports_and_merges_command_line_exports() {

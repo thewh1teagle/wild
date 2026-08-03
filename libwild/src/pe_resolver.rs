@@ -131,6 +131,7 @@ impl<'data> ResolverSession<'data> {
         roots: &[Vec<u8>],
         runtime_resolution: &mut RuntimeResolution,
     ) -> Result<BTreeSet<Vec<u8>>> {
+        crate::timing_phase!(super::PE_PHASE_RESOLVE_ARCHIVES);
         self.symbol_state.add_roots(roots);
         for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
             self.symbol_state.absorb_object(object, index)?;
