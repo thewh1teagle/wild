@@ -117,10 +117,16 @@ const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
 
 #[path = "pe_entry.rs"]
 mod pe_entry;
+#[path = "pe_gc.rs"]
+mod pe_gc;
 #[path = "pe_imports.rs"]
 mod pe_imports;
+#[path = "pe_ir.rs"]
+mod pe_ir;
 #[path = "pe_resolver.rs"]
 mod pe_resolver;
+#[path = "pe_symbol_db.rs"]
+mod pe_symbol_db;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeWriterConfig {
