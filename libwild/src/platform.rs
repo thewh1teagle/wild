@@ -621,6 +621,16 @@ pub(crate) trait Platform:
         args: &Self::Args,
     );
 
+    /// Returns a lazy linker-defined symbol for an unresolved reference, if the platform defines
+    /// one with this name. Unlike the symbols created by `create_linker_defined_symbols`, these
+    /// symbols are only added to the link when an input actually references them.
+    fn unresolved_optional_linker_symbol<'data>(
+        _name: &'data [u8],
+        _output_kind: OutputKind,
+    ) -> Option<InternalSymDefInfo<'data, Self>> {
+        None
+    }
+
     fn built_in_section_infos<'data>()
     -> Vec<crate::output_section_id::SectionOutputInfo<'data, Self>>;
 

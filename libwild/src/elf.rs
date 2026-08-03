@@ -1449,6 +1449,20 @@ impl<C: ElfClass> platform::Platform for Elf<C> {
         });
     }
 
+    fn unresolved_optional_linker_symbol<'data>(
+        name: &'data [u8],
+        output_kind: OutputKind,
+    ) -> Option<InternalSymDefInfo<'data, Self>> {
+        // LLD provides this symbol lazily for final links when crtbegin does not define it. Its
+        // value identifies the DSO or executable, so the first loadable segment is the appropriate
+        // stable address. Partial links must preserve the reference for a later final link.
+        (name == b"__dso_handle" && !output_kind.is_partial_object()).then(|| {
+            let mut definition = InternalSymDefInfo::new(SymbolPlacement::LoadBaseAddress, name);
+            definition.hide();
+            definition
+        })
+    }
+
     fn built_in_section_infos<'data>()
     -> Vec<crate::output_section_id::SectionOutputInfo<'data, Elf<C>>> {
         Self::SECTION_DEFINITIONS
@@ -6731,5 +6745,50 @@ impl SinglePartSectionId {
 impl RegularSectionId {
     const fn output_section_id(self) -> OutputSectionId {
         OutputSectionId::from_u32(ELF_NUM_SINGLE_PART_SECTIONS).offset(self as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn optional_symbol(
+        name: &[u8],
+        output_kind: OutputKind,
+    ) -> Option<InternalSymDefInfo<'_, Elf64>> {
+        <Elf64 as Platform>::unresolved_optional_linker_symbol(name, output_kind)
+    }
+
+    #[test]
+    fn dso_handle_is_a_hidden_load_base_symbol_for_final_links() {
+        for output_kind in [
+            OutputKind::DynamicExecutable(RelocationModel::Relocatable),
+            OutputKind::SharedObject,
+            OutputKind::StaticExecutable(RelocationModel::NonRelocatable),
+            OutputKind::StaticExecutable(RelocationModel::Relocatable),
+        ] {
+            let definition = optional_symbol(b"__dso_handle", output_kind).unwrap();
+            assert!(matches!(
+                definition.placement,
+                SymbolPlacement::LoadBaseAddress
+            ));
+            assert!(platform::Symbol::is_hidden(&definition.symbol));
+        }
+    }
+
+    #[test]
+    fn dso_handle_is_not_defined_for_partial_links() {
+        assert!(optional_symbol(b"__dso_handle", OutputKind::Relocatable).is_none());
+    }
+
+    #[test]
+    fn unrelated_undefined_symbols_are_not_linker_defined() {
+        assert!(
+            optional_symbol(
+                b"some_undefined_symbol",
+                OutputKind::DynamicExecutable(RelocationModel::Relocatable),
+            )
+            .is_none()
+        );
     }
 }

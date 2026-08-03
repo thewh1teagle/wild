@@ -1058,13 +1058,21 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
             PreHashedSymbolName::Unversioned(pre_hashed) => {
                 match name_to_id.entry(pre_hashed) {
                     hashbrown::hash_map::Entry::Vacant(entry) => {
-                        let symbol_id = allocate_start_stop_symbol_id(
+                        let symbol_id = allocate_optional_linker_symbol_id(
                             pre_hashed,
                             symbol_db,
                             per_symbol_flags,
                             custom_start_stop_defs,
-                            output_sections,
-                        );
+                        )
+                        .or_else(|| {
+                            allocate_start_stop_symbol_id(
+                                pre_hashed,
+                                symbol_db,
+                                per_symbol_flags,
+                                custom_start_stop_defs,
+                                output_sections,
+                            )
+                        });
 
                         // We either make our undefined symbol dynamic, allowing the possibility
                         // that it might end up being defined at runtime, or we make it
@@ -1143,6 +1151,18 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
             }
         }
     }
+}
+
+fn allocate_optional_linker_symbol_id<'data, P: Platform>(
+    name: PreHashed<UnversionedSymbolName<'data>>,
+    symbol_db: &mut SymbolDb<'data, P>,
+    per_symbol_flags: &mut PerSymbolFlags,
+    synthetic_defs: &mut ResolvedSyntheticSymbols<'data, P>,
+) -> Option<SymbolId> {
+    let def_info = P::unresolved_optional_linker_symbol(name.bytes(), symbol_db.output_kind)?;
+    let symbol_id = symbol_db.add_synthetic_symbol(per_symbol_flags, name, synthetic_defs);
+    synthetic_defs.symbol_definitions.push(def_info);
+    Some(symbol_id)
 }
 
 fn allocate_start_stop_symbol_id<'data, P: Platform>(

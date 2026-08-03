@@ -5123,12 +5123,8 @@ fn write_internal_symbols<C: ElfClass>(
             address += RISCV_TLS_DTV_OFFSET;
         }
 
-        // PROVIDE_HIDDEN symbols should be local, not global
-        let st_bind = if platform::Symbol::is_hidden(&def_info.symbol) {
-            object::elf::STB_LOCAL
-        } else {
-            object::elf::STB_GLOBAL
-        };
+        let (st_bind, st_visibility) =
+            internal_symbol_binding_and_visibility::<elf::Elf<C>>(&def_info.symbol);
 
         let entry = symbol_writer
             .define_symbol(
@@ -5141,8 +5137,21 @@ fn write_internal_symbols<C: ElfClass>(
             .with_context(|| format!("Failed to write {}", layout.symbol_debug(symbol_id)))?;
 
         entry.set_binding_and_type(st_bind, st_type);
+        entry.set_visibility(st_visibility);
     }
     Ok(())
+}
+
+/// PROVIDE_HIDDEN and other hidden linker-defined symbols are local, but must retain STV_HIDDEN in
+/// the output as well. LLD relies on both properties for optional symbols such as `__dso_handle`.
+fn internal_symbol_binding_and_visibility<P: Platform>(
+    symbol: &P::SymtabEntry,
+) -> (object::elf::SymbolBind, object::elf::SymbolVisibility) {
+    if platform::Symbol::is_hidden(symbol) {
+        (object::elf::STB_LOCAL, object::elf::STV_HIDDEN)
+    } else {
+        (object::elf::STB_GLOBAL, object::elf::STV_DEFAULT)
+    }
 }
 
 fn write_eh_frame_hdr<C: ElfClass>(
@@ -6186,5 +6195,21 @@ fn fill_section_padding<C: ElfClass, A: Arch<Platform = elf::Elf<C>>>(
         }
     } else {
         A::fill_section_padding(padding, section_info.section_attributes.flags);
+    }
+}
+
+#[cfg(test)]
+mod internal_symbol_tests {
+    use super::*;
+    use crate::elf::Class64;
+    use crate::elf::SymtabEntry;
+
+    #[test]
+    fn hidden_internal_symbols_retain_hidden_output_visibility() {
+        let hidden = platform::Symbol::with_hidden(SymtabEntry::<Class64>::default(), true);
+        assert_eq!(
+            internal_symbol_binding_and_visibility::<elf::Elf64>(&hidden),
+            (object::elf::STB_LOCAL, object::elf::STV_HIDDEN)
+        );
     }
 }
