@@ -1501,10 +1501,9 @@ fn guard_metadata_policy(
 #[derive(Debug)]
 struct SelectedComdat {
     object: usize,
+    primary: object::SectionIndex,
     sections: Vec<object::SectionIndex>,
     selection: linker_utils::coff_symbols::ComdatSelection,
-    contents: Vec<u8>,
-    relocation_signature: Vec<u8>,
     timestamp: u32,
 }
 
@@ -1516,6 +1515,87 @@ fn coff_timestamp(file: &object::File<'_>) -> u32 {
     }
 }
 
+fn raw_comdat_sections<'data, Coff: object::read::coff::CoffHeader>(
+    file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
+) -> Result<HashMap<object::SectionIndex, Vec<object::SectionIndex>>> {
+    use object::read::coff::Symbol as _;
+
+    let symbols = file.coff_symbol_table();
+    let mut groups = HashMap::<object::SectionIndex, Vec<object::SectionIndex>>::new();
+    let mut associations = Vec::<(object::SectionIndex, object::SectionIndex)>::new();
+    let mut parent_by_child = HashMap::<object::SectionIndex, object::SectionIndex>::new();
+    for (index, symbol) in symbols.iter() {
+        if !symbol.has_aux_section() {
+            continue;
+        }
+        let aux = symbols
+            .aux_section(index)
+            .context("invalid COFF section-definition symbol")?;
+        if aux.selection == object::pe::ComdatSelection(0) {
+            continue;
+        }
+        let section = symbol
+            .section()
+            .context("COMDAT has an invalid section number")?;
+        if aux.selection == object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE {
+            let parent = u32::from(aux.number.get(object::LittleEndian))
+                | if Coff::is_type_bigobj() {
+                    u32::from(aux.high_number.get(object::LittleEndian)) << 16
+                } else {
+                    0
+                };
+            ensure!(parent != 0, "associative COMDAT has no parent section");
+            let parent = object::SectionIndex(parent as usize);
+            ensure!(
+                parent_by_child.insert(section, parent).is_none(),
+                "COMDAT section has multiple associative parents"
+            );
+            associations.push((section, parent));
+        } else {
+            groups.entry(section).or_insert_with(|| vec![section]);
+        }
+    }
+    // Associative groups may be nested. Resolve each child to the ultimate non-associative
+    // leader while retaining symbol-table order, matching object's iterator semantics.
+    for (child, mut parent) in associations.iter().copied() {
+        let mut depth = 0;
+        while let Some(next) = parent_by_child.get(&parent) {
+            parent = *next;
+            depth += 1;
+            ensure!(
+                depth <= associations.len(),
+                "cycle in associative COMDAT parent chain"
+            );
+        }
+        let sections = groups
+            .get_mut(&parent)
+            .context("associative COMDAT refers to a missing parent")?;
+        sections.push(child);
+    }
+    Ok(groups)
+}
+
+fn cached_comdat_sections(
+    file: &object::File<'_>,
+) -> Result<HashMap<object::SectionIndex, Vec<object::SectionIndex>>> {
+    match file {
+        object::File::Coff(file) => raw_comdat_sections(file),
+        object::File::CoffBig(file) => raw_comdat_sections(file),
+        _ => Ok(HashMap::new()),
+    }
+}
+
+fn section_is_comdat(file: &object::File<'_>, index: object::SectionIndex) -> bool {
+    file.section_by_index(index)
+        .ok()
+        .is_some_and(|section| match section.flags() {
+            SectionFlags::Coff { characteristics } => {
+                characteristics.0 & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0
+            }
+            _ => false,
+        })
+}
+
 fn discarded_comdat_sections(
     objects: &[crate::coff::CoffObject<'_>],
 ) -> Result<HashSet<(usize, object::SectionIndex)>> {
@@ -1524,26 +1604,15 @@ fn discarded_comdat_sections(
     use linker_utils::coff_symbols::ComdatSelection;
     use linker_utils::coff_symbols::select_comdat;
 
-    let comdat_sections = objects
-        .iter()
-        .enumerate()
-        .flat_map(|(object_index, input)| {
-            input.file().comdats().flat_map(move |comdat| {
-                comdat
-                    .sections()
-                    .map(move |section| (object_index, section))
-            })
-        })
-        .collect::<HashSet<_>>();
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
-    for (object_index, input) in objects.iter().enumerate() {
+    for input in objects {
         for symbol in input.file().symbols() {
             if !symbol.is_global() || !symbol.is_definition() {
                 continue;
             }
             if symbol
                 .section_index()
-                .is_some_and(|section| comdat_sections.contains(&(object_index, section)))
+                .is_some_and(|section| section_is_comdat(input.file(), section))
             {
                 continue;
             }
@@ -1555,37 +1624,36 @@ fn discarded_comdat_sections(
     let mut discarded = HashSet::new();
     for (object_index, input) in objects.iter().enumerate() {
         let timestamp = coff_timestamp(input.file());
+        let mut section_groups = cached_comdat_sections(input.file())?;
         for comdat in input.file().comdats() {
-            let name = comdat
-                .name_bytes()
-                .context("invalid COFF COMDAT name")?
-                .to_vec();
             let leader = input
                 .file()
                 .symbol_by_index(comdat.symbol())
                 .context("invalid COFF COMDAT leader")?;
+            let primary = leader
+                .section_index()
+                .context("COMDAT leader has no section")?;
             // A static COMDAT leader has object-local identity. Rust intentionally emits the
             // same local NODUPLICATES name in several codegen units; link.exe and lld-link keep
             // each instance because none participates in global symbol resolution.
             if !leader.is_global() {
+                section_groups.remove(&primary);
                 continue;
             }
-            // object includes the primary section and all associative children.
-            let sections = comdat.sections().collect::<Vec<_>>();
+            let name = comdat
+                .name_bytes()
+                .context("invalid COFF COMDAT name")?
+                .to_vec();
+            // Cache this mapping with one symbol-table pass. object's per-COMDAT iterator scans
+            // the complete symbol table to find associative children, which is quadratic for
+            // compiler output containing thousands of COMDATs.
+            let sections = section_groups
+                .remove(&primary)
+                .unwrap_or_else(|| vec![primary]);
             if strong_definitions.contains(&name) {
                 discarded.extend(sections.iter().map(|section| (object_index, *section)));
                 continue;
             }
-            let Some(primary) = sections.first().copied() else {
-                continue;
-            };
-            let section = input
-                .file()
-                .section_by_index(primary)
-                .context("invalid primary COMDAT section")?;
-            let contents = section.data().context("invalid COMDAT contents")?.to_vec();
-            let relocation_signature =
-                format!("{:?}", section.relocations().collect::<Vec<_>>()).into_bytes();
             let selection = match comdat.kind() {
                 object::read::ComdatKind::NoDuplicates => ComdatSelection::NoDuplicates,
                 object::read::ComdatKind::Any => ComdatSelection::Any,
@@ -1608,15 +1676,57 @@ fn discarded_comdat_sections(
                     existing.selection,
                     selection
                 );
+                // ANY is overwhelmingly common in compiler output. Do not read or clone COMDAT
+                // payloads (and especially do not format relocation tables) unless the selection
+                // policy actually compares them.
+                let (existing_contents, contents) = match selection {
+                    ComdatSelection::SameSize
+                    | ComdatSelection::ExactMatch
+                    | ComdatSelection::Largest => {
+                        let existing_section = objects[existing.object]
+                            .file()
+                            .section_by_index(existing.primary)
+                            .context("invalid selected primary COMDAT section")?;
+                        let section = input
+                            .file()
+                            .section_by_index(primary)
+                            .context("invalid primary COMDAT section")?;
+                        (
+                            existing_section
+                                .data()
+                                .context("invalid selected COMDAT contents")?,
+                            section.data().context("invalid COMDAT contents")?,
+                        )
+                    }
+                    _ => (&[][..], &[][..]),
+                };
+                let (existing_relocation_signature, relocation_signature) =
+                    if selection == ComdatSelection::ExactMatch {
+                        let existing_section = objects[existing.object]
+                            .file()
+                            .section_by_index(existing.primary)
+                            .context("invalid selected primary COMDAT section")?;
+                        let section = input
+                            .file()
+                            .section_by_index(primary)
+                            .context("invalid primary COMDAT section")?;
+                        (
+                            format!("{:?}", existing_section.relocations().collect::<Vec<_>>())
+                                .into_bytes(),
+                            format!("{:?}", section.relocations().collect::<Vec<_>>()).into_bytes(),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                 let decision = select_comdat(
                     selection,
                     ComdatCandidate {
-                        contents: &existing.contents,
-                        relocation_signature: &existing.relocation_signature,
+                        contents: existing_contents,
+                        relocation_signature: &existing_relocation_signature,
                         timestamp: existing.timestamp,
                     },
                     ComdatCandidate {
-                        contents: &contents,
+                        contents,
                         relocation_signature: &relocation_signature,
                         timestamp,
                     },
@@ -1642,10 +1752,9 @@ fn discarded_comdat_sections(
                             name,
                             SelectedComdat {
                                 object: object_index,
+                                primary,
                                 sections,
                                 selection,
-                                contents,
-                                relocation_signature,
                                 timestamp,
                             },
                         );
@@ -1656,15 +1765,18 @@ fn discarded_comdat_sections(
                     name,
                     SelectedComdat {
                         object: object_index,
+                        primary,
                         sections,
                         selection,
-                        contents,
-                        relocation_signature,
                         timestamp,
                     },
                 );
             }
         }
+        ensure!(
+            section_groups.is_empty(),
+            "COFF COMDAT section groups were not matched to leaders"
+        );
     }
     Ok(discarded)
 }
@@ -2683,6 +2795,62 @@ mod tests {
         bytes
     }
 
+    fn nested_associative_comdat_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let primary = object.add_subsection(object::write::StandardSection::Text, b"nested");
+        object.append_section_data(primary, b"primary", 1);
+        object.section_symbol(primary);
+        let symbol = object.add_symbol(Symbol {
+            name: b"nested".to_vec(),
+            value: 0,
+            size: 7,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(primary),
+            flags: object::SymbolFlags::None,
+        });
+        let child = object.add_subsection(object::write::StandardSection::ReadOnlyData, b"child");
+        object.append_section_data(child, b"child", 1);
+        object.section_symbol(child);
+        let grandchild =
+            object.add_subsection(object::write::StandardSection::ReadOnlyData, b"grandchild");
+        object.append_section_data(grandchild, b"grandchild", 1);
+        object.section_symbol(grandchild);
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol,
+            sections: vec![primary, child, grandchild],
+        });
+        let mut bytes = object.write().unwrap();
+
+        // object writes both children as direct associates. Point the grandchild at the child to
+        // exercise a valid nested associative chain.
+        let symbol_table = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let symbol_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let mut index = 0;
+        let mut associative_aux = Vec::new();
+        while index < symbol_count {
+            let symbol_offset = symbol_table + index * 18;
+            let aux_count = bytes[symbol_offset + 17] as usize;
+            if aux_count != 0 {
+                let aux_offset = symbol_offset + 18;
+                if bytes[aux_offset + 14] == object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0 {
+                    associative_aux.push(aux_offset);
+                }
+            }
+            index += 1 + aux_count;
+        }
+        assert_eq!(associative_aux.len(), 2);
+        bytes[associative_aux[1] + 12..associative_aux[1] + 14]
+            .copy_from_slice(&2_u16.to_le_bytes());
+        bytes
+    }
+
     fn single_member_archive(name: &[u8], data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
@@ -3135,6 +3303,18 @@ mod tests {
             let discarded = discarded_comdat_sections(&objects).unwrap();
             assert_eq!(discarded.len(), 2, "selection {kind:?}");
         }
+    }
+
+    #[test]
+    fn nested_associative_comdats_follow_the_ultimate_leader() {
+        let first = nested_associative_comdat_object();
+        let second = nested_associative_comdat_object();
+        let objects = [
+            crate::coff::CoffObject::parse(&first).unwrap(),
+            crate::coff::CoffObject::parse(&second).unwrap(),
+        ];
+
+        assert_eq!(discarded_comdat_sections(&objects).unwrap().len(), 3);
     }
 
     #[test]
