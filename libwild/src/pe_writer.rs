@@ -86,6 +86,11 @@ const PE_DETAIL_TLS_DIRECTORY: &str = "PE detail: Build TLS directory";
 const PE_DETAIL_WRITE_HEADERS: &str = "PE detail: Write PE headers";
 const PE_CHECKSUM_OFFSET: usize = 0x80 + 4 + 20 + 64;
 const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
+// Live contributions are generally small compiler-generated sections. Keep at least this many in
+// each import-reference task so Rayon scheduling and per-task set allocation don't dominate, while
+// still creating several tasks per worker to absorb relocation-count skew between sections.
+const LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK: usize = 64;
+const LIVE_IMPORT_CHUNKS_PER_THREAD: usize = 4;
 const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
@@ -2435,34 +2440,60 @@ fn live_import_references(
 ) -> Result<HashSet<Vec<u8>>> {
     let object_definitions = metadata.definition_names(objects)?;
     let weak_resolution = metadata.weak(objects)?;
-    let mut referenced = HashSet::new();
-    let mut retain = |name: &[u8]| -> Result<()> {
-        let is_selected = |candidate: &[u8]| {
-            object_definitions.contains(candidate) || import_definitions.contains(candidate)
-        };
-        let target = if is_selected(name) {
-            name
-        } else {
-            let weak_target = weak_resolution.resolve(name, is_selected)?;
-            if is_selected(weak_target) {
-                weak_target
-            } else {
-                let Ok(name) = std::str::from_utf8(name) else {
-                    return Ok(());
-                };
-                runtime_resolution
-                    .resolve_alternate_name(name, |candidate| is_selected(candidate.as_bytes()))?
-                    .as_bytes()
-            }
-        };
-        if import_definitions.contains(target) && !referenced.contains(target) {
-            referenced.insert(target.to_vec());
-        }
-        Ok(())
+    live_import_references_with_resolution(
+        objects,
+        contributions,
+        roots,
+        object_definitions,
+        import_definitions,
+        weak_resolution,
+        runtime_resolution,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_live_import_reference(
+    name: &[u8],
+    object_definitions: &HashSet<Vec<u8>>,
+    import_definitions: &HashSet<Vec<u8>>,
+    weak_resolution: &linker_utils::coff_runtime::WeakExternalResolution,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+    referenced: &mut HashSet<Vec<u8>>,
+) -> Result<()> {
+    let is_selected = |candidate: &[u8]| {
+        object_definitions.contains(candidate) || import_definitions.contains(candidate)
     };
-    for root in roots {
-        retain(root)?;
+    let target = if is_selected(name) {
+        name
+    } else {
+        let weak_target = weak_resolution.resolve(name, is_selected)?;
+        if is_selected(weak_target) {
+            weak_target
+        } else {
+            let Ok(name) = std::str::from_utf8(name) else {
+                return Ok(());
+            };
+            runtime_resolution
+                .resolve_alternate_name(name, |candidate| is_selected(candidate.as_bytes()))?
+                .as_bytes()
+        }
+    };
+    if import_definitions.contains(target) {
+        referenced.insert(target.to_vec());
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_live_import_references(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    object_definitions: &HashSet<Vec<u8>>,
+    import_definitions: &HashSet<Vec<u8>>,
+    weak_resolution: &linker_utils::coff_runtime::WeakExternalResolution,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashSet<Vec<u8>>> {
+    let mut referenced = HashSet::new();
     for contribution in contributions {
         let Source::Object { object, section } = contribution.source else {
             continue;
@@ -2480,9 +2511,80 @@ fn live_import_references(
                 .symbol_by_index(symbol)
                 .context("live relocation has an invalid symbol")?;
             if symbol.is_global() && symbol.section_index().is_none() {
-                retain(symbol.name_bytes()?)?;
+                retain_live_import_reference(
+                    symbol.name_bytes()?,
+                    object_definitions,
+                    import_definitions,
+                    weak_resolution,
+                    runtime_resolution,
+                    &mut referenced,
+                )?;
             }
         }
+    }
+    Ok(referenced)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_import_references_with_resolution(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    roots: &[Vec<u8>],
+    object_definitions: &HashSet<Vec<u8>>,
+    import_definitions: &HashSet<Vec<u8>>,
+    weak_resolution: &linker_utils::coff_runtime::WeakExternalResolution,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashSet<Vec<u8>>> {
+    // Roots are few, already ordered and independent of contribution work. Keep their processing
+    // serial so fallback-cycle diagnostics retain their established order.
+    let mut referenced = HashSet::new();
+    for root in roots {
+        retain_live_import_reference(
+            root,
+            object_definitions,
+            import_definitions,
+            weak_resolution,
+            runtime_resolution,
+            &mut referenced,
+        )?;
+    }
+
+    let thread_count = rayon::current_num_threads();
+    if thread_count == 1 || contributions.len() <= LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK {
+        referenced.extend(collect_live_import_references(
+            objects,
+            contributions,
+            object_definitions,
+            import_definitions,
+            weak_resolution,
+            runtime_resolution,
+        )?);
+        return Ok(referenced);
+    }
+
+    let target_chunks = thread_count.saturating_mul(LIVE_IMPORT_CHUNKS_PER_THREAD);
+    let chunk_size = contributions
+        .len()
+        .div_ceil(target_chunks)
+        .max(LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK);
+    // `par_chunks` is indexed. Each chunk preserves contribution and relocation order, and the
+    // collected slots are unwrapped serially below. Thus malformed-input diagnostics still select
+    // the first contribution-order error even though successful chunks run concurrently.
+    let chunk_results = contributions
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            collect_live_import_references(
+                objects,
+                chunk,
+                object_definitions,
+                import_definitions,
+                weak_resolution,
+                runtime_resolution,
+            )
+        })
+        .collect::<Vec<_>>();
+    for chunk in chunk_results {
+        referenced.extend(chunk?);
     }
     Ok(referenced)
 }
@@ -4640,6 +4742,25 @@ mod tests {
         }
     }
 
+    fn object_test_contribution(
+        id: u32,
+        object: usize,
+        section: object::SectionIndex,
+    ) -> Contribution {
+        Contribution {
+            source: Source::Object { object, section },
+            spec: SectionContribution {
+                id: ContributionId(id),
+                name: b".text".to_vec(),
+                characteristics: text_characteristics(),
+                alignment: 1,
+                size: 5,
+                kind: ContributionKind::Data,
+            },
+            data: vec![0; 5],
+        }
+    }
+
     #[test]
     fn relocation_layout_inserts_reloc_without_a_full_relayout() {
         let config = PeWriterConfig::default();
@@ -6001,6 +6122,107 @@ mod tests {
         };
 
         assert_eq!(run(4), run(1));
+    }
+
+    #[test]
+    fn parallel_live_import_references_match_single_thread() {
+        let direct = relocation_object(b"direct_source", b"direct_import");
+        let indirect = relocation_object(b"indirect_source", b"__imp_indirect_import");
+        let weak = relocation_object(b"weak_source", b"weak_alias");
+        let alternate = relocation_object(b"alternate_source", b"alternate_alias");
+        let dead = relocation_object(b"dead_source", b"dead_import");
+        let objects = [
+            crate::coff::CoffObject::parse(&direct).unwrap(),
+            crate::coff::CoffObject::parse(&indirect).unwrap(),
+            crate::coff::CoffObject::parse(&weak).unwrap(),
+            crate::coff::CoffObject::parse(&alternate).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let sections = objects
+            .iter()
+            .map(|object| object.file().section_by_name(".text").unwrap().index())
+            .collect::<Vec<_>>();
+
+        // Repeat live contributions enough times to cross the adaptive minimum chunk size at
+        // every tested parallel width. The dead object's section is deliberately not present,
+        // matching the production contract that this scan receives post-/OPT:REF contributions.
+        let mut contributions = Vec::new();
+        for _ in 0..80 {
+            for (object, &section) in sections.iter().take(4).enumerate() {
+                contributions.push(object_test_contribution(
+                    contributions.len() as u32,
+                    object,
+                    section,
+                ));
+            }
+        }
+        contributions.push(synthetic_test_contribution(
+            contributions.len() as u32,
+            b".synthetic",
+            1,
+        ));
+
+        let metadata = SelectedObjectMetadata::new(&objects);
+        let object_definitions = metadata.definition_names(&objects).unwrap();
+        let import_definitions = [
+            b"direct_import".to_vec(),
+            b"__imp_indirect_import".to_vec(),
+            b"weak_import".to_vec(),
+            b"alternate_import".to_vec(),
+            b"root_import".to_vec(),
+            b"dead_import".to_vec(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let mut weak_resolution = linker_utils::coff_runtime::WeakExternalResolution::default();
+        weak_resolution
+            .apply(
+                linker_utils::coff_runtime::WeakExternalRecord {
+                    symbol: b"weak_alias",
+                    target: b"weak_import",
+                    search: linker_utils::coff_symbols::WeakSearch::Alias,
+                },
+                "weak.obj",
+            )
+            .unwrap();
+        let mut runtime_resolution = linker_utils::coff_runtime::RuntimeResolution::new();
+        runtime_resolution
+            .parse_and_apply(
+                "/alternatename:alternate_alias=alternate_import",
+                "alternate.obj",
+            )
+            .unwrap();
+        let roots = [b"root_import".to_vec()];
+        let expected = [
+            b"direct_import".to_vec(),
+            b"__imp_indirect_import".to_vec(),
+            b"weak_import".to_vec(),
+            b"alternate_import".to_vec(),
+            b"root_import".to_vec(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+        for threads in [1, 2, 4, 10] {
+            let actual = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    live_import_references_with_resolution(
+                        &objects,
+                        &contributions,
+                        &roots,
+                        object_definitions,
+                        &import_definitions,
+                        &weak_resolution,
+                        &runtime_resolution,
+                    )
+                    .unwrap()
+                });
+            assert_eq!(actual, expected, "thread count {threads}");
+            assert!(!actual.contains(b"dead_import".as_slice()));
+        }
     }
 
     #[test]
