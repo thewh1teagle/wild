@@ -217,7 +217,7 @@ pub(crate) fn link<F: FileSystem>(
         prepare_manifest(fs, args, &selected.directives, &mut resources)?;
     }
     let objects = selected.objects;
-    let archive_bytes = selected.archive_bytes;
+    let selected_imports = selected.selected_imports;
     let entry_name = selected.entry_name;
     let exports = selected.exports;
     let archive_definitions = selected.archive_definitions;
@@ -244,7 +244,7 @@ pub(crate) fn link<F: FileSystem>(
             &archive_definitions,
             &runtime_resolution,
         )?;
-        pe_imports::select_from_libraries(&archive_bytes, &undefined)?
+        pe_imports::select_from_records(&selected_imports, &undefined)
     };
     let dll_name = if let Some(name) = definition.module_name.as_deref() {
         name
@@ -541,7 +541,9 @@ fn directive_exports(
 struct SelectedInputs<'data> {
     objects: Vec<crate::coff::CoffObject<'data>>,
     resources: Vec<ResourceRecord>,
+    #[cfg(test)]
     archive_bytes: Vec<&'data [u8]>,
+    selected_imports: Vec<linker_utils::coff_imports::ShortImportObject<'data>>,
     entry_name: Option<String>,
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
@@ -678,10 +680,13 @@ impl<'data> OpenSelection<'data> {
     fn finish(self) -> SelectedInputs<'data> {
         #[cfg(test)]
         let resolver_object_scans = self.resolver.object_scan_count();
+        let selected_imports = self.resolver.selected_imports().to_vec();
         SelectedInputs {
             objects: self.objects,
             resources: self.resources,
+            #[cfg(test)]
             archive_bytes: self.archive_bytes,
+            selected_imports,
             entry_name: self.entry_name,
             exports: self.exports,
             roots: self.roots,

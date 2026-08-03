@@ -7,6 +7,7 @@ use crate::error::Context;
 use crate::error::Result;
 use linker_utils::coff_archives::CoffArchive;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
+use linker_utils::coff_imports::ShortImportObject;
 use linker_utils::coff_runtime::RuntimeResolution;
 use linker_utils::coff_runtime::WeakExternalResolution;
 use linker_utils::coff_runtime::parse_legacy_alias_object;
@@ -131,6 +132,7 @@ pub(super) struct ResolverSession<'data> {
     whole_archive: Vec<bool>,
     extracted: HashSet<(usize, usize)>,
     import_definitions: BTreeSet<Vec<u8>>,
+    selected_imports: Vec<ShortImportObject<'data>>,
     symbol_state: IncrementalSymbolState,
     scanned_objects: usize,
     selected_aliases: Vec<(usize, usize)>,
@@ -143,6 +145,7 @@ impl<'data> ResolverSession<'data> {
             whole_archive: Vec::new(),
             extracted: HashSet::new(),
             import_definitions: BTreeSet::new(),
+            selected_imports: Vec::new(),
             symbol_state: IncrementalSymbolState::new(),
             scanned_objects: 0,
             selected_aliases: Vec::new(),
@@ -176,6 +179,10 @@ impl<'data> ResolverSession<'data> {
 
     pub(super) fn define_linker_symbol(&mut self, name: &[u8]) {
         self.symbol_state.define(name);
+    }
+
+    pub(super) fn selected_imports(&self) -> &[ShortImportObject<'data>] {
+        &self.selected_imports
     }
 
     pub(super) fn resolve(
@@ -213,6 +220,7 @@ impl<'data> ResolverSession<'data> {
                 runtime_resolution,
                 &mut self.extracted,
                 &mut self.import_definitions,
+                &mut self.selected_imports,
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
                 false,
@@ -228,6 +236,7 @@ impl<'data> ResolverSession<'data> {
                 runtime_resolution,
                 &mut self.extracted,
                 &mut self.import_definitions,
+                &mut self.selected_imports,
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
                 true,
@@ -270,6 +279,7 @@ fn extract_pass<'data>(
     runtime_resolution: &mut RuntimeResolution,
     extracted: &mut HashSet<(usize, usize)>,
     import_definitions: &mut BTreeSet<Vec<u8>>,
+    selected_imports: &mut Vec<ShortImportObject<'data>>,
     symbol_state: &mut IncrementalSymbolState,
     selected_aliases: &mut Vec<(usize, usize)>,
     use_alternates: bool,
@@ -342,7 +352,7 @@ fn extract_pass<'data>(
                     objects.push(object);
                     changed = true;
                 }
-                CoffArchiveMemberKind::ShortImport(_) => {
+                CoffArchiveMemberKind::ShortImport(import) => {
                     // The PE import builder consumes selected import symbols from
                     // the original archive. Do not parse these as ordinary objects, but do
                     // retain their definitions for subsequent archive decisions.
@@ -352,6 +362,7 @@ fn extract_pass<'data>(
                             changed = true;
                         }
                     }
+                    selected_imports.push(import);
                 }
                 CoffArchiveMemberKind::Opaque => {
                     if let Some(aliases) = parse_legacy_alias_object(member.data())
@@ -519,6 +530,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(objects.len(), 1, "the fallback definition was extracted");
+    }
+
+    #[test]
+    fn selected_short_import_records_preserve_archive_precedence_and_order() {
+        let root = coff_object(&[], &["foo", "bar"]);
+        let first = archive(&[
+            ("foo.obj", short_import("foo", "first.dll")),
+            ("bar.obj", short_import("bar", "first.dll")),
+        ]);
+        let duplicate = archive(&[("foo.obj", short_import("foo", "second.dll"))]);
+        let mut session = ResolverSession::new();
+        session.add_archive(&first, false).unwrap();
+        session.add_archive(&duplicate, false).unwrap();
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+
+        session
+            .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+            .unwrap();
+
+        let imports = session.selected_imports();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].symbol(), b"bar");
+        assert_eq!(imports[1].symbol(), b"foo");
+        assert!(imports.iter().all(|import| import.dll() == b"first.dll"));
+    }
+
+    #[test]
+    fn malformed_whole_archive_import_retains_member_diagnostic() {
+        let malformed = archive(&[("broken.obj", vec![0, 0, 0xff, 0xff])]);
+        let mut session = ResolverSession::new();
+        session.add_archive(&malformed, true).unwrap();
+
+        let error = session
+            .resolve(&mut Vec::new(), &[], &mut RuntimeResolution::new())
+            .unwrap_err();
+        let message = format!("{error:?}");
+        assert!(message.contains("broken.obj"), "{message}");
+        assert!(
+            message.contains("unsupported selected COFF archive member"),
+            "{message}"
+        );
     }
 
     #[test]
