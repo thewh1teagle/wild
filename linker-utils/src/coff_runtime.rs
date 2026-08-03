@@ -5,6 +5,7 @@
 //! sections and exposes deterministic queries that a PE linker can integrate
 //! into its own archive-extraction loop.
 
+use object::FileKind;
 use object::LittleEndian as LE;
 use object::pe;
 use object::read::coff::CoffHeader as _;
@@ -37,6 +38,88 @@ impl fmt::Display for CoffRuntimeError {
 impl Error for CoffRuntimeError {}
 
 pub type Result<T> = std::result::Result<T, CoffRuntimeError>;
+
+/// One weak-external fallback encoded in an ordinary COFF object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WeakExternalRecord<'data> {
+    pub symbol: &'data [u8],
+    pub target: &'data [u8],
+    pub search: crate::coff_symbols::WeakSearch,
+}
+
+/// Parses weak-external auxiliary records from standard or bigobj COFF.
+pub fn parse_weak_externals(data: &[u8]) -> Result<Vec<WeakExternalRecord<'_>>> {
+    match FileKind::parse(data) {
+        Ok(FileKind::Coff) => parse_weak_externals_as::<pe::ImageFileHeader>(data),
+        Ok(FileKind::CoffBig) => parse_weak_externals_as::<pe::AnonObjectHeaderBigobj>(data),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_weak_externals_as<Coff: object::read::coff::CoffHeader>(
+    data: &[u8],
+) -> Result<Vec<WeakExternalRecord<'_>>> {
+    let file = object::read::coff::CoffFile::<_, Coff>::parse(data)
+        .map_err(|error| CoffRuntimeError::new(format!("malformed COFF object: {error}")))?;
+    let table = file.coff_symbol_table();
+    let strings = table.strings();
+    let mut records = Vec::new();
+    for (index, symbol) in table.iter() {
+        if !symbol.has_aux_weak_external() {
+            continue;
+        }
+        let auxiliary = table.aux_weak_external(index).map_err(|error| {
+            CoffRuntimeError::new(format!("invalid weak-external auxiliary record: {error}"))
+        })?;
+        let target = table
+            .symbol(object::SymbolIndex(
+                usize::try_from(auxiliary.weak_default_sym_index.get(LE)).map_err(|_| {
+                    CoffRuntimeError::new("weak-external target index exceeds usize")
+                })?,
+            ))
+            .map_err(|error| {
+                CoffRuntimeError::new(format!("invalid weak-external target index: {error}"))
+            })?;
+        let search = match auxiliary.weak_search_type.get(LE) {
+            value if value == pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY => {
+                crate::coff_symbols::WeakSearch::NoLibrary
+            }
+            value if value == pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY => {
+                crate::coff_symbols::WeakSearch::Library
+            }
+            value if value == pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS => {
+                crate::coff_symbols::WeakSearch::Alias
+            }
+            value if value == pe::IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY => {
+                crate::coff_symbols::WeakSearch::AntiDependency
+            }
+            value => {
+                return Err(CoffRuntimeError::new(format!(
+                    "unsupported weak-external search characteristic {}",
+                    value.0
+                )));
+            }
+        };
+        let symbol = symbol
+            .name(strings)
+            .map_err(|error| CoffRuntimeError::new(format!("invalid weak symbol name: {error}")))?;
+        let target = target.name(strings).map_err(|error| {
+            CoffRuntimeError::new(format!("invalid weak fallback name: {error}"))
+        })?;
+        if symbol.is_empty() || target.is_empty() || symbol == target {
+            return Err(CoffRuntimeError::new(
+                "weak external has an empty or self-referential fallback",
+            ));
+        }
+        records.push(WeakExternalRecord {
+            symbol,
+            target,
+            search,
+        });
+    }
+    records.sort_unstable_by(|left, right| left.symbol.cmp(right.symbol));
+    Ok(records)
+}
 
 /// One weak alias encoded in a legacy MSVC `Machine=UNKNOWN` object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +386,99 @@ pub struct RuntimeResolution {
     alternate_names: BTreeMap<String, DirectiveValue>,
     mismatches: BTreeMap<String, DirectiveValue>,
     include_roots: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WeakDirectiveValue {
+    target: Vec<u8>,
+    search: crate::coff_symbols::WeakSearch,
+    source: String,
+}
+
+/// Accumulated weak-external fallback policy from selected COFF objects.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WeakExternalResolution {
+    fallbacks: BTreeMap<Vec<u8>, WeakDirectiveValue>,
+}
+
+impl WeakExternalResolution {
+    pub fn apply(&mut self, record: WeakExternalRecord<'_>, source: &str) -> Result<()> {
+        if let Some(existing) = self.fallbacks.get(record.symbol) {
+            if existing.target == record.target && existing.search == record.search {
+                return Ok(());
+            }
+            // ARM64EC anti-dependencies are compiler-generated hints. Like lld,
+            // ignore a duplicate incoming hint and let a real weak fallback
+            // replace an earlier hint.
+            if record.search == crate::coff_symbols::WeakSearch::AntiDependency {
+                return Ok(());
+            }
+            if existing.search != crate::coff_symbols::WeakSearch::AntiDependency {
+                return Err(CoffRuntimeError::new(format!(
+                    "conflicting weak external for `{}`: `{}` from `{}` versus `{}` from `{source}`",
+                    String::from_utf8_lossy(record.symbol),
+                    String::from_utf8_lossy(&existing.target),
+                    existing.source,
+                    String::from_utf8_lossy(record.target),
+                )));
+            }
+        }
+        self.fallbacks.insert(
+            record.symbol.to_vec(),
+            WeakDirectiveValue {
+                target: record.target.to_vec(),
+                search: record.search,
+                source: source.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn records(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&[u8], &[u8], crate::coff_symbols::WeakSearch)> {
+        self.fallbacks
+            .iter()
+            .map(|(symbol, value)| (symbol.as_slice(), value.target.as_slice(), value.search))
+    }
+
+    /// Resolves a fallback chain while allowing a selected strong definition
+    /// to stop the chain at every name.
+    pub fn resolve<'a>(
+        &'a self,
+        symbol: &'a [u8],
+        mut is_defined: impl FnMut(&[u8]) -> bool,
+    ) -> Result<&'a [u8]> {
+        let mut current = symbol;
+        let mut path = Vec::new();
+        let mut positions = BTreeMap::new();
+        loop {
+            if is_defined(current) {
+                return Ok(current);
+            }
+            let Some(value) = self.fallbacks.get(current) else {
+                return Ok(current);
+            };
+            if let Some(&start) = positions.get(current) {
+                let cycle = path[start..]
+                    .iter()
+                    .map(|name: &&[u8]| String::from_utf8_lossy(name))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                return Err(CoffRuntimeError::new(format!(
+                    "weak-external cycle: {cycle} -> {}",
+                    String::from_utf8_lossy(current)
+                )));
+            }
+            positions.insert(current, path.len());
+            path.push(current);
+            current = &value.target;
+            if value.search == crate::coff_symbols::WeakSearch::AntiDependency {
+                return Ok(current);
+            }
+        }
+    }
 }
 
 impl RuntimeResolution {
@@ -631,6 +807,124 @@ mod tests {
                 target: "target".into(),
             }]
         );
+    }
+
+    #[test]
+    fn parses_all_ordinary_weak_external_search_policies() {
+        for (raw, expected) in [
+            (
+                pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY.0,
+                crate::coff_symbols::WeakSearch::NoLibrary,
+            ),
+            (
+                pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY.0,
+                crate::coff_symbols::WeakSearch::Library,
+            ),
+            (
+                pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS.0,
+                crate::coff_symbols::WeakSearch::Alias,
+            ),
+            (
+                pe::IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY.0,
+                crate::coff_symbols::WeakSearch::AntiDependency,
+            ),
+        ] {
+            let mut data = legacy_alias_object(raw);
+            data[0..2].copy_from_slice(&pe::IMAGE_FILE_MACHINE_AMD64.0.to_le_bytes());
+            assert_eq!(
+                parse_weak_externals(&data).unwrap(),
+                [WeakExternalRecord {
+                    symbol: b"alias",
+                    target: b"target",
+                    search: expected,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn weak_resolution_obeys_strong_precedence_chains_and_cycles() {
+        let mut state = WeakExternalResolution::default();
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"a",
+                    target: b"b",
+                    search: crate::coff_symbols::WeakSearch::NoLibrary,
+                },
+                "one.obj",
+            )
+            .unwrap();
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"b",
+                    target: b"c",
+                    search: crate::coff_symbols::WeakSearch::Alias,
+                },
+                "two.obj",
+            )
+            .unwrap();
+
+        assert_eq!(state.resolve(b"a", |name| name == b"b").unwrap(), b"b");
+        assert_eq!(state.resolve(b"a", |name| name == b"c").unwrap(), b"c");
+        assert_eq!(state.resolve(b"a", |_| false).unwrap(), b"c");
+
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"c",
+                    target: b"a",
+                    search: crate::coff_symbols::WeakSearch::Alias,
+                },
+                "three.obj",
+            )
+            .unwrap();
+        assert!(
+            state
+                .resolve(b"a", |_| false)
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn anti_dependencies_do_not_chain_and_incoming_duplicates_are_ignored() {
+        let mut state = WeakExternalResolution::default();
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"a",
+                    target: b"b",
+                    search: crate::coff_symbols::WeakSearch::AntiDependency,
+                },
+                "anti.obj",
+            )
+            .unwrap();
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"b",
+                    target: b"c",
+                    search: crate::coff_symbols::WeakSearch::Alias,
+                },
+                "alias.obj",
+            )
+            .unwrap();
+        assert_eq!(state.resolve(b"a", |_| false).unwrap(), b"b");
+
+        state
+            .apply(
+                WeakExternalRecord {
+                    symbol: b"b",
+                    target: b"ignored",
+                    search: crate::coff_symbols::WeakSearch::AntiDependency,
+                },
+                "duplicate.obj",
+            )
+            .unwrap();
+        assert_eq!(state.resolve(b"b", |_| false).unwrap(), b"c");
     }
 
     #[test]
