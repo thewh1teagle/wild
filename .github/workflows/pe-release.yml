@@ -1,0 +1,59 @@
+# Lean release workflow for this fork's PE/COFF-enabled builds.
+# Deliberately separate from release.yml (upstream's full multi-platform matrix is slow).
+# Trigger by pushing a tag like `pe-v0.1.0`, or manually via workflow_dispatch.
+on:
+  push:
+    tags:
+      - 'pe-v*'
+  workflow_dispatch:
+
+name: PE Release
+
+permissions:
+  contents: write
+
+env:
+  IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
+  VERSION_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('test-{0}', github.run_number) }}
+
+jobs:
+  release:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, runs-on: ubuntu-22.04, bin: wild}
+          - {target: aarch64-unknown-linux-gnu, runs-on: ubuntu-22.04-arm, bin: wild}
+          - {target: x86_64-pc-windows-msvc, runs-on: windows-latest, bin: wild.exe}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --features pe --profile dist --target ${{ matrix.target }} -p wild-linker
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          n="wild-linker-${VERSION_TAG}-${{ matrix.target }}"
+          mkdir "$n"
+          cp "target/${{ matrix.target }}/dist/${{ matrix.bin }}" "$n"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$n"
+          tar zcf "$n.tar.gz" "$n"
+
+      - name: Release
+        if: env.IS_RELEASE == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            wild-linker-*.tar.gz
