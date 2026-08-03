@@ -18,6 +18,7 @@ use object::read::archive::ArchiveFile;
 use object::read::archive::ArchiveKind;
 use object::read::coff::CoffHeader;
 use object::read::coff::Symbol as _;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
@@ -224,6 +225,7 @@ impl<'archive, 'data> CoffArchivePlan<'archive, 'data> {
 #[derive(Clone, Debug)]
 pub struct CoffArchive<'data> {
     members: Vec<CoffArchiveMember<'data>>,
+    definition_members: HashMap<Vec<u8>, Vec<usize>>,
 }
 
 impl<'data> CoffArchive<'data> {
@@ -295,6 +297,11 @@ impl<'data> CoffArchive<'data> {
             });
         }
 
+        let member_indices_by_range = members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.file_range, index))
+            .collect::<HashMap<_, _>>();
         if let Some(symbols) = archive.symbols().map_err(|error| {
             CoffArchiveError::archive(
                 CoffArchiveErrorKind::InvalidSymbolIndex,
@@ -315,18 +322,31 @@ impl<'data> CoffArchive<'data> {
                     )
                 })?;
                 let range = indexed_member.file_range();
-                let Some(member) = members.iter_mut().find(|member| member.file_range == range)
-                else {
+                let Some(member_index) = member_indices_by_range.get(&range).copied() else {
                     return Err(CoffArchiveError::archive(
                         CoffArchiveErrorKind::InvalidSymbolIndex,
                         "archive symbol points outside the ordinary member list",
                     ));
                 };
+                let member = &mut members[member_index];
                 add_unique(&mut member.definitions, symbol.name());
             }
         }
 
-        Ok(Self { members })
+        let mut definition_members = HashMap::<Vec<u8>, Vec<usize>>::new();
+        for member in &members {
+            for definition in &member.definitions {
+                definition_members
+                    .entry(definition.clone())
+                    .or_default()
+                    .push(member.index);
+            }
+        }
+
+        Ok(Self {
+            members,
+            definition_members,
+        })
     }
 
     #[must_use]
@@ -368,12 +388,12 @@ impl<'data> CoffArchive<'data> {
         } else {
             loop {
                 let candidate = unresolved.iter().find_map(|demand| {
-                    self.members
-                        .iter()
-                        .find(|member| {
-                            !was_selected[member.index]
-                                && contains_name(&member.definitions, demand.name())
+                    self.definition_members
+                        .get(demand.name())
+                        .and_then(|indices| {
+                            indices.iter().copied().find(|index| !was_selected[*index])
                         })
+                        .map(|index| &self.members[index])
                         .map(|member| (member, demand.clone()))
                 });
                 let Some((member, trigger)) = candidate else {
