@@ -1,6 +1,7 @@
-# PE/COFF v1 session handoff
+# PE/COFF goals 1 and 2 session handoff
 
-Last updated: 2026-08-03 after Goal 1 closeout. This is the continuity document
+Last updated: 2026-08-03 at the current Goal 2 checkpoint. This is the
+continuity document
 for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
@@ -17,8 +18,11 @@ execute it on real Windows in GitHub Actions, compile a minimal Tauri app in deb
 release, then compile and run the real Vibe application in both profiles.
 
 The work is in the user's fork only. Do **not** open a PR. Goal 1 is complete at
-`547c72f309dc8dd73e5a43166e183491138395e7`; the exact native closeout evidence
-is recorded in `quality-gate.md`. Goal 2 starts next on a new branch.
+`547c72f309dc8dd73e5a43166e183491138395e7`. Goal 2 remains in progress; its
+current performance checkpoint is
+`8dd69ea6b4adba060782cafbba33bd57b44dee4d`. Exact correctness and interim
+performance evidence is recorded in `quality-gate.md` and
+`pe-link-bench_001.md`.
 
 Current headline results:
 
@@ -31,26 +35,35 @@ Current headline results:
   Wild: it panics after the sidecar returns. A paired `lld-link` build reproduces it.
 - Wild output is deterministic across identical Wild links. Wild and `lld-link` output
   is semantically equivalent for the acceptance corpus but is **not byte identical**.
-- The current PE implementation is not yet faster: the captured complete Rust
-  compile/link probe was about `0.98 s` with Wild versus `0.18 s` with `lld-link`
-  (roughly 5.5x slower). This probe is a correctness budget, not a speed claim.
+- Goal 2 reduced the pinned Vibe release link from the original 617–652 ms
+  warm range to 138–180 ms across 1/2/4/8/10 threads. An independent 30-pair
+  confirmation has Wild faster than `lld-link` at 8 threads (138.2 vs
+  146.2 ms) and 10 threads (138.8 vs 156.3 ms). Lower-thread Vibe results still
+  favor lld.
+- The Rust-std link-only reproduction favors Wild at every measured warm
+  1/4/8/10-thread point and advisory-cold 4/8/10. Advisory-cold one-thread
+  Rust std remains slower. Advisory cold is not a global cold-cache claim.
+- Goal 2 is not complete: best-vs-best Vibe remains about 138 versus 103 ms
+  warm and 244 versus 212 ms advisory-cold. The checkpoint used
+  `min_seconds=0` and no CPU affinity on heterogeneous cores, so it must also
+  be rerun with the documented five-second floor and homogeneous pinning.
 
 ## Repository and branch state
 
-- Workspace: `/Users/yqbqwlny/Documents/wild`
+- Workspace: `/home/yakov/Documents/wild`
 - Fork/`origin`: `https://github.com/thewh1teagle/wild`
 - Upstream: `https://github.com/wild-linker/wild.git`
-- Branch: `feature/pe-coff-v1`
+- Branch: `feature/pe-coff-performance`
 - Goal 1 closeout tip: `547c72f309dc8dd73e5a43166e183491138395e7`
-- Remote tracking: `origin/feature/pe-coff-v1`
+- Remote tracking: `origin/feature/pe-coff-performance`
 - Base `main` at the start/current local main: `8e106f2d`
 - Goal 1 feature range: `9e698d9c..547c72f3`.
+- Goal 2 feature range: `65185605..8dd69ea6`.
 - No PR has been opened and none should be opened without an explicit new request.
 - The fork's default branch is `main`. It was temporarily changed to
   `feature/pe-coff-v1` so GitHub could register and dispatch branch-only workflows,
   then restored after the final paired run completed.
-- `AGENTS.md` at the repository root is an untracked, user-owned file. Preserve it;
-  never add, modify, delete, clean, or commit it.
+- Preserve `AGENTS.md`; do not modify it as part of linker work.
 
 Important milestone commits:
 
@@ -73,10 +86,16 @@ Important milestone commits:
 - `547c72f3`: closes Goal 1 with option compatibility, real `/OPT:REF`, delay
   imports and unwind records, stability/fuzz coverage, ordinal/forwarder and
   malformed-image fixtures, and manifest embedding.
+- `65185605`: adds the reproducible link-only benchmark harness.
+- `1c7b0c26` and `2ea4ee1a`: add phase instrumentation used to select work.
+- `ff0b4f34..bc33fb6b`: integrate measured archive, resolution, COMDAT,
+  relocation, layout, hashing, lookup, parallelism, and allocator wins.
+- `8dd69ea6`: caches selected-object symbol metadata and is the current
+  benchmarked Goal 2 checkpoint.
 
-Use `git log --oneline --reverse main..feature/pe-coff-v1` for the complete detailed
-commit history. Many old `codex/*` worktree branches still exist; they are historical
-implementation branches, not the integration target.
+Use `git log --oneline --reverse main..feature/pe-coff-performance` for the
+complete detailed commit history. Many old `codex/*` and `perf/*` worktree
+branches are historical experiments, not the integration target.
 
 ## Scope and success definition
 
@@ -403,12 +422,9 @@ Recommended order:
    evidence. The fork default branch has already been restored to `main`.
 2. Preserve the existing correctness gates. Add malformed-image/negative tests when
    touching loader directories; keep real-Windows execution authoritative.
-3. Profile the PE implementation before optimizing. Current evidence says Wild PE is
-   slower than lld. Likely targets are repeated archive/symbol work, allocations and
-   copies in the writer, COMDAT selection, section-data construction, and unused
-   parallelism. Wild's long-term speed advantage should come from its architecture:
-   purpose-built data structures, parallel resolution/layout, low synchronization,
-   batched I/O, and direct output construction—not from skipping validation.
+3. Preserve Goal 2's benchmark protocol and rerun it when changing archive,
+   symbol, layout, relocation, allocation, or parallel behavior. Do not widen
+   the bounded Vibe and Rust-std claims without new evidence.
 4. Add real PDB emission and debugger validation. This is a substantial feature, not
    merely accepting `/PDB`.
 5. Add LTO interoperability (`/LTCG`) with explicit ownership of who runs the codegen
@@ -420,8 +436,8 @@ Recommended order:
 7. Expand compatibility across Windows SDK/MSVC versions, more real applications,
    sanitizers/security metadata, delay-loaded DLL use, unusual `.def` inputs, and
    negative loader cases.
-8. Benchmark warm/cold, debug/release, Rust/C++/Tauri, peak RSS, and scaling by thread
-   count against both `lld-link` and `link.exe`. Only then claim speed.
+8. Broaden the benchmark matrix to C++, Tauri, debug links, `link.exe`, and a
+   controlled true-cold environment before making claims about those cases.
 9. For parity with Linux Wild, continue with production hardening, diagnostics, feature
    breadth, memory/performance work, fuzzing, and sustained real-world use. PDB + LTO +
    incremental support would improve usability greatly but would not alone equal the
@@ -446,17 +462,17 @@ done
 
 Then:
 
-- Confirm Goal 1 remains pinned at or after `547c72f3`; start Goal 2 on a new
-  performance branch from that baseline.
+- Confirm Goal 1 remains pinned at or after `547c72f3` and Goal 2 at or after
+  `8dd69ea6`; keep benchmark comparisons on the exact recorded binary/corpus.
 - Do not touch untracked `AGENTS.md`.
 - Read `vibe-debug-comparison-diagnostics/binary-comparison.txt` and the corresponding
   release file before making claims about byte identity.
-- Copy the paired debug/release evidence into `quality-gate.md` if that has not yet
-  been done.
+- Read the checkpoint Goal 2 JSON paths in `quality-gate.md` before making speed or
+  memory claims.
 - Run format/actionlint checks for any changed workflow or Markdown-adjacent config.
 - Commit only intended tracked files, push the feature branch, and do not open a PR.
 
-## Update 2026-08-03: Goal 1 closeout and next branch
+## Update 2026-08-03: Goal 1 closeout and Goal 2 checkpoint
 
 This section supersedes the paths, priorities, and "remaining work" above
 where they conflict.
@@ -477,9 +493,23 @@ where they conflict.
   and Tauri
   [30809478031](https://github.com/thewh1teagle/wild/actions/runs/30809478031);
   all passed.
-- Goal 2 is next on a new branch. Profile link-only cold/warm time, peak RSS
-  and thread scaling against `lld-link` before changing hot stages. PDB, full
-  CFG/security metadata, LTO, incremental linking and niche compatibility
-  remain deferred as specified in `GOAL.md`.
+- Goal 2 reached checkpoint `8dd69ea6`. The 78.1 MB Vibe
+  reproduction improved from 617–652 ms warm at 1/2/4/8/10 threads to
+  180/152/141/141/138 ms. A separate 30-pair confirmation proves wins over
+  `lld-link` at the same 8 and 10-thread settings; it does not prove
+  best-vs-best or lower-thread superiority.
+- Checkpoint warm/advisory-cold medians, MAD, RSS, scaling, paired deltas, binary and
+  corpus hashes, and all evidence paths are in `pe-link-bench_001.md`. Advisory
+  cold uses `POSIX_FADV_DONTNEED`, not a global cache drop.
+- Accepted work covers measured archive/symbol/COMDAT/layout/relocation/hash
+  reuse and parallelism plus mimalloc v2. Neutral or regressive whole-stage
+  layout, lazy-archive, and aggressive parallel prototypes were not integrated.
+  High-thread Vibe RSS remains above lld and is an explicit tradeoff.
+- PDB, full CFG/security metadata, LTO, incremental linking and niche
+  compatibility remain deferred unchanged as specified in `GOAL.md`.
+- Goal 2 remains open: best-vs-best Vibe is still about 33.5% behind warm and
+  14.8% behind advisory-cold. The checkpoint's `min_seconds=0`, unpinned runs
+  are below the documented authority protocol. Continue optimizing, then rerun
+  with homogeneous CPU affinity and the five-second accumulated-time floor.
 - Reading order for a new session: `GOAL.md` → `goal1-gaps.md` →
   `host-tooling.md` → this file → `quality-gate.md` → `feature-matrix.md`.
