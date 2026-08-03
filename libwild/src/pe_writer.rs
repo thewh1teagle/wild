@@ -3753,8 +3753,8 @@ mod tests {
                 .map(|export| (export.name.as_slice(), export.ordinal, export.data))
                 .collect::<Vec<_>>(),
             [
-                (b"function".as_slice(), 1, false),
-                (b"value".as_slice(), 9, true)
+                (b"value".as_slice(), 9, true),
+                (b"function".as_slice(), 10, false)
             ]
         );
         assert_ne!(
