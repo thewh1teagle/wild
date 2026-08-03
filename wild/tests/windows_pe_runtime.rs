@@ -54,11 +54,27 @@ mod corpus {
         },
         RuntimeCase {
             expected: ExpectedProgram {
+                label: "consumer of a C++ runtime DLL export",
+                stdout: "wild-pe-cpp-dll 42\r\n",
+                exit_code: 66,
+            },
+            run: run_cpp_dll_runtime,
+        },
+        RuntimeCase {
+            expected: ExpectedProgram {
                 label: "Rust std executable",
                 stdout: "wild-pe-rust-runtime\n",
                 exit_code: 64,
             },
             run: run_rust_runtime,
+        },
+        RuntimeCase {
+            expected: ExpectedProgram {
+                label: "consumer of a Rust cdylib export",
+                stdout: "wild-pe-rust-dll 42\r\n",
+                exit_code: 67,
+            },
+            run: run_rust_dll_runtime,
         },
         RuntimeCase {
             expected: ExpectedProgram {
@@ -309,6 +325,37 @@ mod corpus {
         }
     }
 
+    fn run_cpp_dll_runtime(
+        toolchain: &Toolchain,
+        linker: &OsStr,
+        directory: &Path,
+        expected: &ExpectedProgram,
+    ) {
+        let dll_object = directory.join("cpp_runtime_exports.obj");
+        toolchain.compile(&source("cpp_runtime_exports.cpp"), &dll_object, true, false);
+        let dll = directory.join("cpp_runtime_exports.dll");
+        let import_library = directory.join("cpp_runtime_exports.lib");
+        link_dll(toolchain, linker, &dll_object, &dll, &import_library);
+        assert_named_export(&dll, "cpp_exported");
+
+        let consumer_object = directory.join("cpp_dll_consumer.obj");
+        toolchain.compile(
+            &source("cpp_dll_consumer.c"),
+            &consumer_object,
+            false,
+            false,
+        );
+        let executable = directory.join("cpp_dll_consumer.exe");
+        link_executable(
+            toolchain,
+            linker,
+            &[consumer_object],
+            &executable,
+            &[import_library],
+        );
+        verify_image_and_maybe_run(expected, &executable, directory);
+    }
+
     fn run_rust_runtime(
         toolchain: &Toolchain,
         linker: &OsStr,
@@ -334,6 +381,91 @@ mod corpus {
         }
         assert_success(&mut command, "compile and link Rust runtime fixture");
         verify_image_and_maybe_run(expected, &executable, directory);
+    }
+
+    fn run_rust_dll_runtime(
+        toolchain: &Toolchain,
+        linker: &OsStr,
+        directory: &Path,
+        expected: &ExpectedProgram,
+    ) {
+        let dll = directory.join("rust_cdylib.dll");
+        let import_library = directory.join("rust_cdylib.lib");
+        let mut command = Command::new("rustc");
+        command
+            .current_dir(directory)
+            .args(["--crate-type", "cdylib"])
+            .args(["--target", "x86_64-pc-windows-msvc"])
+            .arg(source("rust_cdylib.rs"))
+            .arg("-C")
+            .arg(format!("linker={}", linker.to_string_lossy()))
+            .arg("-C")
+            .arg("opt-level=1")
+            .arg("-C")
+            .arg(format!("link-arg=/implib:{}", import_library.display()))
+            .arg("-o")
+            .arg(&dll);
+        for library_path in &toolchain.library_paths {
+            command
+                .arg("-C")
+                .arg(format!("link-arg=/libpath:{}", library_path.display()));
+        }
+        assert_success(&mut command, "compile and link Rust cdylib");
+        assert!(
+            import_library.is_file(),
+            "Rust cdylib linker did not create import library {}",
+            import_library.display()
+        );
+        assert_named_export(&dll, "rust_exported");
+
+        let consumer_object = directory.join("rust_dll_consumer.obj");
+        toolchain.compile(
+            &source("rust_dll_consumer.c"),
+            &consumer_object,
+            false,
+            false,
+        );
+        let executable = directory.join("rust_dll_consumer.exe");
+        link_executable(
+            toolchain,
+            linker,
+            &[consumer_object],
+            &executable,
+            &[import_library],
+        );
+        verify_image_and_maybe_run(expected, &executable, directory);
+    }
+
+    fn link_dll(
+        toolchain: &Toolchain,
+        linker: &OsStr,
+        object: &Path,
+        dll: &Path,
+        import_library: &Path,
+    ) {
+        let mut command = Command::new(linker);
+        command
+            .current_dir(dll.parent().expect("DLL has a parent directory"))
+            .args(["/nologo", "/dll", "/machine:x64"])
+            .arg(format!("/out:{}", dll.display()))
+            .arg(format!("/implib:{}", import_library.display()))
+            .arg(object);
+        toolchain.add_library_paths(&mut command);
+        assert_success(&mut command, "link runtime DLL");
+        assert!(
+            import_library.is_file(),
+            "DLL linker did not create import library {}",
+            import_library.display()
+        );
+    }
+
+    fn assert_named_export(dll: &Path, name: &str) {
+        let inspection = inspect_image(dll);
+        assert!(
+            inspection.contains(&format!("Name: {name}")),
+            "{} lacks expected export {name}:\n{inspection}",
+            dll.display()
+        );
     }
 
     fn link_executable(
