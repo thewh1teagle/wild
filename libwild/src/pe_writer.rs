@@ -53,6 +53,32 @@ const PE_PHASE_COPY_IMAGE: &str = "PE: Copy image contributions";
 const PE_PHASE_APPLY_RELOCATIONS: &str = "PE: Apply relocations";
 const PE_PHASE_FINALIZE_IMAGE: &str = "PE: Finalize image metadata";
 const PE_PHASE_WRITE_OUTPUT: &str = "PE: Write output";
+const PE_DETAIL_BUILD_IMPORTS: &str = "PE detail: Build eager imports";
+const PE_DETAIL_BUILD_DELAY_IMPORTS: &str = "PE detail: Build delay imports";
+const PE_DETAIL_BUILD_RESOURCES: &str = "PE detail: Build resources";
+const PE_DETAIL_COMDAT_CLASSIFY: &str = "PE detail: Classify COMDAT topology";
+const PE_DETAIL_COMDAT_SELECT: &str = "PE detail: Select COMDAT winners";
+const PE_DETAIL_CONTRIBUTIONS: &str = "PE detail: Materialize input contributions";
+const PE_DETAIL_DEBUG_BUILD_ID: &str = "PE detail: Compute debug build ID";
+const PE_DETAIL_DEBUG_DIRECTORY: &str = "PE detail: Build debug directory";
+const PE_DETAIL_DIR64_SITES: &str = "PE detail: Discover DIR64 sites";
+const PE_DETAIL_EXCEPTION_DIRECTORY: &str = "PE detail: Canonicalize exception directory";
+const PE_DETAIL_IMAGE_ALLOCATE: &str = "PE detail: Allocate output image";
+const PE_DETAIL_IMAGE_COPY: &str = "PE detail: Copy contribution payloads";
+const PE_DETAIL_IMPORT_SELECTION: &str = "PE detail: Select live imports";
+const PE_DETAIL_LAYOUT_INITIAL: &str = "PE detail: Initial section layout";
+const PE_DETAIL_LAYOUT_PREPARE: &str = "PE detail: Prepare layout inputs";
+const PE_DETAIL_LAYOUT_RELOCATIONS: &str = "PE detail: Converge relocation layout";
+const PE_DETAIL_LAYOUT_RELAYOUT: &str = "PE detail: Re-layout relocation section";
+const PE_DETAIL_REF_CLASSIFY: &str = "PE detail: Classify unreachable COMDATs";
+const PE_DETAIL_REF_DEFINITIONS: &str = "PE detail: Build REF definition graph";
+const PE_DETAIL_REF_REACHABILITY: &str = "PE detail: Traverse REF relocations";
+const PE_DETAIL_REF_ROOTS: &str = "PE detail: Mark REF roots";
+const PE_DETAIL_REF_TOPOLOGY: &str = "PE detail: Build REF group topology";
+const PE_DETAIL_ROOTS: &str = "PE detail: Prepare GC roots";
+const PE_DETAIL_SOURCE_LOCATIONS: &str = "PE detail: Build source-location map";
+const PE_DETAIL_TLS_DIRECTORY: &str = "PE detail: Build TLS directory";
+const PE_DETAIL_WRITE_HEADERS: &str = "PE detail: Write PE headers";
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
@@ -1198,6 +1224,7 @@ fn build_image_with_delay_loads(
     let (mut imports, mut delay_imports) =
         pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
     let comdat_phase = crate::timing_guard!(PE_PHASE_SELECT_COMDATS);
+    let roots_phase = crate::timing_guard!(PE_DETAIL_ROOTS);
     // Archive selection and section GC deliberately remain separate: resolution must see every
     // undefined reference in order to extract the right archive members, while /OPT:REF only
     // decides which already-selected COMDAT contributions reach the image.
@@ -1231,9 +1258,11 @@ fn build_image_with_delay_loads(
     }
     gc_roots.sort();
     gc_roots.dedup();
+    drop(roots_phase);
     let (mut contributions, comdat_redirects) =
         collect_contributions_with_roots(objects, args, &gc_roots, runtime_resolution)?;
     if opt_ref_enabled(args) {
+        let import_selection_phase = crate::timing_guard!(PE_DETAIL_IMPORT_SELECTION);
         let mut import_definitions = pe_imports::definition_names(&imports);
         import_definitions.extend(pe_imports::definition_names(&delay_imports));
         let live_imports = live_import_references(
@@ -1245,10 +1274,12 @@ fn build_image_with_delay_loads(
         )?;
         pe_imports::retain_referenced(&mut imports, &live_imports);
         pe_imports::retain_referenced(&mut delay_imports, &live_imports);
+        drop(import_selection_phase);
     }
     drop(comdat_phase);
 
     let layout_phase = crate::timing_guard!(PE_PHASE_LAYOUT);
+    let layout_prepare_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_PREPARE);
     let absolute_symbols = absolute_symbol_values(objects, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
@@ -1330,7 +1361,11 @@ fn build_image_with_delay_loads(
     let dynamic_base = args.dynamic_base && !args.fixed;
     let mut reloc_id = None;
     let mut reloc_data = Vec::new();
+    drop(layout_prepare_phase);
+    let initial_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
     let mut layout = make_layout(&contributions, config)?;
+    drop(initial_layout_phase);
+    let relocation_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELOCATIONS);
     if dynamic_base {
         for _ in 0..3 {
             let delay_iat_slots = delay_iat_slots(
@@ -1363,7 +1398,9 @@ fn build_image_with_delay_loads(
                     contribution.data.resize(next.len(), 0);
                 }
             }
+            let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
             let next_layout = make_layout(&contributions, config)?;
+            drop(relayout_phase);
             if next == reloc_data && next_layout == layout {
                 layout = next_layout;
                 break;
@@ -1385,9 +1422,12 @@ fn build_image_with_delay_loads(
             let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
             contribution.spec.size = reloc_data.len() as u32;
             contribution.data = reloc_data.clone();
+            let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
             layout = make_layout(&contributions, config)?;
+            drop(relayout_phase);
         }
     }
+    drop(relocation_layout_phase);
     if let Some(max_size) = args.image_base.and_then(|base| base.max_size) {
         ensure!(
             u64::from(layout.size_of_image) <= max_size,
@@ -1425,6 +1465,7 @@ fn build_image_with_delay_loads(
             .data = emitted_delay_unwind.pdata;
     }
 
+    let eager_imports_phase = crate::timing_guard!(PE_DETAIL_BUILD_IMPORTS);
     let emitted_imports = match (idata_id, thunk_id) {
         (Some(idata), thunk) => pe_imports::emit(
             &imports,
@@ -1447,9 +1488,11 @@ fn build_image_with_delay_loads(
             .unwrap()
             .data = emitted_imports.thunks.clone();
     }
+    drop(eager_imports_phase);
     // Produce a first deterministic delay image to publish its synthetic definitions before
     // ordinary COFF relocations are resolved. The helper call is patched after definitions are
     // known below.
+    let delay_imports_phase = crate::timing_guard!(PE_DETAIL_BUILD_DELAY_IMPORTS);
     let mut emitted_delay_imports = match (didat_id, delay_thunk_id) {
         (Some(didat), Some(thunks)) => pe_imports::emit_delay(
             &delay_imports,
@@ -1475,6 +1518,8 @@ fn build_image_with_delay_loads(
             .unwrap()
             .data = emitted_delay_imports.thunks.clone();
     }
+    drop(delay_imports_phase);
+    let resources_phase = crate::timing_guard!(PE_DETAIL_BUILD_RESOURCES);
     let resource_directory = if let Some(id) = resource_id {
         let section = linker_utils::pe_resources::build_resource_section(
             resources,
@@ -1491,6 +1536,7 @@ fn build_image_with_delay_loads(
     } else {
         None
     };
+    drop(resources_phase);
     drop(assemble_synthetic_phase);
 
     let definitions_phase = crate::timing_guard!(PE_PHASE_DEFINE_SYMBOLS);
@@ -1627,7 +1673,10 @@ fn build_image_with_delay_loads(
     drop(definitions_phase);
 
     let assemble_image_phase = crate::timing_guard!(PE_PHASE_COPY_IMAGE);
+    let image_allocate_phase = crate::timing_guard!(PE_DETAIL_IMAGE_ALLOCATE);
     let mut image = vec![0; layout.file_size as usize];
+    drop(image_allocate_phase);
+    let image_copy_phase = crate::timing_guard!(PE_DETAIL_IMAGE_COPY);
     for contribution in &contributions {
         let placement = &layout.placements[&contribution.spec.id];
         if let Some(file_offset) = placement.file_offset {
@@ -1635,6 +1684,7 @@ fn build_image_with_delay_loads(
             image[start..start + contribution.data.len()].copy_from_slice(&contribution.data);
         }
     }
+    drop(image_copy_phase);
     drop(assemble_image_phase);
 
     let relocations_phase = crate::timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
@@ -1651,6 +1701,7 @@ fn build_image_with_delay_loads(
     drop(relocations_phase);
 
     let final_image_phase = crate::timing_guard!(PE_PHASE_FINALIZE_IMAGE);
+    let tls_phase = crate::timing_guard!(PE_DETAIL_TLS_DIRECTORY);
     let tls_directory = prepare_tls_directory(
         objects,
         &contributions,
@@ -1662,7 +1713,11 @@ fn build_image_with_delay_loads(
         has_tls_inputs,
         &mut image,
     )?;
+    drop(tls_phase);
+    let exception_phase = crate::timing_guard!(PE_DETAIL_EXCEPTION_DIRECTORY);
     let exception_directory = canonicalize_exception_directory(&mut image, &layout, args)?;
+    drop(exception_phase);
+    let debug_directory_phase = crate::timing_guard!(PE_DETAIL_DEBUG_DIRECTORY);
     let debug_directory = if let Some(id) = debug_id {
         let placement = &layout.placements[&id];
         let file_offset = placement
@@ -1680,6 +1735,8 @@ fn build_image_with_delay_loads(
     } else {
         None
     };
+    drop(debug_directory_phase);
+    let headers_phase = crate::timing_guard!(PE_DETAIL_WRITE_HEADERS);
     write_headers(
         &mut image,
         &layout,
@@ -1700,6 +1757,8 @@ fn build_image_with_delay_loads(
         debug_directory,
         load_config_directory,
     );
+    drop(headers_phase);
+    let build_id_phase = crate::timing_guard!(PE_DETAIL_DEBUG_BUILD_ID);
     if let Some(id) = debug_id {
         let placement = &layout.placements[&id];
         let file_offset = placement.file_offset.unwrap();
@@ -1720,6 +1779,7 @@ fn build_image_with_delay_loads(
         )?;
         image[start..start + encoded.bytes.len()].copy_from_slice(&encoded.bytes);
     }
+    drop(build_id_phase);
     drop(final_image_phase);
     Ok(BuiltImage {
         bytes: image,
@@ -2016,6 +2076,7 @@ fn collect_contributions_with_roots(
             runtime_resolution,
         )?);
     }
+    let contributions_phase = crate::timing_guard!(PE_DETAIL_CONTRIBUTIONS);
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
             let raw_name = section.name_bytes().context("invalid COFF section name")?;
@@ -2111,6 +2172,7 @@ fn collect_contributions_with_roots(
     for (index, contribution) in output.iter_mut().enumerate() {
         contribution.spec.id = ContributionId(index as u32);
     }
+    drop(contributions_phase);
     Ok((output, comdats.redirects))
 }
 
@@ -2424,6 +2486,7 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
     use linker_utils::coff_symbols::ComdatSelection;
     use linker_utils::coff_symbols::select_comdat;
 
+    let classify_phase = crate::timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
     for input in objects {
         for symbol in input.file().symbols() {
@@ -2439,12 +2502,19 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
             strong_definitions.insert(symbol.name_bytes()?.to_vec());
         }
     }
+    let section_groups = objects
+        .iter()
+        .map(|input| cached_comdat_sections(input.file()))
+        .collect::<Result<Vec<_>>>()?;
+    drop(classify_phase);
 
+    let selection_phase = crate::timing_guard!(PE_DETAIL_COMDAT_SELECT);
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
     let mut resolution = ComdatResolution::default();
-    for (object_index, input) in objects.iter().enumerate() {
+    for (object_index, (input, mut section_groups)) in
+        objects.iter().zip(section_groups).enumerate()
+    {
         let timestamp = coff_timestamp(input.file());
-        let mut section_groups = cached_comdat_sections(input.file())?;
         for comdat in input.file().comdats() {
             let leader = input
                 .file()
@@ -2629,6 +2699,7 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
             "COFF COMDAT section groups were not matched to leaders"
         );
     }
+    drop(selection_phase);
     Ok(resolution)
 }
 
@@ -2644,6 +2715,7 @@ fn unreferenced_comdat_sections(
     roots: &[Vec<u8>],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashSet<ObjectSectionKey>> {
+    let topology_phase = crate::timing_guard!(PE_DETAIL_REF_TOPOLOGY);
     let mut group_members = HashMap::<ObjectSectionKey, Vec<ObjectSectionKey>>::new();
     for (object_index, object) in objects.iter().enumerate() {
         for group in cached_comdat_sections(object.file())?.into_values() {
@@ -2657,6 +2729,7 @@ fn unreferenced_comdat_sections(
             }
         }
     }
+    drop(topology_phase);
     let resolve = |mut key: ObjectSectionKey| -> Result<Option<ObjectSectionKey>> {
         for _ in 0..=comdats.redirects.len() {
             if !comdats.discarded.contains(&key) {
@@ -2673,6 +2746,7 @@ fn unreferenced_comdat_sections(
     // Relocations to external symbols have no section on their local symbol record. Resolve
     // them through the selected global definition, while direct/local relocations use the
     // symbol's own section below.
+    let definitions_phase = crate::timing_guard!(PE_DETAIL_REF_DEFINITIONS);
     let mut definitions = HashMap::<Vec<u8>, ObjectSectionKey>::new();
     for (object_index, object) in objects.iter().enumerate() {
         for symbol in object.file().symbols() {
@@ -2716,6 +2790,7 @@ fn unreferenced_comdat_sections(
         })?;
         Ok(definitions.get(target.as_bytes()).copied())
     };
+    drop(definitions_phase);
 
     let mut live = HashSet::<ObjectSectionKey>::new();
     let mut pending = Vec::<ObjectSectionKey>::new();
@@ -2735,6 +2810,7 @@ fn unreferenced_comdat_sections(
 
     // See the function comment above: all ordinary sections are roots.  This also makes REF
     // compatible with objects compiled without /Gy, where a whole .text section is indivisible.
+    let roots_phase = crate::timing_guard!(PE_DETAIL_REF_ROOTS);
     for (object_index, object) in objects.iter().enumerate() {
         for section in object.file().sections() {
             let key = (object_index, section.index());
@@ -2750,7 +2826,9 @@ fn unreferenced_comdat_sections(
             mark_live(section, &mut live, &mut pending);
         }
     }
+    drop(roots_phase);
 
+    let reachability_phase = crate::timing_guard!(PE_DETAIL_REF_REACHABILITY);
     while let Some((object_index, section_index)) = pending.pop() {
         let section = objects[object_index]
             .file()
@@ -2776,7 +2854,9 @@ fn unreferenced_comdat_sections(
             }
         }
     }
+    drop(reachability_phase);
 
+    let classification_phase = crate::timing_guard!(PE_DETAIL_REF_CLASSIFY);
     let mut discarded = HashSet::new();
     for (object_index, object) in objects.iter().enumerate() {
         for section in object.file().sections() {
@@ -2789,6 +2869,7 @@ fn unreferenced_comdat_sections(
             }
         }
     }
+    drop(classification_phase);
     Ok(discarded)
 }
 
@@ -2926,13 +3007,16 @@ fn make_layout(contributions: &[Contribution], config: PeWriterConfig) -> Result
 fn source_locations(
     contributions: &[Contribution],
 ) -> HashMap<(usize, object::SectionIndex), ContributionId> {
-    contributions
+    let locations_phase = crate::timing_guard!(PE_DETAIL_SOURCE_LOCATIONS);
+    let locations = contributions
         .iter()
         .filter_map(|c| match c.source {
             Source::Object { object, section } => Some(((object, section), c.spec.id)),
             Source::Synthetic => None,
         })
-        .collect()
+        .collect();
+    drop(locations_phase);
+    locations
 }
 
 fn redirected_location(
@@ -2958,6 +3042,7 @@ fn dir64_rvas(
     layout: &SectionLayout,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
 ) -> Result<Vec<u32>> {
+    let dir64_phase = crate::timing_guard!(PE_DETAIL_DIR64_SITES);
     let locations = source_locations(contributions);
     let mut rvas = Vec::new();
     for (object_index, input) in objects.iter().enumerate() {
@@ -2989,6 +3074,7 @@ fn dir64_rvas(
             }
         }
     }
+    drop(dir64_phase);
     Ok(rvas)
 }
 
@@ -3888,10 +3974,44 @@ mod tests {
             PE_PHASE_FINALIZE_IMAGE,
             PE_PHASE_WRITE_OUTPUT,
         ];
+        let details = [
+            PE_DETAIL_BUILD_IMPORTS,
+            PE_DETAIL_BUILD_DELAY_IMPORTS,
+            PE_DETAIL_BUILD_RESOURCES,
+            PE_DETAIL_COMDAT_CLASSIFY,
+            PE_DETAIL_COMDAT_SELECT,
+            PE_DETAIL_CONTRIBUTIONS,
+            PE_DETAIL_DEBUG_BUILD_ID,
+            PE_DETAIL_DEBUG_DIRECTORY,
+            PE_DETAIL_DIR64_SITES,
+            PE_DETAIL_EXCEPTION_DIRECTORY,
+            PE_DETAIL_IMAGE_ALLOCATE,
+            PE_DETAIL_IMAGE_COPY,
+            PE_DETAIL_IMPORT_SELECTION,
+            PE_DETAIL_LAYOUT_INITIAL,
+            PE_DETAIL_LAYOUT_PREPARE,
+            PE_DETAIL_LAYOUT_RELOCATIONS,
+            PE_DETAIL_LAYOUT_RELAYOUT,
+            PE_DETAIL_REF_CLASSIFY,
+            PE_DETAIL_REF_DEFINITIONS,
+            PE_DETAIL_REF_REACHABILITY,
+            PE_DETAIL_REF_ROOTS,
+            PE_DETAIL_REF_TOPOLOGY,
+            PE_DETAIL_ROOTS,
+            PE_DETAIL_SOURCE_LOCATIONS,
+            PE_DETAIL_TLS_DIRECTORY,
+            PE_DETAIL_WRITE_HEADERS,
+        ];
         assert!(phases.iter().all(|phase| phase.starts_with("PE: ")));
+        assert!(details.iter().all(|phase| phase.starts_with("PE detail: ")));
         assert_eq!(
-            phases.into_iter().collect::<BTreeSet<_>>().len(),
-            phases.len()
+            phases
+                .iter()
+                .chain(details.iter())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            phases.len() + details.len()
         );
     }
 
