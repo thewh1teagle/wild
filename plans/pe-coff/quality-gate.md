@@ -3,7 +3,7 @@
 Evidence captured on 2026-08-03. Run IDs and commit hashes are included so a
 passing result is not accidentally attributed to a later revision.
 
-## Local macOS M4 verification
+## Local macOS M4 verification (original host)
 
 The following checks pass with the x86-64 MSVC Rust target, LLVM 18, and the
 local xwin CRT/SDK:
@@ -73,3 +73,45 @@ macOS validates their PE structure; execution is covered by Windows below.
   Vibe's separate undocumented `--help` forwarding path is diagnostic-only at
   this revision: it times out in debug and exits with `0xc0000409` in release,
   while the supported GUI application path passes in both profiles.
+
+## Local Linux aarch64 verification (current host, 2026-08-03)
+
+The same local gates were re-verified on an Ubuntu aarch64 machine at commit
+`f2392c1a` after the setup documented in `host-tooling.md` (LLVM 18.1.3, the
+same major version as the macOS evidence):
+
+- fmt, clippy (`pe` feature), actionlint, and taplo gates pass.
+- `cargo +1.95.0 test -p linker-utils -p libwild --no-default-features
+  --features pe`: 223 + 137 tests pass (1 opt-in xwin probe ignored), matching
+  the macOS counts. Requires `clang-format` installed.
+- `pe-repro_001.py --wild target/debug/wild`: all six fixtures are
+  byte-deterministic across Wild links and semantically equivalent to
+  `lld-link`.
+- `pe-perf_001.py --wild-budget-seconds 30`: pass; Wild/lld complete
+  compile+link ratio ≈ 3.3× on this 20-core host (correctness budget only).
+- Known gap: `wild/tests/windows_pe_runtime.rs` is cfg-gated to Windows/macOS
+  and compiles to a no-op skip on Linux even though this host satisfies its
+  capability probe. See `host-tooling.md` and `goal1-gaps.md`.
+
+## Paired Vibe Wild-versus-lld-link control
+
+Run [30801348499](https://github.com/thewh1teagle/wild/actions/runs/30801348499),
+commit `52aeac2d`, passed — the definitive application-level control. Each
+Windows job builds the same pinned Vibe revision
+(`1c5466b21b2228d708d9140d0f2ec71f69c0bb3e`) once with Wild and once with
+`lld-link`, with explicit stale-output deletion and freshness markers.
+
+- Debug: Wild 79,326,720 bytes (SHA-256 `60B9671F…`), lld 42,254,848 bytes
+  (`1EE3AB83…`); not byte identical (first difference at offset `0x2`). Both
+  CLI wrappers printed the identical 305-byte sona help, hit the same
+  Vibe/Aptabase panic, and timed out; both GUIs created a top-level window and
+  stayed alive; both sidecars exited 0.
+- Release: Wild 12,269,568 bytes (`3F9C220F…`), lld 10,984,448 bytes
+  (`F957CB01…`); both CLI wrappers exited `0xc0000409` (Vibe's own
+  panic-abort); both GUIs created a top-level window and stayed alive; both
+  sidecars exited 0.
+
+Identical behavior from the lld control confirms the CLI defect belongs to
+Vibe/Tauri, not Wild. Byte identity is not a goal; loader-visible semantic
+equivalence is. The size gap is consistent with `/OPT:REF`/`ICF` being no-ops
+in Wild (see `goal1-gaps.md`).
