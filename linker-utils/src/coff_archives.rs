@@ -368,10 +368,31 @@ impl<'data> CoffArchive<'data> {
         defined: &[&[u8]],
         whole_archive: bool,
     ) -> CoffArchivePlan<'archive, 'data> {
-        let mut definitions: HashSet<Vec<u8>> = defined.iter().map(|name| name.to_vec()).collect();
+        let definitions = defined.iter().copied().collect::<HashSet<_>>();
+        self.plan_with_defined_lookup(demands, whole_archive, |name| definitions.contains(name))
+    }
+
+    /// Plans extraction while querying the caller's existing symbol state in place.
+    ///
+    /// This avoids copying and re-hashing a large global definition set for every
+    /// archive pass. Definitions introduced by selected members remain local to
+    /// this plan and are consulted before the caller-provided lookup.
+    pub fn plan_with_defined_lookup<'archive, 'name>(
+        &'archive self,
+        demands: &[ArchiveDemand<'name>],
+        whole_archive: bool,
+        mut is_defined: impl FnMut(&[u8]) -> bool,
+    ) -> CoffArchivePlan<'archive, 'data> {
+        let mut definitions = HashSet::<Vec<u8>>::new();
         let mut unresolved = Vec::new();
         for demand in demands {
-            add_demand(&mut unresolved, &definitions, demand.name, demand.kind);
+            add_demand_with_lookup(
+                &mut unresolved,
+                &definitions,
+                &mut is_defined,
+                demand.name,
+                demand.kind,
+            );
         }
 
         let mut selected = Vec::new();
@@ -379,7 +400,12 @@ impl<'data> CoffArchive<'data> {
         if whole_archive {
             for member in &self.members {
                 was_selected[member.index] = true;
-                absorb_member(member, &mut definitions, &mut unresolved);
+                absorb_member_with_lookup(
+                    member,
+                    &mut definitions,
+                    &mut unresolved,
+                    &mut is_defined,
+                );
                 selected.push(SelectedArchiveMember {
                     member,
                     reason: ArchiveSelectionReason::WholeArchive,
@@ -400,7 +426,12 @@ impl<'data> CoffArchive<'data> {
                     break;
                 };
                 was_selected[member.index] = true;
-                absorb_member(member, &mut definitions, &mut unresolved);
+                absorb_member_with_lookup(
+                    member,
+                    &mut definitions,
+                    &mut unresolved,
+                    &mut is_defined,
+                );
                 selected.push(SelectedArchiveMember {
                     member,
                     reason: ArchiveSelectionReason::Symbol(trigger),
@@ -551,36 +582,38 @@ fn parse_coff<'data, Coff: CoffHeader>(
     ))
 }
 
-fn absorb_member(
+fn absorb_member_with_lookup(
     member: &CoffArchiveMember<'_>,
     definitions: &mut HashSet<Vec<u8>>,
     unresolved: &mut Vec<OwnedArchiveDemand>,
+    is_defined: &mut impl FnMut(&[u8]) -> bool,
 ) {
     for definition in &member.definitions {
         definitions.insert(definition.clone());
     }
-    unresolved.retain(|demand| !definitions.contains(demand.name()));
+    unresolved.retain(|demand| !definitions.contains(demand.name()) && !is_defined(demand.name()));
     for demand in &member.demands {
-        add_demand(unresolved, definitions, demand.name(), demand.kind());
+        add_demand_with_lookup(
+            unresolved,
+            definitions,
+            is_defined,
+            demand.name(),
+            demand.kind(),
+        );
     }
 }
 
-fn add_demand(
+fn add_demand_with_lookup(
     demands: &mut Vec<OwnedArchiveDemand>,
     definitions: &HashSet<Vec<u8>>,
+    is_defined: &mut impl FnMut(&[u8]) -> bool,
     name: &[u8],
     kind: ArchiveDemandKind,
 ) {
-    if definitions.contains(name) {
+    if definitions.contains(name) || is_defined(name) {
         return;
     }
-    if let Some(existing) = demands.iter_mut().find(|demand| demand.name() == name) {
-        if kind == ArchiveDemandKind::Strong {
-            existing.kind = ArchiveDemandKind::Strong;
-        }
-    } else {
-        demands.push(OwnedArchiveDemand::new(name, kind));
-    }
+    add_owned_demand(demands, name, kind);
 }
 
 fn add_owned_demand(demands: &mut Vec<OwnedArchiveDemand>, name: &[u8], kind: ArchiveDemandKind) {
@@ -744,6 +777,13 @@ mod tests {
                 .selected()
                 .is_empty()
         );
+        let mut lookups = 0;
+        let lookup_plan = parsed.plan_with_defined_lookup(&[weak], false, |name| {
+            lookups += 1;
+            name == b"weak"
+        });
+        assert!(lookup_plan.selected().is_empty());
+        assert_eq!(lookups, 1);
 
         let plan = parsed.plan(&[weak], &[], false);
         assert_eq!(plan.selected()[0].member().name(), b"weak.obj");
