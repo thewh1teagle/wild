@@ -1063,7 +1063,8 @@ fn build_image(
 }
 
 fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u64) {
-    use linker_utils::coff_runtime::{LinkerDefinedValue, linker_defined_symbol};
+    use linker_utils::coff_runtime::LinkerDefinedValue;
+    use linker_utils::coff_runtime::linker_defined_symbol;
 
     // lld-link and link.exe let an ordinary selected definition win. Otherwise
     // the canonical symbol denotes the first byte of the loaded PE image.
