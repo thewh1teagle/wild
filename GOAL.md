@@ -100,9 +100,16 @@ library, ripgrep, rust-analyzer, and uv. Freeze and publish, before tuning:
   selected thread configurations are immutable denominators for the final
   series; rebuilding them or changing their work cannot move the bar.
 
-The frozen pre-Goal-3 Wild revision is the per-corpus regression baseline.
-Changing a corpus, binary build, machine configuration, or protocol starts a
-new benchmark series and cannot be mixed into the authoritative result.
+The per-corpus regression baseline is the first frozen **Goal-3-eligible** Wild
+revision: it must replay all four frozen PE corpora correctly, and it is frozen
+before profiling or performance tuning begins. If the pre-Goal-3 revision
+cannot link a newly frozen primary corpus, preserve and report that failure,
+make only the minimal correctness fix needed to establish eligibility, and
+freeze that corrected revision as the timing baseline. Such a correctness-only
+eligibility fix is not a performance result and cannot be selected from timing
+data. Changing a corpus, eligible baseline, binary build, machine
+configuration, or protocol after tuning starts creates a new benchmark series
+and cannot be mixed into the authoritative result.
 
 ### Completion metric
 
