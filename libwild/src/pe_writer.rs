@@ -73,6 +73,7 @@ const PE_DETAIL_LAYOUT_RELAYOUT: &str = "PE detail: Re-layout relocation section
 const PE_DETAIL_REF_CLASSIFY: &str = "PE detail: Classify unreachable COMDATs";
 const PE_DETAIL_REF_DEFINITIONS: &str = "PE detail: Build REF definition graph";
 const PE_DETAIL_REF_REACHABILITY: &str = "PE detail: Traverse REF relocations";
+const MAX_RELOCATION_RELAYOUTS: usize = 4;
 const PE_DETAIL_REF_ROOTS: &str = "PE detail: Mark REF roots";
 const PE_DETAIL_REF_TOPOLOGY: &str = "PE detail: Build REF group topology";
 const PE_DETAIL_ROOTS: &str = "PE detail: Prepare GC roots";
@@ -164,6 +165,12 @@ struct Contribution {
     source: Source,
     spec: SectionContribution,
     data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dir64Site {
+    contribution: ContributionId,
+    offset: u32,
 }
 
 struct BuiltImage {
@@ -1364,74 +1371,34 @@ fn build_image_with_delay_loads(
         debug_characteristics(),
     )?;
     let dynamic_base = args.dynamic_base && !args.fixed;
-    let mut reloc_id = None;
-    let mut reloc_data = Vec::new();
     drop(layout_prepare_phase);
     let initial_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
     let mut layout = make_layout(&contributions, config)?;
     drop(initial_layout_phase);
     let relocation_layout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELOCATIONS);
-    if dynamic_base {
-        for _ in 0..3 {
+    let dir64_sites = if dynamic_base {
+        discover_dir64_sites(objects, &contributions, &absolute_symbols)?
+    } else {
+        Vec::new()
+    };
+    let (next_layout, reloc_id, has_base_relocations, relocation_relayouts) = if dynamic_base {
+        converge_relocation_layout(&mut contributions, layout, config, |layout| {
             let delay_iat_slots = delay_iat_slots(
                 &delay_imports,
                 didat_id,
                 delay_thunk_id,
-                &layout,
+                layout,
                 config.image_base,
             )?;
-            let mut dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
+            let mut dir64 = dir64_rvas(&dir64_sites, layout)?;
             dir64.extend_from_slice(&delay_iat_slots);
-            let next = build_amd64_base_relocation_table(dir64, layout.size_of_image)
-                .context("failed to build PE base relocation table")?;
-            if next.is_empty() {
-                break;
-            }
-            match reloc_id {
-                None => {
-                    reloc_id = add_synthetic(
-                        &mut contributions,
-                        b".reloc",
-                        next.len(),
-                        reloc_characteristics(),
-                    )?;
-                }
-                Some(id) => {
-                    let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
-                    contribution.spec.size =
-                        u32::try_from(next.len()).context("base relocation table too large")?;
-                    contribution.data.resize(next.len(), 0);
-                }
-            }
-            let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
-            let next_layout = make_layout(&contributions, config)?;
-            drop(relayout_phase);
-            if next == reloc_data && next_layout == layout {
-                layout = next_layout;
-                break;
-            }
-            reloc_data = next;
-            layout = next_layout;
-        }
-        if let Some(id) = reloc_id {
-            let delay_iat_slots = delay_iat_slots(
-                &delay_imports,
-                didat_id,
-                delay_thunk_id,
-                &layout,
-                config.image_base,
-            )?;
-            let mut dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
-            dir64.extend_from_slice(&delay_iat_slots);
-            reloc_data = build_amd64_base_relocation_table(dir64, layout.size_of_image)?;
-            let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
-            contribution.spec.size = reloc_data.len() as u32;
-            contribution.data = reloc_data.clone();
-            let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
-            layout = make_layout(&contributions, config)?;
-            drop(relayout_phase);
-        }
-    }
+            Ok(dir64)
+        })?
+    } else {
+        (layout, None, false, 0)
+    };
+    layout = next_layout;
+    debug_assert!(relocation_relayouts <= MAX_RELOCATION_RELAYOUTS);
     drop(relocation_layout_phase);
     if let Some(max_size) = args.image_base.and_then(|base| base.max_size) {
         ensure!(
@@ -1712,7 +1679,7 @@ fn build_image_with_delay_loads(
         &contributions,
         &layout,
         &definitions,
-        &absolute_symbols,
+        &dir64_rvas(&dir64_sites, &layout)?,
         config.image_base,
         dynamic_base,
         has_tls_inputs,
@@ -1752,7 +1719,7 @@ fn build_image_with_delay_loads(
         emitted_imports.import_directory,
         emitted_imports.iat_directory,
         emitted_delay_imports.directory,
-        reloc_id.is_some() && !reloc_data.is_empty(),
+        reloc_id.is_some() && has_base_relocations,
         export_directory
             .as_ref()
             .map(|directory| (directory.rva, directory.size)),
@@ -2986,6 +2953,66 @@ fn add_synthetic(
     Ok(Some(id))
 }
 
+fn converge_relocation_layout(
+    contributions: &mut Vec<Contribution>,
+    mut layout: SectionLayout,
+    config: PeWriterConfig,
+    mut relocation_rvas: impl FnMut(&SectionLayout) -> Result<Vec<u32>>,
+) -> Result<(SectionLayout, Option<ContributionId>, bool, usize)> {
+    let initial =
+        build_amd64_base_relocation_table(relocation_rvas(&layout)?, layout.size_of_image)
+            .context("failed to build PE base relocation table")?;
+    if initial.is_empty() {
+        return Ok((layout, None, false, 0));
+    }
+
+    let reloc_id = add_synthetic(
+        contributions,
+        b".reloc",
+        initial.len(),
+        reloc_characteristics(),
+    )?
+    .expect("non-empty relocation data creates a contribution");
+    let mut expected_size = initial.len();
+    let mut relayouts = 0;
+
+    loop {
+        let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
+        layout = make_layout(contributions, config)?;
+        drop(relayout_phase);
+        relayouts += 1;
+
+        let data =
+            build_amd64_base_relocation_table(relocation_rvas(&layout)?, layout.size_of_image)
+                .context("failed to build PE base relocation table")?;
+        if data.len() == expected_size {
+            let contribution = contributions
+                .iter_mut()
+                .find(|contribution| contribution.spec.id == reloc_id)
+                .expect("synthetic relocation contribution remains present");
+            contribution.data = data;
+            return Ok((layout, Some(reloc_id), true, relayouts));
+        }
+
+        ensure!(
+            relayouts < MAX_RELOCATION_RELAYOUTS,
+            "PE base-relocation section size did not converge after {MAX_RELOCATION_RELAYOUTS} layouts"
+        );
+        // Usually this is the only correction: once `.reloc` exists, changing its size shifts
+        // later output sections by their section alignment and preserves the number of encoded
+        // relocation entries. Keep a bounded fallback for `.reloc` input subsections and valid
+        // low-alignment images, where a sub-page shift can change the number of page blocks.
+        expected_size = data.len();
+        let contribution = contributions
+            .iter_mut()
+            .find(|contribution| contribution.spec.id == reloc_id)
+            .expect("synthetic relocation contribution remains present");
+        contribution.spec.size =
+            u32::try_from(expected_size).context("base relocation table too large")?;
+        contribution.data.resize(expected_size, 0);
+    }
+}
+
 fn make_layout(contributions: &[Contribution], config: PeWriterConfig) -> Result<SectionLayout> {
     let section_count = contributions
         .iter()
@@ -3041,15 +3068,14 @@ fn redirected_location(
     Err(error!("cycle in COMDAT section redirects"))
 }
 
-fn dir64_rvas(
+fn discover_dir64_sites(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
-    layout: &SectionLayout,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<Dir64Site>> {
     let dir64_phase = crate::timing_guard!(PE_DETAIL_DIR64_SITES);
     let locations = source_locations(contributions);
-    let mut rvas = Vec::new();
+    let mut sites = Vec::new();
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
             let Some(id) = locations.get(&(object_index, section.index())) else {
@@ -3067,19 +3093,28 @@ fn dir64_rvas(
                             continue;
                         }
                     }
-                    rvas.push(
-                        layout.placements[id]
-                            .rva
-                            .checked_add(
-                                u32::try_from(offset).context("relocation offset too large")?,
-                            )
-                            .context("relocation RVA overflow")?,
-                    );
+                    sites.push(Dir64Site {
+                        contribution: *id,
+                        offset: u32::try_from(offset).context("relocation offset too large")?,
+                    });
                 }
             }
         }
     }
     drop(dir64_phase);
+    Ok(sites)
+}
+
+fn dir64_rvas(sites: &[Dir64Site], layout: &SectionLayout) -> Result<Vec<u32>> {
+    let mut rvas = Vec::with_capacity(sites.len());
+    for site in sites {
+        rvas.push(
+            layout.placements[&site.contribution]
+                .rva
+                .checked_add(site.offset)
+                .context("relocation RVA overflow")?,
+        );
+    }
     Ok(rvas)
 }
 
@@ -3443,7 +3478,7 @@ fn prepare_tls_directory(
     contributions: &[Contribution],
     layout: &SectionLayout,
     definitions: &HashMap<Vec<u8>, u64>,
-    absolute_symbols: &HashMap<Vec<u8>, u64>,
+    dir64_rvas: &[u32],
     image_base: u64,
     dynamic_base: bool,
     has_tls_inputs: bool,
@@ -3533,11 +3568,10 @@ fn prepare_tls_directory(
         "TLS template size changed during metadata construction"
     );
 
-    let dir64 = dir64_rvas(objects, contributions, layout, absolute_symbols)?;
     if dynamic_base {
         for rva in &tls.dir64_relocation_rvas {
             ensure!(
-                dir64.contains(rva),
+                dir64_rvas.contains(rva),
                 "TLS directory field at RVA {rva:#x} lacks an AMD64 DIR64 base relocation"
             );
         }
@@ -3548,7 +3582,7 @@ fn prepare_tls_directory(
         image_base,
         callbacks_rva,
         dynamic_base,
-        &dir64,
+        dir64_rvas,
     )?;
 
     image[directory_offset..directory_offset + directory_size as usize]
@@ -3958,6 +3992,97 @@ mod tests {
     use object::write::Relocation;
     use object::write::Symbol;
     use object::write::SymbolSection;
+
+    fn synthetic_test_contribution(id: u32, name: &[u8], size: u32) -> Contribution {
+        Contribution {
+            source: Source::Synthetic,
+            spec: SectionContribution {
+                id: ContributionId(id),
+                name: name.to_vec(),
+                characteristics: readonly_data_characteristics(),
+                alignment: 1,
+                size,
+                kind: ContributionKind::Data,
+            },
+            data: vec![0; size as usize],
+        }
+    }
+
+    #[test]
+    fn relocation_layout_needs_one_pass_when_pages_shift_whole() {
+        let config = PeWriterConfig::default();
+        let mut contributions = vec![
+            synthetic_test_contribution(0, b".text", 8),
+            synthetic_test_contribution(1, b".custom", 0x1000),
+        ];
+        let initial = make_layout(&contributions, config).unwrap();
+        let sites = [
+            Dir64Site {
+                contribution: ContributionId(1),
+                offset: 0,
+            },
+            Dir64Site {
+                contribution: ContributionId(1),
+                offset: 0xff8,
+            },
+        ];
+
+        let (layout, reloc_id, has_relocations, relayouts) =
+            converge_relocation_layout(&mut contributions, initial, config, |layout| {
+                dir64_rvas(&sites, layout)
+            })
+            .unwrap();
+
+        assert_eq!(relayouts, 1);
+        assert_eq!(reloc_id, Some(ContributionId(2)));
+        assert!(has_relocations);
+        let data = &contributions[2].data;
+        assert_eq!(
+            linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
+                data,
+                layout.size_of_image,
+            )
+            .unwrap(),
+            dir64_rvas(&sites, &layout).unwrap()
+        );
+    }
+
+    #[test]
+    fn relocation_layout_corrects_page_split_from_reloc_subsection() {
+        let config = PeWriterConfig::default();
+        let mut contributions = vec![synthetic_test_contribution(0, b".reloc$input", 0x1000)];
+        let initial = make_layout(&contributions, config).unwrap();
+        let sites = [
+            Dir64Site {
+                contribution: ContributionId(0),
+                offset: 0,
+            },
+            Dir64Site {
+                contribution: ContributionId(0),
+                offset: 0xff8,
+            },
+        ];
+
+        let (layout, reloc_id, has_relocations, relayouts) =
+            converge_relocation_layout(&mut contributions, initial, config, |layout| {
+                dir64_rvas(&sites, layout)
+            })
+            .unwrap();
+
+        assert_eq!(relayouts, 2);
+        assert_eq!(reloc_id, Some(ContributionId(1)));
+        assert!(has_relocations);
+        let data = &contributions[1].data;
+        assert_eq!(data.len(), 24);
+        assert_eq!(
+            linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
+                data,
+                layout.size_of_image,
+            )
+            .unwrap(),
+            dir64_rvas(&sites, &layout).unwrap()
+        );
+    }
 
     #[test]
     fn pe_timing_phase_labels_are_stable_and_unique() {
@@ -6137,7 +6262,7 @@ mod tests {
             &[],
             &layout,
             &HashMap::new(),
-            &HashMap::new(),
+            &[],
             PeWriterConfig::default().image_base,
             true,
             true,
