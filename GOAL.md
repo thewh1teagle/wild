@@ -1,8 +1,9 @@
 # Goal
 
-Make Wild's x86-64 PE/COFF support production-usable and stable, then fast.
-Two sequential goals on two branches; optional heavyweight features are
-deferred to the end.
+Make Wild's x86-64 PE/COFF support production-usable and stable, then fast,
+then substantially faster than the established linker alternatives across a
+broad real-world corpus. Three sequential goals on three branches; optional
+heavyweight features are deferred to the end.
 
 ## Goal 1 — production-usable and stable (complete on `feature/pe-coff-v1`)
 
@@ -71,7 +72,71 @@ advisory-cold one thread. Exact medians, MAD, RSS, scaling, protocol, binary and
 corpus hashes, and evidence paths are recorded in
 `plans/pe-coff/pe-link-bench_001.md` and `plans/pe-coff/quality-gate.md`.
 
-## Deferred to final phases (after both goals, each separate)
+## Goal 3 — native Windows performance (`feature/pe-coff-windows-performance`)
+
+Make PE/COFF performance reflect Wild's core purpose: link real programs as
+fast as possible. Goal 2 established one bounded best-versus-best Vibe result;
+Goal 3 must generalize the performance work across several pinned Rust
+applications on a physical x86-64 Windows machine and make Wild decisively,
+repeatably faster than `lld-link`, not merely competitive in one configuration.
+
+In priority order:
+
+1. Implement the native-Windows link-only replay harness specified in
+   `plans/pe-coff/windows-native-performance.md`. Preserve randomized paired
+   execution, per-linker thread sweeps, direct best-versus-best confirmation,
+   raw samples, median/MAD/p95, CPU time, peak working set, affinity, binary and
+   corpus hashes, PE validation, and Wild determinism.
+2. Capture exact, immutable `lld-link /reproduce` corpora outside the repository
+   for a tiered Rust matrix: Rust hello-world as the process-startup floor,
+   Rust-std for the fastest inner loop, ripgrep for a small real application,
+   rust-analyzer for a larger symbol/archive/COMDAT workload, and uv as the
+   primary substantial Windows application. Keep Vibe as the periodic
+   application-scale regression corpus.
+3. Establish an immutable baseline for the branch on this Windows host. Sweep
+   `/threads:1,2,3,4,5,6` for both linkers, independently select each linker's
+   fastest configuration, and compare those configurations in randomized
+   direct pairs. Do not carry the previous Linux ten-thread optimum onto this
+   six-logical-CPU machine.
+4. Use the smallest representative corpus for rapid iteration, but confirm
+   every promising change on uv or rust-analyzer so process startup and one
+   narrow workload do not drive the design. Periodically rerun the complete
+   matrix to catch cross-corpus regressions.
+5. Optimize only measured costs. Start with Wild's phase timings, then use
+   Windows Performance Recorder/Analyzer when phase totals are insufficient.
+   Investigate archive preparation and extraction, symbol resolution, COMDAT
+   reachability, relocation analysis/application, layout, hashing, allocation,
+   output copying, synchronization, scheduling, and shutdown according to the
+   profiles rather than a predetermined rewrite plan.
+6. Keep each optimization coherent and independently measurable. Run a quick
+   paired smoke comparison during iteration, the full statistical floor for
+   candidates, and preserve rejected or neutral experiment evidence so the
+   same ideas are not repeatedly rediscovered.
+7. Preserve all Goal 1 correctness, native execution, semantic-equivalence,
+   malformed-input, and determinism gates. Performance changes must not rely on
+   unsafe option weakening, skipped loader metadata, stale outputs, or unequal
+   work between Wild and `lld-link`.
+
+Goal 3 completes only when authoritative warm, direct best-versus-best Windows
+measurements show all of the following on pinned inputs and binaries:
+
+- Wild is at least 20% faster than `lld-link` on the geometric mean of the
+  primary Rust-std, ripgrep, rust-analyzer, and uv corpora.
+- Wild is individually faster on both uv and rust-analyzer, so the result is
+  not carried by tiny links.
+- No primary corpus regresses by more than 3% from the immutable Goal 3 Wild
+  baseline without an explicitly justified corpus-wide tradeoff.
+- Correctness, deterministic output, and native execution remain green.
+- Peak working set and scaling are recorded and bounded; a speed win must not
+  be presented as a memory win unless the measurements also prove that claim.
+
+This goal is optimization only. PDB generation, CFG/security expansion, LTO,
+incremental linking, new architectures, and niche compatibility work are out of
+scope even if encountered during profiling. Do not expand feature scope to make
+a benchmark pass; use supported release-mode inputs and keep deferred work
+deferred.
+
+## Deferred to final phases (after all three goals, each separate)
 
 - Optional debug tooling: PDB emission (MSF/CodeView/type merging) with
   debugger validation; real `/MAP` output. Until then `/DEBUG`/`/PDB` stay
@@ -85,7 +150,7 @@ corpus hashes, and evidence paths are recorded in
 - Niche compatibility: thin archives, exotic `.def` directives,
   `/MERGE:.pdata`, non-x86-64 targets.
 
-## Both goals
+## All goals
 
 - Use parallel subagents in worktrees; the manager reviews and merges their work.
 - Work only in our fork. Do not open a pull request; upstreaming happens later
