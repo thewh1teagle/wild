@@ -28,9 +28,8 @@ path = "tests/windows_pe_runtime.rs"
 [dependencies]
 libwild = { path = "../libwild", version = "0.10.0", default-features = false }
 
-# This is off by default, since it doesn't appear to help. However, if you're linking against musl
-# libc, which has a comparatively slow allocator, then enabling this does help. To enable this,
-# build with `--features mimalloc`.
+# This remains off for default ELF/Mach-O builds. PE enables it through the `pe` feature; other
+# builds can opt in explicitly with `--features mimalloc`.
 mimalloc = { workspace = true, optional = true }
 
 dhat = { workspace = true, optional = true }
@@ -78,7 +77,9 @@ wasm = ["libwild/wasm"]
 
 macho = ["libwild/macho"]
 
-pe = ["libwild/pe"]
+mimalloc = ["dep:mimalloc"]
+
+pe = ["libwild/pe", "mimalloc"]
 
 # external tests
 external_tests = ["mold_tests"]
