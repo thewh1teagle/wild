@@ -13,6 +13,7 @@ use crate::platform;
 use linker_utils::coff_runtime::RuntimeDirective;
 use linker_utils::coff_runtime::RuntimeResolution;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +316,7 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, i
 /// quoting. Keeping this entry point shared prevents compiler-generated directives from subtly
 /// differing from their command-line equivalents.
 pub(crate) fn parse_directives(args: &mut CoffArgs, directives: &str) -> Result {
-    let tokens = windows_command_line_args(directives)?;
+    let tokens = windows_command_line_args(directives);
     parse_tokens(args, tokens.iter().map(String::as_str), ".drectve section")?;
     validate_alignments(args)?;
     args.common.report_unrecognized()
@@ -837,7 +838,7 @@ fn parse_section(value: &str) -> Result<SectionAttributes> {
 
 /// Implements the backslash-before-quote rules used by CommandLineToArgvW/link.exe response
 /// parsing. Unlike a shell, backslashes are otherwise preserved (important for Windows paths).
-fn windows_command_line_args(input: &str) -> Result<Vec<String>> {
+fn windows_command_line_args(input: &str) -> Vec<String> {
     let chars: Vec<char> = input.chars().collect();
     let mut result = Vec::new();
     let mut index = 0;
@@ -860,7 +861,14 @@ fn windows_command_line_args(input: &str) -> Result<Vec<String>> {
                 if index < chars.len() && chars[index] == '"' {
                     value.extend(std::iter::repeat_n('\\', count / 2));
                     if count % 2 == 0 {
-                        quoted = !quoted;
+                        if quoted && index + 1 < chars.len() && chars[index + 1] == '"' {
+                            // Two consecutive quotes within a quoted portion represent one
+                            // literal quote under the Windows command-line rules.
+                            value.push('"');
+                            index += 1;
+                        } else {
+                            quoted = !quoted;
+                        }
                     } else {
                         value.push('"');
                     }
@@ -869,19 +877,23 @@ fn windows_command_line_args(input: &str) -> Result<Vec<String>> {
                     value.extend(std::iter::repeat_n('\\', count));
                 }
             } else if chars[index] == '"' {
-                quoted = !quoted;
-                index += 1;
+                if quoted && index + 1 < chars.len() && chars[index + 1] == '"' {
+                    value.push('"');
+                    index += 2;
+                } else {
+                    quoted = !quoted;
+                    index += 1;
+                }
             } else {
                 value.push(chars[index]);
                 index += 1;
             }
         }
-        if quoted {
-            bail!("unterminated double quote in COFF directive string");
-        }
+        // CommandLineToArgvW and lld-link both treat EOF as the end of an unmatched quoted
+        // portion, so retain the token instead of rejecting an otherwise usable response file.
         result.push(value);
     }
-    Ok(result)
+    result
 }
 
 /// Decodes a link.exe response file.
@@ -916,16 +928,64 @@ fn decode_utf16_response_file(contents: &[u8], decode: fn([u8; 2]) -> u16) -> Re
 }
 
 fn expand_response_files<S: AsRef<str>, I: Iterator<Item = S>>(input: I) -> Result<Vec<String>> {
+    let current_dir = std::env::current_dir().context("failed to determine current directory")?;
+    expand_response_files_from(input, &current_dir, &mut Vec::new())
+}
+
+fn expand_response_files_from<S: AsRef<str>, I: Iterator<Item = S>>(
+    input: I,
+    base_dir: &Path,
+    active_files: &mut Vec<PathBuf>,
+) -> Result<Vec<String>> {
+    // This is primarily a guard against an adversarial but acyclic chain exhausting the call
+    // stack. Cycles are diagnosed separately below with their actual path.
+    const MAX_RESPONSE_FILE_DEPTH: usize = 128;
+
     let mut output = Vec::new();
     for arg in input {
         let arg = arg.as_ref();
         if let Some(path) = arg.strip_prefix('@') {
-            let contents = std::fs::read(path)
-                .with_context(|| format!("failed to read response file `{path}`"))?;
-            let contents = decode_response_file(&contents)
-                .with_context(|| format!("failed to decode response file `{path}`"))?;
-            let nested = windows_command_line_args(&contents)?;
-            output.extend(expand_response_files(nested.into_iter())?);
+            let supplied_path = Path::new(path);
+            let response_path = if supplied_path.is_absolute() {
+                supplied_path.to_owned()
+            } else {
+                base_dir.join(supplied_path)
+            };
+            let canonical_path = std::fs::canonicalize(&response_path).with_context(|| {
+                format!(
+                    "failed to resolve response file `{}`",
+                    response_path.display()
+                )
+            })?;
+            if active_files.contains(&canonical_path) {
+                bail!(
+                    "recursive response file expansion of `{}`",
+                    response_path.display()
+                );
+            }
+            if active_files.len() >= MAX_RESPONSE_FILE_DEPTH {
+                bail!(
+                    "response file nesting exceeds the maximum depth of {MAX_RESPONSE_FILE_DEPTH} at `{}`",
+                    response_path.display()
+                );
+            }
+
+            let contents = std::fs::read(&response_path).with_context(|| {
+                format!("failed to read response file `{}`", response_path.display())
+            })?;
+            let contents = decode_response_file(&contents).with_context(|| {
+                format!(
+                    "failed to decode response file `{}`",
+                    response_path.display()
+                )
+            })?;
+            let nested = windows_command_line_args(&contents);
+            let nested_base = response_path.parent().unwrap_or(base_dir);
+            active_files.push(canonical_path);
+            let expanded =
+                expand_response_files_from(nested.into_iter(), nested_base, active_files);
+            active_files.pop();
+            output.extend(expanded?);
         } else {
             output.push(arg.to_owned());
         }
@@ -1207,6 +1267,81 @@ mod tests {
                 InputSpec::File(ref path) if &**path == Path::new("caf\u{e9}.obj")
             ));
         }
+    }
+
+    #[test]
+    fn resolves_nested_response_files_relative_to_the_including_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested_directory = directory.path().join("responses");
+        std::fs::create_dir(&nested_directory).unwrap();
+        let outer = nested_directory.join("outer.rsp");
+        let inner = nested_directory.join("inner.rsp");
+        std::fs::write(&outer, "@inner.rsp").unwrap();
+        std::fs::write(&inner, "/OUT:nested.exe \"nested object.obj\"").unwrap();
+
+        let mut args = CoffArgs::default();
+        parse(&mut args, [format!("@{}", outer.display())].into_iter()).unwrap();
+        assert_eq!(&*args.common.output, Path::new("nested.exe"));
+        assert!(matches!(
+            args.common.inputs[0].spec,
+            InputSpec::File(ref path) if &**path == Path::new("nested object.obj")
+        ));
+    }
+
+    #[test]
+    fn rejects_recursive_response_files_but_allows_sequential_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.rsp");
+        let second = directory.path().join("second.rsp");
+        std::fs::write(&first, "@second.rsp").unwrap();
+        std::fs::write(&second, "@first.rsp").unwrap();
+
+        let error =
+            expand_response_files([format!("@{}", first.display())].into_iter()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recursive response file expansion")
+        );
+
+        let leaf = directory.path().join("leaf.rsp");
+        let repeated = directory.path().join("repeated.rsp");
+        std::fs::write(&leaf, "common.obj").unwrap();
+        std::fs::write(&repeated, "@leaf.rsp @leaf.rsp").unwrap();
+        assert_eq!(
+            expand_response_files([format!("@{}", repeated.display())].into_iter()).unwrap(),
+            ["common.obj", "common.obj"]
+        );
+    }
+
+    #[test]
+    fn limits_response_file_nesting_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=128 {
+            let contents = if index == 128 {
+                "too-deep.obj".to_owned()
+            } else {
+                format!("@{}.rsp", index + 1)
+            };
+            std::fs::write(directory.path().join(format!("{index}.rsp")), contents).unwrap();
+        }
+
+        let first = directory.path().join("0.rsp");
+        let error =
+            expand_response_files([format!("@{}", first.display())].into_iter()).unwrap_err();
+        assert!(error.to_string().contains("maximum depth of 128"));
+    }
+
+    #[test]
+    fn follows_windows_doubled_quote_and_unmatched_quote_rules() {
+        assert_eq!(
+            windows_command_line_args(r#""before""after" plain"#),
+            [r#"before"after"#, "plain"]
+        );
+        assert_eq!(
+            windows_command_line_args(r#""unterminated value"#),
+            ["unterminated value"]
+        );
     }
 
     #[test]
