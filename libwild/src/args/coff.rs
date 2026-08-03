@@ -76,10 +76,25 @@ pub(crate) struct SectionAttributes {
     pub(crate) attributes: String,
 }
 
+/// One `/EXPORT:` directive in its link.exe-compatible form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExportSpec {
+    /// Public name placed in the PE export directory.
+    pub(crate) name: String,
+    /// Internal symbol name, or a forwarder such as `KERNEL32.Sleep`.
+    pub(crate) target: String,
+    pub(crate) ordinal: Option<u16>,
+    pub(crate) noname: bool,
+    pub(crate) data: bool,
+    /// Export from the DLL but omit it from the generated import library.
+    pub(crate) private: bool,
+}
+
 #[derive(Debug)]
 pub struct CoffArgs {
     pub(crate) common: CommonArgs,
     pub(crate) entry: Option<String>,
+    pub(crate) no_entry: bool,
     pub(crate) subsystem: Option<SubsystemSpec>,
     pub(crate) is_dll: bool,
     pub(crate) machine: CoffMachine,
@@ -87,7 +102,7 @@ pub struct CoffArgs {
     pub(crate) default_libraries: Vec<String>,
     pub(crate) no_default_libraries: bool,
     pub(crate) excluded_default_libraries: Vec<String>,
-    pub(crate) exports: Vec<String>,
+    pub(crate) exports: Vec<ExportSpec>,
     pub(crate) force_undefined: Vec<String>,
     pub(crate) debug: bool,
     pub(crate) no_logo: bool,
@@ -128,6 +143,7 @@ impl Default for CoffArgs {
                 ..CommonArgs::default()
             },
             entry: None,
+            no_entry: false,
             subsystem: None,
             is_dll: false,
             machine: CoffMachine::X86_64,
@@ -283,6 +299,7 @@ where
             "entry" => {
                 args.entry = Some(required_value("/ENTRY", inline_value, &mut input)?.to_owned());
             }
+            "noentry" if inline_value.is_none() => args.no_entry = true,
             "subsystem" => {
                 let value = required_value("/SUBSYSTEM", inline_value, &mut input)?;
                 args.subsystem = Some(parse_subsystem(value)?);
@@ -294,7 +311,7 @@ where
             }
             "nodefaultlib" => match inline_value {
                 Some(value) if !value.is_empty() => {
-                    args.excluded_default_libraries.push(value.to_owned())
+                    args.excluded_default_libraries.push(value.to_owned());
                 }
                 _ => args.no_default_libraries = true,
             },
@@ -305,7 +322,7 @@ where
             }
             "export" => {
                 let value = required_value("/EXPORT", inline_value, &mut input)?;
-                args.exports.push(value.to_owned());
+                args.exports.push(parse_export(value)?);
             }
             "include" => {
                 let value = required_value("/INCLUDE", inline_value, &mut input)?;
@@ -415,6 +432,60 @@ where
     Ok(())
 }
 
+fn parse_export(value: &str) -> Result<ExportSpec> {
+    let mut fields = value.split(',');
+    let mapping = fields.next().unwrap_or_default();
+    if mapping.is_empty() {
+        bail!("/EXPORT expects a non-empty export name");
+    }
+    let (name, target) = mapping
+        .split_once('=')
+        .map_or((mapping, mapping), |(name, target)| (name, target));
+    if name.is_empty() || target.is_empty() {
+        bail!("/EXPORT expects name[=internal-name]");
+    }
+
+    let mut ordinal = None;
+    let mut noname = false;
+    let mut data = false;
+    let mut private = false;
+    for field in fields {
+        if let Some(value) = field.strip_prefix('@') {
+            if ordinal.is_some() || value.is_empty() {
+                bail!("invalid ordinal in /EXPORT:{value}");
+            }
+            let parsed = value
+                .parse::<u16>()
+                .with_context(|| format!("invalid export ordinal `@{value}`"))?;
+            if parsed == 0 {
+                bail!("export ordinal zero is reserved");
+            }
+            ordinal = Some(parsed);
+            continue;
+        }
+        match field.to_ascii_lowercase().as_str() {
+            "noname" if !noname => noname = true,
+            "data" if !data => data = true,
+            "private" if !private => private = true,
+            "noname" | "data" | "private" => {
+                bail!("duplicate /EXPORT modifier `{field}`")
+            }
+            _ => bail!("unsupported /EXPORT modifier `{field}`"),
+        }
+    }
+    if noname && ordinal.is_none() {
+        bail!("/EXPORT NONAME requires an explicit ordinal");
+    }
+    Ok(ExportSpec {
+        name: name.to_owned(),
+        target: target.to_owned(),
+        ordinal,
+        noname,
+        data,
+        private,
+    })
+}
+
 fn required_value<'a, I>(
     option: &str,
     inline: Option<&'a str>,
@@ -469,10 +540,10 @@ fn parse_alignment(option: &str, value: &str, min: u32, max: u32) -> Result<u32>
 }
 
 fn validate_alignments(args: &CoffArgs) -> Result {
-    if let (Some(section), Some(file)) = (args.section_alignment, args.file_alignment) {
-        if section < file {
-            bail!("/ALIGN ({section}) must not be smaller than /FILEALIGN ({file})");
-        }
+    if let (Some(section), Some(file)) = (args.section_alignment, args.file_alignment)
+        && section < file
+    {
+        bail!("/ALIGN ({section}) must not be smaller than /FILEALIGN ({file})");
     }
     Ok(())
 }
@@ -683,6 +754,7 @@ mod tests {
                 "/ENTRY:custom_entry",
                 "/SUBSYSTEM:CONSOLE,6.2",
                 "/DLL",
+                "/NOENTRY",
                 "/DEFAULTLIB:ucrt.lib",
                 "/NODEFAULTLIB:oldnames.lib",
                 "/LIBPATH:sdk/lib",
@@ -709,13 +781,53 @@ mod tests {
         assert_eq!(args.default_libraries, ["ucrt.lib"]);
         assert_eq!(args.excluded_default_libraries, ["oldnames.lib"]);
         assert_eq!(args.lib_search_path[0].as_ref(), Path::new("sdk/lib"));
-        assert_eq!(args.exports, ["answer,@7"]);
+        assert!(args.no_entry);
+        assert_eq!(
+            args.exports,
+            [ExportSpec {
+                name: "answer".into(),
+                target: "answer".into(),
+                ordinal: Some(7),
+                noname: false,
+                data: false,
+                private: false,
+            }]
+        );
         assert_eq!(args.force_undefined, ["forced_symbol"]);
         assert!(args.debug);
         assert!(matches!(
             args.common.inputs[0].spec,
             InputSpec::File(ref path) if &**path == Path::new("main.obj")
         ));
+    }
+
+    #[test]
+    fn parses_typed_export_alias_and_modifiers() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            ["/EXPORT:public_name=internal_name,@42,NONAME,DATA,PRIVATE"].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            args.exports,
+            [ExportSpec {
+                name: "public_name".into(),
+                target: "internal_name".into(),
+                ordinal: Some(42),
+                noname: true,
+                data: true,
+                private: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_export_modifiers() {
+        let mut args = CoffArgs::default();
+        assert!(parse(&mut args, ["/EXPORT:answer,NONAME"].into_iter()).is_err());
+        let mut args = CoffArgs::default();
+        assert!(parse(&mut args, ["/EXPORT:answer,@0"].into_iter()).is_err());
     }
 
     #[test]
