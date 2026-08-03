@@ -7,6 +7,10 @@ lld, followed only by their output path and the requested `/threads:N` value.
 Ordinary sweeps pass the same value to both linkers; the optional direct-pair
 confirmation described below can pass independently selected values.
 
+The original PE CLI and schema remain the default. Goal 3 additionally uses
+`--format elf` to replay a frozen Wild save directory through native AArch64
+Wild and `ld.lld`; that opt-in mode is documented below.
+
 ## Prepare a corpus
 
 Add `/reproduce:rust-std.tar` to one successful lld link. For a direct rustc
@@ -68,7 +72,11 @@ uv run plans/pe-coff/pe-link-bench_001.py \
   --lld-link /usr/lib/llvm-18/bin/lld-link \
   --mode warm \
   --thread-pair 10:1 \
+  --selection-sweep /tmp/pe-link-sweep.json \
+  --tmpfs-output-dir /benchmark \
+  --output-expectations /corpora/vibe-pe-properties.json \
   --cpu-list 5-9,15-19 \
+  --environment-note 'dedicated idle DGX; fixed performance governor' \
   --output /tmp/pe-link-best-vs-best.json
 ```
 
@@ -80,7 +88,134 @@ tool level, raw samples, execution order, median ratio, paired Wild-minus-lld
 deltas, paired-win count, RSS, and per-tool validation using the selected
 count. Tool and corpus provenance is unchanged. This confirmation does not
 measure thread scaling and should not replace the full sweep used to select
-the two configurations.
+the two configurations. Goal 3 authority runs always provide
+`--selection-sweep`; its SHA-256 is embedded in the direct report. Use a fresh
+seed for the direct run. Sweep samples are selection data, never holdout data.
+If a holdout result informs another implementation or protocol change, discard
+it and collect a new direct holdout.
+
+Goal 3 PE sweeps and holdouts must pass `--tmpfs-output-dir`, just like ELF.
+Legacy PE runs may omit it for compatibility, but the parity aggregator rejects
+those reports. Freeze an output-expectation JSON per corpus and pass it to every
+sweep and holdout. PE expectations are exact:
+
+```json
+{
+  "format": "pe",
+  "machine": "IMAGE_FILE_MACHINE_AMD64",
+  "subsystem": 3,
+  "entry_point_nonzero": true,
+  "exports": false,
+  "imports": true,
+  "base_relocations": true
+}
+```
+
+Use the values appropriate to the frozen workload; `subsystem: 3` and the
+presence booleans above are examples. Validation parses the PE data-directory
+RVAs and sizes and fails when machine, subsystem, entry-point presence, export,
+import, or base-relocation presence differs. It also rejects a silent semantic
+property disagreement between the paired linkers.
+
+## ELF save-directory replay on the DGX
+
+Capture the final ELF link with `WILD_SAVE_BASE`, identify the numbered save
+directory whose executable `run-with` script represents the intended final
+release link, and freeze the entire directory. `--corpus` is that save
+directory. The harness invokes exactly:
+
+```text
+run-with <native-linker> --threads=N
+```
+
+Each process receives a unique `OUT` path below the explicitly supplied tmpfs.
+The harness rejects a non-tmpfs output directory. Build a native AArch64 Wild
+binary with ELF support and use the native AArch64 `ld.lld`, then perform the
+selection sweep:
+
+```console
+uv run plans/pe-coff/pe-link-bench_001.py \
+  --format elf \
+  --corpus /corpora/ripgrep-elf/save-dir \
+  --wild target/release/wild \
+  --ld-lld /usr/bin/ld.lld \
+  --tmpfs-output-dir /benchmark \
+  --output-expectations /corpora/ripgrep-elf-properties.json \
+  --mode warm \
+  --threads 1,2,4,8,10,20 \
+  --cpu-list 0-19 \
+  --environment-note 'dedicated idle DGX; fixed performance governor' \
+  --seed 1101 \
+  --output /evidence/ripgrep-elf-sweep.json
+```
+
+Select each tool's lowest-median thread count independently, freeze that pair,
+and collect a separate randomized holdout:
+
+```console
+uv run plans/pe-coff/pe-link-bench_001.py \
+  --format elf \
+  --corpus /corpora/ripgrep-elf/save-dir \
+  --wild target/release/wild \
+  --ld-lld /usr/bin/ld.lld \
+  --tmpfs-output-dir /benchmark \
+  --output-expectations /corpora/ripgrep-elf-properties.json \
+  --mode warm \
+  --thread-pair 20:1 \
+  --selection-sweep /evidence/ripgrep-elf-sweep.json \
+  --cpu-list 0-19 \
+  --environment-note 'dedicated idle DGX; fixed performance governor' \
+  --seed 2202 \
+  --output /evidence/ripgrep-elf-direct.json
+```
+
+ELF reports use the same sampling floors, randomized paired blocks, CPU
+affinity, cache definitions, raw timing samples, GNU-time peak RSS sampling,
+tool/corpus hashes, and provenance as PE reports. Validation parses the native
+x86-64 ELF header and program-header bounds, records the output hash, and
+requires two identical outputs from each ELF linker. The linker processes are
+native AArch64 Linux executables; the replayed output is x86-64 ELF.
+Freeze ELF type and entry-point presence too:
+
+```json
+{
+  "format": "elf",
+  "machine": "EM_X86_64",
+  "type": 3,
+  "entry_point_nonzero": true
+}
+```
+
+`type: 3` is an example for a PIE/shared object; use the inspected type of the
+frozen workload. The harness rejects a Wild/`ld.lld` structural disagreement.
+
+## Frozen PE baseline regression holdout
+
+Goal 3's per-corpus 3% regression guard needs a paired comparison between the
+final candidate and the frozen pre-Goal-3 Wild binary. Use `--baseline-wild`
+for both its selection sweep and its separate direct holdout. The candidate is
+still `--wild`; `--baseline-wild` replaces `lld-link` as the second PE tool and
+is invoked with the same Wild PE flavor arguments:
+
+```console
+uv run plans/pe-coff/pe-link-bench_001.py \
+  --corpus /corpora/ripgrep-pe/repro \
+  --wild /build/final/wild \
+  --baseline-wild /build/frozen-baseline/wild \
+  --tmpfs-output-dir /benchmark \
+  --output-expectations /corpora/ripgrep-pe-properties.json \
+  --mode warm \
+  --thread-pair 10:10 \
+  --selection-sweep /evidence/ripgrep-pe-baseline-sweep.json \
+  --cpu-list 0-19 \
+  --environment-note 'dedicated idle DGX; fixed performance governor' \
+  --seed 3303 \
+  --output /evidence/ripgrep-pe-baseline-direct.json
+```
+
+The pair must come from an independently selected full sweep; `10:10` above is
+only illustrative. `dgx-parity_001.py` verifies the sweep selection and rejects
+an unbound, reused, stale, or protocol-incompatible holdout.
 
 ## Cache modes
 
