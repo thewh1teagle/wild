@@ -1147,6 +1147,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ltcg_and_incremental_linking_options() {
+        for option in ["/LTCG", "/INCREMENTAL"] {
+            let error = parse(&mut CoffArgs::default(), [option].into_iter())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unrecognized option"), "{option}: {error}");
+            assert!(error.contains(option), "{option}: {error}");
+
+            let error = parse_directives(&mut CoffArgs::default(), option)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unrecognized option"), "{option}: {error}");
+            assert!(error.contains(option), "{option}: {error}");
+        }
+    }
+
+    #[test]
     fn accepts_ignored_pdb_alt_path_without_changing_debug_policy() {
         let mut args = CoffArgs::default();
         parse(&mut args, ["/PDBALTPATH:%_PDB%"].into_iter()).unwrap();

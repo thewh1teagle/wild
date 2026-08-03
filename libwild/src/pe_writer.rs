@@ -4388,6 +4388,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_llvm_bitcode_as_a_pe_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let bitcode_path = directory.path().join("module.obj");
+        // LLVM bitcode's stable four-byte magic makes this a representative IR
+        // input without requiring an external compiler fixture.
+        std::fs::write(&bitcode_path, b"BC\xc0\xde\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            no_entry: true,
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
+        let mut inputs = Vec::new();
+        open_input(
+            &fs,
+            &bitcode_path,
+            &args,
+            &input_storage,
+            &mut inputs,
+            false,
+        )
+        .unwrap();
+        let error = match select_opened_inputs::<crate::fs::OsFileSystem>(
+            &args,
+            &args.exports,
+            &inputs,
+            false,
+            &[],
+        ) {
+            Ok(_) => panic!("accepted LLVM bitcode as a PE input"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("cannot identify COFF input"), "{error}");
+        assert!(error.contains("module.obj"), "{error}");
+    }
+
+    #[test]
     fn emits_resources_and_repro_debug_directory_deterministically() {
         use linker_utils::pe_resources::ResourceId;
         use linker_utils::pe_resources::ResourceRecord;
