@@ -196,8 +196,15 @@ jobs:
           $candidate = Get-ChildItem $base -Directory |
             Where-Object {
               $runWith = Join-Path $_.FullName 'run-with'
-              (Test-Path $runWith) -and
-                (Select-String -Path $runWith -Pattern 'vibe.exe' -SimpleMatch -Quiet)
+              if (-not (Test-Path $runWith)) {
+                return $false
+              }
+              $argumentFiles = @($runWith) + @(
+                Get-ChildItem $_.FullName -File -Filter 'at-*.txt' |
+                  Select-Object -ExpandProperty FullName
+              )
+              return Select-String -Path $argumentFiles `
+                -Pattern 'vibe.exe' -SimpleMatch -Quiet
             } |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
