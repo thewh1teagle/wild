@@ -580,6 +580,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_sized_contribution_keeps_an_aligned_boundary_location() {
+        let inputs = [
+            contribution(1, b".rdata$a", ContributionKind::Data, 3, 1),
+            contribution(2, b".rdata$b", ContributionKind::Data, 0, 8),
+            contribution(3, b".rdata$c", ContributionKind::Data, 4, 1),
+        ];
+        let layout = layout_sections(&inputs, options()).unwrap();
+
+        let empty = &layout.placements[&ContributionId(2)];
+        let following = &layout.placements[&ContributionId(3)];
+        assert_eq!((empty.offset, empty.rva, empty.size), (8, 0x1008, 0));
+        assert_eq!(following.offset, empty.offset);
+        assert_eq!(layout.sections[0].virtual_size, 12);
+    }
+
+    #[test]
     fn merges_compatible_flags_and_removes_input_only_bits() {
         let mut first = contribution(1, b".text$a", ContributionKind::Data, 1, 16);
         first.characteristics = pe::IMAGE_SCN_CNT_CODE.0
