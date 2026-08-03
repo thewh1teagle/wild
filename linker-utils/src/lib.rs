@@ -5,6 +5,7 @@ pub mod coff_archives;
 pub mod coff_def;
 pub mod coff_import_library_writer;
 pub mod coff_imports;
+pub mod coff_runtime;
 pub mod coff_symbols;
 pub mod elf;
 pub mod loongarch64;
