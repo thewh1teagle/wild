@@ -29,7 +29,37 @@ struct IncrementalSymbolState {
     defined: HashSet<Vec<u8>>,
     unresolved: BTreeSet<Vec<u8>>,
     weak_resolution: WeakExternalResolution,
+    globals: Vec<SelectedGlobalSymbol>,
     absorbed_objects: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct SelectedGlobalSymbol {
+    pub(super) object: usize,
+    #[allow(dead_code)]
+    pub(super) index: object::SymbolIndex,
+    pub(super) section: Option<object::SectionIndex>,
+    pub(super) section_kind: object::SymbolSection,
+    pub(super) address: u64,
+    pub(super) size: u64,
+    pub(super) is_definition: bool,
+    pub(super) is_common: bool,
+    pub(super) is_undefined: bool,
+    pub(super) is_weak: bool,
+    pub(super) name: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(super) struct SelectedSymbolSnapshot {
+    pub(super) globals: Vec<SelectedGlobalSymbol>,
+    pub(super) weak_resolution: WeakExternalResolution,
+}
+
+pub(super) struct ResolverOutput<'data> {
+    pub(super) selected_imports: Vec<ShortImportObject<'data>>,
+    pub(super) symbols: SelectedSymbolSnapshot,
+    #[cfg(test)]
+    pub(super) object_scans: usize,
 }
 
 impl IncrementalSymbolState {
@@ -38,6 +68,7 @@ impl IncrementalSymbolState {
             defined: HashSet::new(),
             unresolved: BTreeSet::new(),
             weak_resolution: WeakExternalResolution::default(),
+            globals: Vec::new(),
             absorbed_objects: 0,
         }
     }
@@ -59,7 +90,23 @@ impl IncrementalSymbolState {
         }
         for symbol in object.file().symbols() {
             let name = symbol.name_bytes().context("invalid COFF symbol name")?;
-            if name.is_empty() || !symbol.is_global() {
+            if !symbol.is_global() {
+                continue;
+            }
+            self.globals.push(SelectedGlobalSymbol {
+                object: index,
+                index: symbol.index(),
+                section: symbol.section_index(),
+                section_kind: symbol.section(),
+                address: symbol.address(),
+                size: symbol.size(),
+                is_definition: symbol.is_definition(),
+                is_common: symbol.is_common(),
+                is_undefined: symbol.is_undefined(),
+                is_weak: symbol.is_weak(),
+                name: name.to_vec(),
+            });
+            if name.is_empty() {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
@@ -172,11 +219,6 @@ impl<'data> ResolverSession<'data> {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(super) fn object_scan_count(&self) -> usize {
-        self.symbol_state.absorbed_objects
-    }
-
     /// Returns whether a regular archive member can define `name`.
     ///
     /// PE linkers implicitly retain the CRT's `_load_config_used` object when
@@ -195,8 +237,21 @@ impl<'data> ResolverSession<'data> {
         self.symbol_state.define(name);
     }
 
+    #[cfg(test)]
     pub(super) fn selected_imports(&self) -> &[ShortImportObject<'data>] {
         &self.selected_imports
+    }
+
+    pub(super) fn finish(self) -> ResolverOutput<'data> {
+        ResolverOutput {
+            selected_imports: self.selected_imports,
+            symbols: SelectedSymbolSnapshot {
+                globals: self.symbol_state.globals,
+                weak_resolution: self.symbol_state.weak_resolution,
+            },
+            #[cfg(test)]
+            object_scans: self.symbol_state.absorbed_objects,
+        }
     }
 
     pub(super) fn resolve(
@@ -491,6 +546,94 @@ mod tests {
     use super::*;
     use object::pe;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn resolver_snapshot_preserves_direct_and_archive_symbol_order() {
+        assert_send_sync::<SelectedSymbolSnapshot>();
+
+        let direct = coff_object(&["direct"], &["arc_sym"]);
+        let library = archive(&[("member.obj", coff_object(&["arc_sym", "second"], &[]))]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&direct).unwrap()];
+        let mut session = ResolverSession::new();
+        session.add_archive(&library, false).unwrap();
+        session
+            .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+            .unwrap();
+
+        let output = session.finish();
+        assert_eq!(output.object_scans, 2);
+        let actual = output
+            .symbols
+            .globals
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.object,
+                    symbol.index,
+                    symbol.name.as_slice(),
+                    symbol.is_definition,
+                    symbol.is_undefined,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (0, object::SymbolIndex(0), b"direct".as_slice(), true, false),
+                (
+                    0,
+                    object::SymbolIndex(1),
+                    b"arc_sym".as_slice(),
+                    false,
+                    true,
+                ),
+                (
+                    1,
+                    object::SymbolIndex(0),
+                    b"arc_sym".as_slice(),
+                    true,
+                    false,
+                ),
+                (1, object::SymbolIndex(1), b"second".as_slice(), true, false),
+            ]
+        );
+        assert_eq!(output.symbols.weak_resolution.records().count(), 0);
+    }
+
+    #[test]
+    fn resolver_still_validates_local_symbol_names() {
+        let bytes = object_with_malformed_local_name();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let error = IncrementalSymbolState::new()
+            .absorb_object(&object, 0)
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("invalid COFF symbol name"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn weak_metadata_error_precedes_later_malformed_local_name() {
+        let mut bytes = weak_object(99);
+        bytes.truncate(bytes.len() - 4);
+        bytes[12..16].copy_from_slice(&4u32.to_le_bytes());
+        push_malformed_local_symbol(&mut bytes);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+
+        let error = IncrementalSymbolState::new()
+            .absorb_object(&object, 0)
+            .unwrap_err();
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unsupported weak-external search characteristic 99"),
+            "{message}"
+        );
+        assert!(!message.contains("invalid COFF symbol name"), "{message}");
+    }
+
     #[test]
     fn optional_archive_root_extracts_only_when_available() {
         let library = archive(&[("loadcfg.obj", coff_object(&["loadcfg"], &[]))]);
@@ -772,6 +915,23 @@ mod tests {
         symbol[12..14].copy_from_slice(&section.to_le_bytes());
         symbol[16] = pe::IMAGE_SYM_CLASS_EXTERNAL.0;
         bytes.extend_from_slice(&symbol);
+    }
+
+    fn push_malformed_local_symbol(bytes: &mut Vec<u8>) {
+        let mut symbol = [0; 18];
+        symbol[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        symbol[12..14].copy_from_slice(&1i16.to_le_bytes());
+        symbol[16] = pe::IMAGE_SYM_CLASS_STATIC.0;
+        bytes.extend_from_slice(&symbol);
+    }
+
+    fn object_with_malformed_local_name() -> Vec<u8> {
+        let mut bytes = coff_object(&[], &[]);
+        bytes.truncate(bytes.len() - 4);
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        push_malformed_local_symbol(&mut bytes);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
     }
 
     fn weak_object(search: u32) -> Vec<u8> {
