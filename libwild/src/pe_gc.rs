@@ -6,6 +6,8 @@ use super::pe_ir::NameId;
 use super::pe_ir::PeIr;
 use super::pe_ir::RelocationCsr;
 use super::pe_ir::RelocationRecord;
+use super::pe_ir::ResolvedRelocationCsr;
+use super::pe_ir::ResolvedTargetKind;
 use super::pe_ir::SectionId;
 use super::pe_ir::SymbolId;
 use super::pe_symbol_db::ProviderKind;
@@ -139,6 +141,16 @@ pub(super) trait EventDrivenGc {
 pub(super) struct DenseEventGc<'ir, 'data> {
     ir: &'ir PeIr<'data>,
     alternate_targets: &'ir [u32],
+    resolved: Option<&'ir ResolvedRelocationCsr>,
+}
+
+pub(super) struct ProductionGcInput<'a> {
+    pub(super) redirect_targets: Vec<SectionId>,
+    pub(super) discarded: Vec<bool>,
+    pub(super) is_comdat: &'a [bool],
+    pub(super) root_names: &'a [NameId],
+    pub(super) groups: &'a [SectionGroup],
+    pub(super) group_members: &'a [SectionId],
 }
 
 impl<'ir, 'data> DenseEventGc<'ir, 'data> {
@@ -146,7 +158,47 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         Self {
             ir,
             alternate_targets,
+            resolved: None,
         }
+    }
+
+    pub(super) fn new_resolved(
+        ir: &'ir PeIr<'data>,
+        alternate_targets: &'ir [u32],
+        resolved: &'ir ResolvedRelocationCsr,
+    ) -> Self {
+        Self {
+            ir,
+            alternate_targets,
+            resolved: Some(resolved),
+        }
+    }
+
+    fn unpack_target(target: super::pe_ir::ResolvedTarget) -> Result<ResolvedTarget> {
+        Ok(match target.kind {
+            ResolvedTargetKind::Section => ResolvedTarget {
+                section: Some(SectionId::from_u32(target.target)),
+                import: None,
+                import_name: None,
+                absolute: false,
+            },
+            ResolvedTargetKind::Import => ResolvedTarget {
+                section: None,
+                import: Some(super::pe_ir::ImportId::from_u32(target.value)),
+                import_name: Some(NameId::from_u32(target.target)),
+                absolute: false,
+            },
+            ResolvedTargetKind::Absolute => ResolvedTarget {
+                section: None,
+                import: None,
+                import_name: None,
+                absolute: true,
+            },
+            ResolvedTargetKind::Name => ResolvedTarget::default(),
+            ResolvedTargetKind::Diagnostic => {
+                return Err(error!("Invalid COFF relocation symbol {}", target.target));
+            }
+        })
     }
 
     fn resolve_name(&self, symbols: &SymbolDb, mut name: NameId) -> Result<ResolvedTarget> {
@@ -226,6 +278,224 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             });
         }
         self.resolve_name(symbols, symbol.name)
+    }
+
+    pub(super) fn collect_production(&self, mut input: ProductionGcInput<'_>) -> Result<GcOutput> {
+        let mut collect_phase = crate::pe_timing_guard!("PE dense GC: Direct collect");
+        let resolved = self
+            .resolved
+            .context("production GC requires resolved relocations")?;
+        let section_count = self.ir.sections.len();
+        collect_phase
+            .0
+            .add(crate::timing::PeMetric::Sections, section_count);
+        collect_phase
+            .0
+            .add(crate::timing::PeMetric::Relocations, resolved.records.len());
+        collect_phase
+            .0
+            .add(crate::timing::PeMetric::Groups, input.groups.len());
+        ensure!(
+            input.redirect_targets.len() == section_count
+                && input.discarded.len() == section_count
+                && input.is_comdat.len() == section_count,
+            "production GC dense array cardinality mismatch"
+        );
+        let mut redirects = Vec::new();
+        for (index, &target) in input.redirect_targets.iter().enumerate() {
+            let from = SectionId::from_u32(index as u32);
+            ensure!(
+                target.index() < section_count,
+                "invalid production GC redirect"
+            );
+            if from != target {
+                redirects.push(SectionRedirect { from, to: target });
+            }
+        }
+        for start in 0..section_count {
+            let mut node = SectionId::from_u32(start as u32);
+            for _ in 0..=redirects.len() {
+                let next = input.redirect_targets[node.index()];
+                if next == node {
+                    input.redirect_targets[start] = node;
+                    break;
+                }
+                node = next;
+            }
+            ensure!(
+                input.redirect_targets[node.index()] == node,
+                "cycle in COMDAT section redirects"
+            );
+        }
+
+        let mut group_by_section = vec![u32::MAX; section_count];
+        for (group_index, group) in input.groups.iter().enumerate() {
+            let start = group.member_start as usize;
+            let end = start
+                .checked_add(group.member_len as usize)
+                .context("COMDAT member range overflow")?;
+            for &member in input
+                .group_members
+                .get(start..end)
+                .context("COMDAT member range is out of bounds")?
+            {
+                let slot = group_by_section
+                    .get_mut(member.index())
+                    .context("invalid COMDAT group member")?;
+                ensure!(
+                    *slot == u32::MAX,
+                    "section belongs to multiple COMDAT groups"
+                );
+                *slot = group_index as u32;
+            }
+        }
+
+        let mut associative_heads = vec![u32::MAX; section_count];
+        let mut associative_tails = vec![u32::MAX; section_count];
+        let mut associative_next = vec![u32::MAX; section_count];
+        for (child, section) in self.ir.sections.iter().enumerate() {
+            if let Some(parent) = section.associative_section.get() {
+                ensure!(
+                    parent.index() < section_count,
+                    "invalid associative COMDAT parent"
+                );
+                let child = child as u32;
+                let tail = &mut associative_tails[parent.index()];
+                if *tail == u32::MAX {
+                    associative_heads[parent.index()] = child;
+                } else {
+                    associative_next[*tail as usize] = child;
+                }
+                *tail = child;
+            }
+        }
+
+        let mut live_bits = vec![0u64; section_count.div_ceil(64)];
+        let mut visitation_order = Vec::new();
+        let mut pending = VecDeque::new();
+        let mark = |section: SectionId,
+                    live_bits: &mut [u64],
+                    pending: &mut VecDeque<SectionId>,
+                    visitation_order: &mut Vec<SectionId>|
+         -> Result<()> {
+            let canonical = *input
+                .redirect_targets
+                .get(section.index())
+                .context("live section is outside dense IR")?;
+            if input.discarded[canonical.index()] {
+                return Ok(());
+            }
+            let word = canonical.index() / 64;
+            let mask = 1u64 << (canonical.index() % 64);
+            if live_bits[word] & mask == 0 {
+                live_bits[word] |= mask;
+                pending.push_back(canonical);
+                visitation_order.push(canonical);
+            }
+            Ok(())
+        };
+        let mut referenced_imports = BTreeSet::new();
+        let mut referenced_import_names = BTreeSet::new();
+        for (index, &is_comdat) in input.is_comdat.iter().enumerate() {
+            if !is_comdat {
+                mark(
+                    SectionId::from_u32(index as u32),
+                    &mut live_bits,
+                    &mut pending,
+                    &mut visitation_order,
+                )?;
+            }
+        }
+        for &name in input.root_names {
+            let target = Self::unpack_target(
+                resolved
+                    .name(name)
+                    .context("GC root name is outside resolved namespace")?,
+            )?;
+            if let Some(import) = target.import {
+                referenced_imports.insert(import);
+            }
+            if let Some(name) = target.import_name {
+                referenced_import_names.insert(name);
+            }
+            if let Some(section) = target.section {
+                mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
+            }
+        }
+
+        let mut traversal_phase = crate::pe_timing_guard!("PE dense GC: Traverse resolved CSR");
+        let mut dir64_needs = Vec::new();
+        while let Some(section) = pending.pop_front() {
+            let group = group_by_section[section.index()];
+            if group != u32::MAX {
+                let group = &input.groups[group as usize];
+                let start = group.member_start as usize;
+                let end = start + group.member_len as usize;
+                for &member in &input.group_members[start..end] {
+                    mark(member, &mut live_bits, &mut pending, &mut visitation_order)?;
+                }
+            }
+            let mut child = associative_heads[section.index()];
+            while child != u32::MAX {
+                mark(
+                    SectionId::from_u32(child),
+                    &mut live_bits,
+                    &mut pending,
+                    &mut visitation_order,
+                )?;
+                child = associative_next[child as usize];
+            }
+            for relocation in resolved
+                .for_section(section)
+                .context("live section has no resolved relocation CSR row")?
+            {
+                let target = Self::unpack_target(relocation.target)?;
+                if relocation.typ == 1 && !target.absolute {
+                    dir64_needs.push(Dir64Need {
+                        section,
+                        offset: relocation.offset,
+                    });
+                }
+                if let Some(import) = target.import {
+                    referenced_imports.insert(import);
+                }
+                if let Some(name) = target.import_name {
+                    referenced_import_names.insert(name);
+                }
+                if let Some(target) = target.section {
+                    mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
+                }
+            }
+        }
+        if traversal_phase.0.enabled() {
+            let relocation_count = visitation_order
+                .iter()
+                .filter_map(|&section| resolved.for_section(section))
+                .map(<[super::pe_ir::ResolvedRelocationRecord]>::len)
+                .sum();
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::Sections, visitation_order.len());
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::Relocations, relocation_count);
+            traversal_phase
+                .0
+                .add(crate::timing::PeMetric::QueuePushes, visitation_order.len());
+            traversal_phase.0.add(
+                crate::timing::PeMetric::Imports,
+                referenced_import_names.len(),
+            );
+        }
+        Ok(GcOutput {
+            live_bits: live_bits.into_boxed_slice(),
+            canonical_sections: input.redirect_targets.into_boxed_slice(),
+            redirects: redirects.into_boxed_slice(),
+            visitation_order: visitation_order.into_boxed_slice(),
+            referenced_imports: referenced_imports.into_iter().collect(),
+            referenced_import_names: referenced_import_names.into_iter().collect(),
+            dir64_needs: dir64_needs.into_boxed_slice(),
+        })
     }
 }
 
@@ -458,7 +728,15 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                     mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
                 }
                 GcEvent::RootSymbol { name, .. } => {
-                    let target = self.resolve_name(input.symbols, name)?;
+                    let target = if let Some(resolved) = self.resolved {
+                        Self::unpack_target(
+                            resolved
+                                .name(name)
+                                .context("GC root name is outside resolved namespace")?,
+                        )?
+                    } else {
+                        self.resolve_name(input.symbols, name)?
+                    };
                     if let Some(import) = target.import {
                         referenced_imports.insert(import);
                     }
@@ -503,26 +781,50 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 edge = associative_next[edge as usize];
             }
 
-            let relocations = input
-                .relocations
-                .for_section(section)
-                .context("live section has no relocation CSR row")?;
-            for relocation in relocations {
-                let target = self.resolve_occurrence(input.symbols, *relocation)?;
-                if relocation.typ == 1 && !target.absolute {
-                    dir64_needs.push(Dir64Need {
-                        section,
-                        offset: relocation.offset,
-                    });
+            if let Some(resolved) = self.resolved {
+                let relocations = resolved
+                    .for_section(section)
+                    .context("live section has no resolved relocation CSR row")?;
+                for relocation in relocations {
+                    let target = Self::unpack_target(relocation.target)?;
+                    if relocation.typ == 1 && !target.absolute {
+                        dir64_needs.push(Dir64Need {
+                            section,
+                            offset: relocation.offset,
+                        });
+                    }
+                    if let Some(import) = target.import {
+                        referenced_imports.insert(import);
+                    }
+                    if let Some(name) = target.import_name {
+                        referenced_import_names.insert(name);
+                    }
+                    if let Some(target) = target.section {
+                        mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
+                    }
                 }
-                if let Some(import) = target.import {
-                    referenced_imports.insert(import);
-                }
-                if let Some(name) = target.import_name {
-                    referenced_import_names.insert(name);
-                }
-                if let Some(target) = target.section {
-                    mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
+            } else {
+                let relocations = input
+                    .relocations
+                    .for_section(section)
+                    .context("live section has no relocation CSR row")?;
+                for relocation in relocations {
+                    let target = self.resolve_occurrence(input.symbols, *relocation)?;
+                    if relocation.typ == 1 && !target.absolute {
+                        dir64_needs.push(Dir64Need {
+                            section,
+                            offset: relocation.offset,
+                        });
+                    }
+                    if let Some(import) = target.import {
+                        referenced_imports.insert(import);
+                    }
+                    if let Some(name) = target.import_name {
+                        referenced_import_names.insert(name);
+                    }
+                    if let Some(target) = target.section {
+                        mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
+                    }
                 }
             }
         }

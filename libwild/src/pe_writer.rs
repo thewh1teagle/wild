@@ -1284,6 +1284,7 @@ struct DenseProductionState<'data> {
     ir: pe_ir::PeIr<'data>,
     names: pe_symbol_db::OrderedNameInterner<'data>,
     symbols: pe_symbol_db::SymbolDb,
+    resolved_relocations: pe_ir::ResolvedRelocationCsr,
     resolver_states: Box<[pe_resolver::ResolverNameState]>,
     alternate_targets: Box<[u32]>,
     has_import_providers: bool,
@@ -1412,10 +1413,12 @@ impl<'data> DenseProductionState<'data> {
             finalized.names.len() == resolver_states.len(),
             "canonical name and symbol-state cardinality mismatch"
         );
+        let resolved_relocations = ir.resolve_relocations(&finalized.symbols, &alternate_targets);
         Ok(Self {
             ir,
             names: finalized.names,
             symbols: finalized.symbols,
+            resolved_relocations,
             resolver_states: resolver_states.into_boxed_slice(),
             alternate_targets: alternate_targets.into_boxed_slice(),
             has_import_providers,
@@ -3255,23 +3258,15 @@ struct ComdatResolution {
     analysis: CompactComdatAnalysis,
 }
 
-fn dense_section_id(ir: &pe_ir::PeIr<'_>, key: ObjectSectionKey) -> Result<pe_ir::SectionId> {
-    ir.section_by_raw(
-        pe_ir::ObjectId::from_u32(u32::try_from(key.0).context("PE object index exceeds u32")?),
-        u32::try_from(key.1.0).context("raw COFF section index exceeds u32")?,
-    )
-    .context("COFF section has no dense section record")
-}
-
-/// Convert the already-classified COMDAT result into the sole production REF graph. Selection
-/// events are emitted in dense input order; relocation edges remain in PeIr's CSR and are decoded
-/// only when their canonical source becomes live.
+/// Convert COMDAT analysis directly into dense arrays. CompactComdatAnalysis and PeIr are both
+/// finalized in selected-object/raw-section order; validate that invariant before treating an
+/// analysis node as its SectionId, so a future ordering change fails safely rather than mislinks.
 fn collect_dense_gc(
     dense: &DenseProductionState<'_>,
     comdats: &ComdatResolution,
     roots: &[Vec<u8>],
 ) -> Result<pe_gc::GcOutput> {
-    let mut input_phase = crate::pe_timing_guard!("PE dense GC: Construct input");
+    let mut input_phase = crate::pe_timing_guard!("PE dense GC: Construct direct input");
     input_phase
         .0
         .add(crate::timing::PeMetric::Sections, dense.ir.sections.len());
@@ -3287,95 +3282,53 @@ fn collect_dense_gc(
         dense.ir.relocations.records.len(),
     );
 
-    let mut mapping_phase = crate::pe_timing_guard!("PE dense GC: Map raw sections to dense IDs");
-    mapping_phase.0.add(
-        crate::timing::PeMetric::Sections,
-        comdats.analysis.keys.len(),
+    ensure!(
+        comdats.analysis.keys.len() == dense.ir.sections.len(),
+        "COMDAT analysis/dense section cardinality mismatch"
     );
-    let dense_sections = comdats
+    let mut redirect_targets = (0..dense.ir.sections.len())
+        .map(|index| pe_ir::SectionId::from_u32(index as u32))
+        .collect::<Vec<_>>();
+    let mut discarded = vec![false; dense.ir.sections.len()];
+    for (node, (&key, section)) in comdats
         .analysis
         .keys
         .iter()
-        .copied()
-        .map(|key| dense_section_id(&dense.ir, key))
-        .collect::<Result<Vec<_>>>()?;
-    drop(mapping_phase);
-
-    let mut events_phase = crate::pe_timing_guard!("PE dense GC: Build selection events");
-    let mut events = Vec::new();
-    for (node, &key) in comdats.analysis.keys.iter().enumerate() {
-        let section = dense_sections[node];
-        if comdats.discarded.contains(&key) {
-            events.push(pe_gc::GcEvent::Discard { section });
-        }
+        .zip(dense.ir.sections.iter())
+        .enumerate()
+    {
+        ensure!(
+            key.0 == section.object.index() && key.1.0 == section.raw_index as usize,
+            "COMDAT analysis node order differs from dense SectionId order"
+        );
+        discarded[node] = comdats.discarded.contains(&key);
         if let Some(&target) = comdats.redirects.get(&key) {
             let target_node = comdats
                 .analysis
                 .node(target)
                 .context("COMDAT redirect target has no analysis node")?;
-            events.push(pe_gc::GcEvent::Redirect {
-                from: section,
-                to: dense_sections[target_node],
-            });
-        }
-        if !comdats.analysis.is_comdat[node] {
-            events.push(pe_gc::GcEvent::RootSection {
-                section,
-                reason: pe_gc::RootReason::NonComdat,
-            });
+            redirect_targets[node] = pe_ir::SectionId::from_u32(
+                u32::try_from(target_node).context("redirect target exceeds dense ID range")?,
+            );
         }
     }
-    for (section_index, section) in dense.ir.sections.iter().enumerate() {
-        if let Some(parent) = section.associative_section.get() {
-            events.push(pe_gc::GcEvent::AssociativeEdge {
-                parent,
-                child: pe_ir::SectionId::from_u32(
-                    u32::try_from(section_index).context("dense section index exceeds u32")?,
-                ),
-            });
-        }
-    }
-    events_phase
-        .0
-        .add(crate::timing::PeMetric::Sections, dense_sections.len());
-    events_phase
-        .0
-        .add(crate::timing::PeMetric::Events, events.len());
-    events_phase
-        .0
-        .add(crate::timing::PeMetric::Lookups, comdats.redirects.len());
-    drop(events_phase);
 
-    let mut roots_phase = crate::pe_timing_guard!("PE dense GC: Build root events");
-    let events_before_roots = events.len();
+    let mut root_names = Vec::with_capacity(roots.len());
     for root in roots {
         let hash = crate::hash::hash_bytes(root);
         if let Some(name) = dense.names.lookup_prehashed(root, hash) {
-            events.push(pe_gc::GcEvent::RootSymbol {
-                name,
-                reason: pe_gc::RootReason::CommandLine,
-            });
+            root_names.push(name);
         }
     }
-    roots_phase
-        .0
-        .add(crate::timing::PeMetric::Names, roots.len());
-    roots_phase.0.add(
-        crate::timing::PeMetric::Events,
-        events.len() - events_before_roots,
-    );
-    roots_phase
-        .0
-        .add(crate::timing::PeMetric::Lookups, roots.len());
-    drop(roots_phase);
 
-    let mut groups_phase = crate::pe_timing_guard!("PE dense GC: Build group input");
     let mut groups = Vec::with_capacity(comdats.analysis.groups.len());
     let mut group_members = Vec::new();
     for group in &comdats.analysis.groups {
         let start = u32::try_from(group_members.len()).context("too many COMDAT group members")?;
         for &node in group {
-            group_members.push(dense_sections[node]);
+            group_members.push(pe_ir::SectionId::from_u32(
+                u32::try_from(node).context("COMDAT node exceeds dense ID range")?,
+            ));
         }
         let Some(&leader) = group_members.get(start as usize) else {
             return Err(error!("empty COMDAT reachability group"));
@@ -3386,31 +3339,22 @@ fn collect_dense_gc(
             member_len: u32::try_from(group.len()).context("COMDAT group is too large")?,
         });
     }
-    groups_phase
-        .0
-        .add(crate::timing::PeMetric::Groups, groups.len());
-    groups_phase
-        .0
-        .add(crate::timing::PeMetric::Sections, group_members.len());
-    drop(groups_phase);
-
-    let section_count =
-        u32::try_from(dense.ir.sections.len()).context("dense PE section count exceeds u32")?;
-    let mut collector = pe_gc::DenseEventGc::new(&dense.ir, &dense.alternate_targets);
+    let collector = pe_gc::DenseEventGc::new_resolved(
+        &dense.ir,
+        &dense.alternate_targets,
+        &dense.resolved_relocations,
+    );
     input_phase
         .0
-        .add(crate::timing::PeMetric::Events, events.len());
-    pe_gc::EventDrivenGc::collect(
-        &mut collector,
-        pe_gc::GcInput {
-            section_count,
-            events: &events,
-            groups: &groups,
-            group_members: &group_members,
-            relocations: &dense.ir.relocations,
-            symbols: &dense.symbols,
-        },
-    )
+        .add(crate::timing::PeMetric::Events, comdats.redirects.len());
+    collector.collect_production(pe_gc::ProductionGcInput {
+        redirect_targets,
+        discarded,
+        is_comdat: &comdats.analysis.is_comdat,
+        root_names: &root_names,
+        groups: &groups,
+        group_members: &group_members,
+    })
 }
 
 fn record_comdat_redirects(
@@ -4367,6 +4311,60 @@ fn find_local_symbol(
     Ok(None)
 }
 
+fn dense_section_targets(
+    dense: &DenseProductionState<'_>,
+    layout: &SectionLayout,
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    dense_gc: Option<&pe_gc::GcOutput>,
+) -> Result<Vec<Option<DenseSectionTarget>>> {
+    let mut output = Vec::with_capacity(dense.ir.sections.len());
+    for (index, record) in dense.ir.sections.iter().enumerate() {
+        let section = pe_ir::SectionId::from_u32(
+            u32::try_from(index).context("dense section index exceeds u32")?,
+        );
+        let selected = if let Some(gc) = dense_gc {
+            gc.canonical(section)
+                .and_then(|section| dense.ir.sections.get(section.index()))
+        } else {
+            let key = (
+                record.object.index(),
+                object::SectionIndex(record.raw_index as usize),
+            );
+            redirected_location(locations, redirects, key)?.and_then(|((object, raw), _)| {
+                dense
+                    .ir
+                    .section_by_raw(
+                        pe_ir::ObjectId::from_u32(object as u32),
+                        u32::try_from(raw.0).ok()?,
+                    )
+                    .and_then(|section| dense.ir.sections.get(section.index()))
+            })
+        };
+        let Some(selected) = selected else {
+            output.push(None);
+            continue;
+        };
+        let key = (
+            selected.object.index(),
+            object::SectionIndex(selected.raw_index as usize),
+        );
+        let Some(id) = locations.get(&key) else {
+            output.push(None);
+            continue;
+        };
+        let placement = &layout.placements[id];
+        output.push(Some(DenseSectionTarget {
+            rva: placement.rva,
+            output_section_rva: layout.sections[placement.output_section].rva,
+            output_section_index: u16::try_from(placement.output_section + 1)
+                .context("PE section index exceeds u16")?,
+            size: selected.size,
+        }));
+    }
+    Ok(output)
+}
+
 fn copy_and_apply_relocations(
     objects: &[crate::coff::CoffObject<'_>],
     dense: Option<&DenseProductionState<'_>>,
@@ -4381,6 +4379,9 @@ fn copy_and_apply_relocations(
     image: &mut [u8],
 ) -> Result<()> {
     validate_object_output_ranges(contributions, layout, image.len())?;
+    let dense_targets = dense
+        .map(|dense| dense_section_targets(dense, layout, locations, redirects, dense_gc))
+        .transpose()?;
     let parallel_image = pe_layout::DisjointOutput::new(image);
     let copy = |contribution: &Contribution| match dense {
         Some(dense) => copy_and_relocate_dense_contribution(
@@ -4390,6 +4391,7 @@ fn copy_and_apply_relocations(
             locations,
             redirects,
             dense_gc,
+            dense_targets.as_deref(),
             definitions,
             absolute_symbols,
             image_base,
@@ -4494,6 +4496,14 @@ struct PreparedRelocation {
     absolute_value: Option<u64>,
     contribution_rva: u32,
     offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DenseSectionTarget {
+    rva: u32,
+    output_section_rva: u32,
+    output_section_index: u16,
+    size: u32,
 }
 
 impl PreparedRelocation {
@@ -4602,6 +4612,7 @@ fn copy_and_relocate_dense_contribution(
     locations: &LocationMap,
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
+    dense_targets: Option<&[Option<DenseSectionTarget>]>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
@@ -4626,10 +4637,9 @@ fn copy_and_relocate_dense_contribution(
         .context("real contribution has no dense PE section")?;
     let record = &dense.ir.sections[section.index()];
     let relocations = dense
-        .ir
-        .relocations
+        .resolved_relocations
         .for_section(section)
-        .context("dense PE section has no relocation row")?;
+        .context("dense PE section has no resolved relocation row")?;
     let placement = &layout.placements[&contribution.spec.id];
     let Some(file_offset) = placement.file_offset else {
         ensure!(
@@ -4664,6 +4674,7 @@ fn copy_and_relocate_dense_contribution(
             locations,
             redirects,
             dense_gc,
+            dense_targets,
             definitions,
             absolute_symbols,
             image_base,
@@ -4687,108 +4698,128 @@ fn prepare_dense_relocation(
     locations: &LocationMap,
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
+    dense_targets: Option<&[Option<DenseSectionTarget>]>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     placement: &linker_utils::pe_sections::ContributionPlacement,
-    relocation: pe_ir::RelocationRecord,
+    relocation: pe_ir::ResolvedRelocationRecord,
 ) -> Result<PreparedRelocation> {
     use linker_utils::coff::Amd64RelocationInputs;
     use linker_utils::coff::ImageBase;
     use linker_utils::coff::Rva;
     use linker_utils::coff::SectionIndex;
 
-    let symbol = dense.ir.relocation_target(relocation)?;
-    let name = dense
-        .names
-        .bytes(symbol.name)
-        .context("relocation target has an invalid canonical name")?;
-    let is_global = symbol.flags & 1 != 0;
-    let (target, target_section, target_section_index, absolute_value) = if is_global
-        && let Some(address) = definitions.get(name)
+    let (target, target_section, target_section_index, absolute_value) = if let Some(section) =
+        relocation.target.section_id()
     {
-        if let Some(value) = absolute_symbols.get(name) {
-            (0, 0, 0, Some(*value))
-        } else {
-            let (target, section, index) = target_location(layout, image_base, *address)?;
-            (target, section, index, None)
-        }
-    } else if let Some(section) = symbol.section.get() {
-        let (selected, id) = if let Some(gc) = dense_gc {
-            let canonical = gc
-                .canonical(section)
-                .context("dense GC has no canonical relocation target")?;
-            let selected = dense
-                .ir
-                .sections
-                .get(canonical.index())
-                .context("canonical dense relocation target is invalid")?;
-            let key = (
-                selected.object.index(),
-                object::SectionIndex(selected.raw_index as usize),
-            );
-            let id = *locations.get(&key).ok_or_else(|| {
-                error!(
-                    "relocation targets discarded canonical section {}:{:?} via symbol `{}`",
-                    key.0,
-                    key.1,
-                    String::from_utf8_lossy(name)
-                )
-            })?;
-            (selected, id)
-        } else {
-            let target_record = dense
-                .ir
-                .sections
+        if let Some(targets) = dense_targets {
+            let target = targets
                 .get(section.index())
-                .context("dense relocation target section is invalid")?;
-            let target_object = target_record.object.index();
-            let target_raw = object::SectionIndex(target_record.raw_index as usize);
-            let ((selected_object, selected_raw), id) = redirected_location(
-                locations,
-                redirects,
-                (target_object, target_raw),
-            )?
-            .ok_or_else(|| {
-                error!(
-                    "relocation targets discarded section {target_object}:{target_raw:?} via symbol `{}`",
-                    String::from_utf8_lossy(name)
-                )
-            })?;
-            let selected = dense
-                .ir
-                .section_by_raw(
-                    pe_ir::ObjectId::from_u32(
-                        u32::try_from(selected_object).context("selected object exceeds u32")?,
-                    ),
-                    u32::try_from(selected_raw.0).context("selected section exceeds u32")?,
-                )
-                .and_then(|section| dense.ir.sections.get(section.index()))
-                .context("COMDAT redirect target has no dense section")?;
-            (selected, id)
-        };
-        ensure!(
-            symbol.value <= u64::from(selected.size),
-            "symbol offset exceeds selected COMDAT section"
-        );
-        let target_placement = &layout.placements[&id];
-        let target = target_placement
-            .rva
-            .checked_add(u32::try_from(symbol.value).context("COFF symbol offset exceeds u32")?)
-            .context("COFF symbol RVA overflow")?;
-        (
-            target,
-            layout.sections[target_placement.output_section].rva,
-            u16::try_from(target_placement.output_section + 1)
-                .context("PE section index exceeds u16")?,
-            None,
-        )
+                .copied()
+                .flatten()
+                .context("relocation targets a discarded dense section")?;
+            ensure!(
+                relocation.target.value <= target.size,
+                "symbol offset exceeds selected COMDAT section"
+            );
+            (
+                target
+                    .rva
+                    .checked_add(relocation.target.value)
+                    .context("COFF symbol RVA overflow")?,
+                target.output_section_rva,
+                target.output_section_index,
+                None,
+            )
+        } else {
+            let (selected, id) = if let Some(gc) = dense_gc {
+                let canonical = gc
+                    .canonical(section)
+                    .context("dense GC has no canonical relocation target")?;
+                let selected = dense
+                    .ir
+                    .sections
+                    .get(canonical.index())
+                    .context("canonical dense relocation target is invalid")?;
+                let key = (
+                    selected.object.index(),
+                    object::SectionIndex(selected.raw_index as usize),
+                );
+                let id = *locations.get(&key).ok_or_else(|| {
+                    error!(
+                        "relocation targets discarded canonical section {}:{:?}",
+                        key.0, key.1
+                    )
+                })?;
+                (selected, id)
+            } else {
+                let target_record = dense
+                    .ir
+                    .sections
+                    .get(section.index())
+                    .context("dense relocation target section is invalid")?;
+                let target_object = target_record.object.index();
+                let target_raw = object::SectionIndex(target_record.raw_index as usize);
+                let ((selected_object, selected_raw), id) = redirected_location(
+                    locations,
+                    redirects,
+                    (target_object, target_raw),
+                )?
+                .ok_or_else(|| {
+                    error!("relocation targets discarded section {target_object}:{target_raw:?}")
+                })?;
+                let selected = dense
+                    .ir
+                    .section_by_raw(
+                        pe_ir::ObjectId::from_u32(
+                            u32::try_from(selected_object)
+                                .context("selected object exceeds u32")?,
+                        ),
+                        u32::try_from(selected_raw.0).context("selected section exceeds u32")?,
+                    )
+                    .and_then(|section| dense.ir.sections.get(section.index()))
+                    .context("COMDAT redirect target has no dense section")?;
+                (selected, id)
+            };
+            ensure!(
+                u64::from(relocation.target.value) <= u64::from(selected.size),
+                "symbol offset exceeds selected COMDAT section"
+            );
+            let target_placement = &layout.placements[&id];
+            let target = target_placement
+                .rva
+                .checked_add(relocation.target.value)
+                .context("COFF symbol RVA overflow")?;
+            (
+                target,
+                layout.sections[target_placement.output_section].rva,
+                u16::try_from(target_placement.output_section + 1)
+                    .context("PE section index exceeds u16")?,
+                None,
+            )
+        }
     } else {
+        if relocation.target.kind == pe_ir::ResolvedTargetKind::Diagnostic {
+            return Err(error!(
+                "Invalid COFF relocation symbol {}",
+                relocation.target.target
+            ));
+        }
+        let name = relocation
+            .target
+            .name_id()
+            .and_then(|name| dense.names.bytes(name))
+            .context("relocation target has an invalid canonical name")?;
         let address = *definitions
             .get(name)
             .ok_or_else(|| error!("undefined symbol `{}`", String::from_utf8_lossy(name)))?;
-        let (target, section, index) = target_location(layout, image_base, address)?;
-        (target, section, index, None)
+        if let Some(value) = absolute_symbols.get(name) {
+            (0, 0, 0, Some(*value))
+        } else {
+            let (target, section, index) = target_location(layout, image_base, address)?;
+            (target, section, index, None)
+        }
     };
     let kind = linker_utils::coff::Amd64RelocationKind::from_type(object::pe::RelocationType(
         relocation.typ,

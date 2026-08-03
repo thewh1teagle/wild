@@ -9,6 +9,9 @@
 use super::pe_resolver::SelectedGlobalSymbol;
 use super::pe_symbol_db::DeferredInvalidName;
 use super::pe_symbol_db::OrderedNameInterner;
+use super::pe_symbol_db::ProviderKind;
+use super::pe_symbol_db::ResolutionState;
+use super::pe_symbol_db::SymbolDb;
 use crate::coff::CoffDeferredNameError;
 use crate::coff::CoffObject;
 use crate::error::Result;
@@ -244,6 +247,106 @@ pub(super) struct RelocationCsr {
     pub(super) records: Box<[RelocationRecord]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum ResolvedTargetKind {
+    Section,
+    Import,
+    Absolute,
+    Name,
+    Diagnostic,
+}
+
+/// Canonical semantic outcome shared by section GC and final relocation application. `target` is
+/// a SectionId for Section, a canonical NameId for Import/Absolute/Name, and a raw symbol index
+/// for Diagnostic. `value` is the section-relative symbol value or selected ImportId.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(super) struct ResolvedTarget {
+    pub(super) target: u32,
+    pub(super) value: u32,
+    pub(super) kind: ResolvedTargetKind,
+    pub(super) flags: u8,
+    pub(super) reserved: u16,
+}
+
+impl ResolvedTarget {
+    const fn section(section: SectionId, value: u32) -> Self {
+        Self {
+            target: section.get(),
+            value,
+            kind: ResolvedTargetKind::Section,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    const fn named(kind: ResolvedTargetKind, name: NameId, value: u32) -> Self {
+        Self {
+            target: name.get(),
+            value,
+            kind,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    const fn diagnostic(raw_symbol: u32) -> Self {
+        Self {
+            target: raw_symbol,
+            value: 0,
+            kind: ResolvedTargetKind::Diagnostic,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    pub(super) const fn section_id(self) -> Option<SectionId> {
+        match self.kind {
+            ResolvedTargetKind::Section => Some(SectionId::from_u32(self.target)),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn name_id(self) -> Option<NameId> {
+        match self.kind {
+            ResolvedTargetKind::Import
+            | ResolvedTargetKind::Absolute
+            | ResolvedTargetKind::Name => Some(NameId::from_u32(self.target)),
+            ResolvedTargetKind::Section | ResolvedTargetKind::Diagnostic => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(super) struct ResolvedRelocationRecord {
+    pub(super) offset: u32,
+    pub(super) target: ResolvedTarget,
+    pub(super) typ: u16,
+    pub(super) flags: u16,
+}
+
+#[derive(Debug)]
+pub(super) struct ResolvedRelocationCsr {
+    pub(super) starts: Box<[u32]>,
+    pub(super) records: Box<[ResolvedRelocationRecord]>,
+    pub(super) names: Box<[ResolvedTarget]>,
+}
+
+impl ResolvedRelocationCsr {
+    pub(super) fn for_section(&self, section: SectionId) -> Option<&[ResolvedRelocationRecord]> {
+        let next = section.index().checked_add(1)?;
+        let start = *self.starts.get(section.index())? as usize;
+        let end = *self.starts.get(next)? as usize;
+        self.records.get(start..end)
+    }
+
+    pub(super) fn name(&self, name: NameId) -> Option<ResolvedTarget> {
+        self.names.get(name.index()).copied()
+    }
+}
+
 impl RelocationCsr {
     pub(super) fn range(&self, section: SectionId) -> Option<Range<usize>> {
         let next = section.index().checked_add(1)?;
@@ -284,6 +387,114 @@ pub(super) struct SelectedObjectFinalization<'data> {
 }
 
 impl<'data> PeIr<'data> {
+    pub(super) fn resolve_relocations(
+        &self,
+        symbols: &SymbolDb,
+        alternate_targets: &[u32],
+    ) -> ResolvedRelocationCsr {
+        let names = (0..symbols.entries.len())
+            .map(|index| {
+                self.resolve_name_target(symbols, alternate_targets, NameId::from_u32(index as u32))
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let records = self
+            .relocations
+            .records
+            .iter()
+            .map(|relocation| {
+                let target = self.symbols.get(relocation.target.index()).map_or_else(
+                    || ResolvedTarget::diagnostic(relocation.target.get()),
+                    |symbol| {
+                        if symbol.diagnostic == SymbolDiagnostic::InvalidRelocationTarget {
+                            return ResolvedTarget::diagnostic(symbol.raw_index);
+                        }
+                        if symbol.flags & 1 == 0
+                            && let Some(section) = symbol.section.get()
+                        {
+                            return u32::try_from(symbol.value).map_or_else(
+                                |_| ResolvedTarget::diagnostic(symbol.raw_index),
+                                |value| ResolvedTarget::section(section, value),
+                            );
+                        }
+                        names
+                            .get(symbol.name.index())
+                            .copied()
+                            .unwrap_or_else(|| ResolvedTarget::diagnostic(symbol.raw_index))
+                    },
+                );
+                ResolvedRelocationRecord {
+                    offset: relocation.offset,
+                    target,
+                    typ: relocation.typ,
+                    flags: relocation.flags,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        ResolvedRelocationCsr {
+            starts: self.relocations.starts.clone(),
+            records,
+            names,
+        }
+    }
+
+    fn resolve_name_target(
+        &self,
+        symbols: &SymbolDb,
+        alternate_targets: &[u32],
+        mut name: NameId,
+    ) -> ResolvedTarget {
+        for _ in 0..=symbols.entries.len() {
+            let Some(entry) = symbols.entry(name) else {
+                return ResolvedTarget::diagnostic(name.get());
+            };
+            if entry.resolution.state() == ResolutionState::Resolved {
+                let Some(provider) = entry
+                    .resolution
+                    .provider()
+                    .and_then(|provider| symbols.provider(provider))
+                else {
+                    return ResolvedTarget::diagnostic(name.get());
+                };
+                return match provider.kind() {
+                    ProviderKind::ObjectSymbol => {
+                        let Some(symbol) = self.symbols.get(provider.subject as usize) else {
+                            return ResolvedTarget::diagnostic(name.get());
+                        };
+                        match symbol.section.get() {
+                            Some(section) => u32::try_from(symbol.value).map_or_else(
+                                |_| ResolvedTarget::diagnostic(symbol.raw_index),
+                                |value| ResolvedTarget::section(section, value),
+                            ),
+                            None => ResolvedTarget::named(ResolvedTargetKind::Name, name, 0),
+                        }
+                    }
+                    ProviderKind::Import => {
+                        ResolvedTarget::named(ResolvedTargetKind::Import, name, provider.subject)
+                    }
+                    ProviderKind::Absolute | ProviderKind::LinkerDefined => {
+                        ResolvedTarget::named(ResolvedTargetKind::Absolute, name, provider.subject)
+                    }
+                    ProviderKind::ArchiveMember => ResolvedTarget::diagnostic(name.get()),
+                };
+            }
+            if let Some(fallback) = entry.weak_fallback() {
+                name = fallback;
+                continue;
+            }
+            let alternate = alternate_targets
+                .get(name.index())
+                .copied()
+                .unwrap_or(u32::MAX);
+            if alternate == u32::MAX {
+                return ResolvedTarget::named(ResolvedTargetKind::Name, name, 0);
+            }
+            name = NameId::from_u32(alternate);
+        }
+        ResolvedTarget::diagnostic(name.get())
+    }
+
     /// Authoritative raw COFF symbol to dense-symbol mapping within one selected object.
     pub(super) fn symbol_by_raw(&self, object: ObjectId, raw_symbol: u32) -> Option<SymbolId> {
         let object = self.objects.get(object.index())?;
