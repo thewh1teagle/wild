@@ -106,6 +106,25 @@ impl<'data> ResolverSession<'data> {
         self.symbol_state.absorbed_objects
     }
 
+    /// Returns whether a regular archive member can define `name`.
+    ///
+    /// PE linkers implicitly retain the CRT's `_load_config_used` object when
+    /// it is available, even though ordinary application code does not refer
+    /// to that symbol. The caller uses this query to add that conditional root
+    /// without turning an absent optional symbol into an unresolved external.
+    pub(super) fn has_archive_definition(&self, name: &[u8]) -> bool {
+        self.archives.iter().any(|archive| {
+            archive.members().iter().any(|member| {
+                matches!(member.kind(), CoffArchiveMemberKind::CoffObject { .. })
+                    && member.definitions().any(|definition| definition == name)
+            })
+        })
+    }
+
+    pub(super) fn define_linker_symbol(&mut self, name: &[u8]) {
+        self.symbol_state.define(name);
+    }
+
     pub(super) fn resolve(
         &mut self,
         objects: &mut Vec<crate::coff::CoffObject<'data>>,
@@ -348,6 +367,33 @@ fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> R
 mod tests {
     use super::*;
     use object::pe;
+
+    #[test]
+    fn optional_archive_root_extracts_only_when_available() {
+        let library = archive(&[("loadcfg.obj", coff_object(&["loadcfg"], &[]))]);
+        let mut session = ResolverSession::new();
+        session.add_archive(&library, false).unwrap();
+        assert!(session.has_archive_definition(b"loadcfg"));
+        let mut objects = Vec::new();
+        session
+            .resolve(
+                &mut objects,
+                &[b"loadcfg".to_vec()],
+                &mut RuntimeResolution::new(),
+            )
+            .unwrap();
+        assert_eq!(objects.len(), 1);
+
+        let unrelated = archive(&[("other.obj", coff_object(&["other"], &[]))]);
+        let mut session = ResolverSession::new();
+        session.add_archive(&unrelated, false).unwrap();
+        assert!(!session.has_archive_definition(b"loadcfg"));
+        let mut objects = Vec::new();
+        session
+            .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+            .unwrap();
+        assert!(objects.is_empty());
+    }
 
     #[test]
     fn later_archive_observes_definitions_and_demands_from_earlier_archive() {
