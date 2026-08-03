@@ -1154,6 +1154,11 @@ fn collect_contributions(
     objects: &[crate::coff::CoffObject<'_>],
     args: &crate::args::coff::CoffArgs,
 ) -> Result<Vec<Contribution>> {
+    if args.guard.control_flow == crate::args::coff::OptSetting::Enabled {
+        return Err(error!(
+            "explicit /GUARD:CF is not yet supported; refusing to emit incomplete CFG/load-config metadata"
+        ));
+    }
     let mut output = Vec::new();
     let discarded_comdats = discarded_comdat_sections(objects)?;
     for (object_index, input) in objects.iter().enumerate() {
@@ -1165,6 +1170,11 @@ fn collect_contributions(
             };
             let class = linker_utils::coff_symbols::classify_section(flags)
                 .context("invalid COFF section flags")?;
+            if guard_metadata_policy(raw_name, args.guard.control_flow)?
+                == GuardMetadataPolicy::Discard
+            {
+                continue;
+            }
             reject_unsupported_metadata_section(raw_name)?;
             if class.discardable
                 || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
@@ -1234,16 +1244,40 @@ fn reject_unsupported_metadata_section(name: &[u8]) -> Result<()> {
             String::from_utf8_lossy(name)
         ));
     }
-    if [b".gfids".as_slice(), b".giats", b".gljmp", b".gehcont"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        return Err(error!(
-            "Guard metadata section `{}` is not yet supported; refusing to emit an incomplete load-config directory",
-            String::from_utf8_lossy(name)
-        ));
-    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardMetadataPolicy {
+    Keep,
+    Discard,
+}
+
+fn guard_metadata_policy(
+    name: &[u8],
+    control_flow: crate::args::coff::OptSetting,
+) -> Result<GuardMetadataPolicy> {
+    let is_guard_metadata = [b".gfids".as_slice(), b".giats", b".gljmp", b".gehcont"]
+        .iter()
+        .any(|prefix| {
+            name == *prefix
+                || name
+                    .strip_prefix(*prefix)
+                    .is_some_and(|tail| tail.starts_with(b"$"))
+        });
+    if !is_guard_metadata {
+        return Ok(GuardMetadataPolicy::Keep);
+    }
+
+    match control_flow {
+        crate::args::coff::OptSetting::Default | crate::args::coff::OptSetting::Disabled => {
+            Ok(GuardMetadataPolicy::Discard)
+        }
+        crate::args::coff::OptSetting::Enabled => Err(error!(
+            "Guard metadata section `{}` is not yet supported; refusing to emit an incomplete load-config directory for explicit /GUARD:CF",
+            String::from_utf8_lossy(name)
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -2132,6 +2166,27 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn guard_metadata_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0xc3], 1);
+        for name in [
+            b".gfids$y".as_slice(),
+            b".giats$y",
+            b".gljmp$y",
+            b".gehcont$y",
+        ] {
+            let section =
+                object.add_section(Vec::new(), name.to_vec(), object::SectionKind::ReadOnlyData);
+            object.append_section_data(section, &0u32.to_le_bytes(), 4);
+        }
+        object.write().unwrap()
+    }
+
     #[test]
     fn args_drive_writer_configuration() {
         let args = crate::args::coff::CoffArgs {
@@ -2366,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tls_and_guard_metadata_until_resolver_support_exists() {
+    fn rejects_tls_metadata_until_resolver_support_exists() {
         assert!(
             reject_unsupported_metadata_section(b".tls$AAA")
                 .unwrap_err()
@@ -2379,12 +2434,57 @@ mod tests {
                 .to_string()
                 .contains("TLS callback")
         );
-        assert!(
-            reject_unsupported_metadata_section(b".gfids$y")
-                .unwrap_err()
-                .to_string()
-                .contains("Guard metadata")
+    }
+
+    #[test]
+    fn default_guard_policy_discards_guard_metadata_only() {
+        let bytes = guard_metadata_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let contributions =
+            collect_contributions(&[object], &crate::args::coff::CoffArgs::default()).unwrap();
+        assert_eq!(
+            contributions
+                .iter()
+                .map(|contribution| contribution.spec.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b".text".as_slice()]
         );
+    }
+
+    #[test]
+    fn disabled_guard_policy_discards_guard_metadata_only() {
+        let bytes = guard_metadata_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let args = crate::args::coff::CoffArgs {
+            guard: crate::args::coff::GuardOptions {
+                control_flow: crate::args::coff::OptSetting::Disabled,
+                no_long_jump: false,
+            },
+            ..Default::default()
+        };
+        let contributions = collect_contributions(&[object], &args).unwrap();
+        assert_eq!(
+            contributions
+                .iter()
+                .map(|contribution| contribution.spec.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b".text".as_slice()]
+        );
+    }
+
+    #[test]
+    fn enabled_guard_policy_refuses_to_silently_weaken_cfg() {
+        let bytes = guard_metadata_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let args = crate::args::coff::CoffArgs {
+            guard: crate::args::coff::GuardOptions {
+                control_flow: crate::args::coff::OptSetting::Enabled,
+                no_long_jump: false,
+            },
+            ..Default::default()
+        };
+        let error = collect_contributions(&[object], &args).unwrap_err();
+        assert!(error.to_string().contains("explicit /GUARD:CF"));
     }
 
     #[test]
