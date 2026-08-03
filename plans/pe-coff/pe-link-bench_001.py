@@ -188,17 +188,25 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def tool_version_command(tool: Tool) -> list[str]:
+    if tool.name == "wild":
+        return [str(tool.path), "-flavor", "gnu", "--version"]
+    return [str(tool.path), "--version"]
+
+
 def tool_metadata(tool: Tool) -> dict[str, Any]:
     try:
         completed = subprocess.run(
-            [str(tool.path), "--version"],
+            tool_version_command(tool),
             text=True,
             capture_output=True,
             timeout=15,
             check=False,
         )
         version = (completed.stdout or completed.stderr).splitlines()
-        version_text = version[0].strip() if version else "unknown"
+        version_text = (
+            version[0].strip() if completed.returncode == 0 and version else "unknown"
+        )
     except (OSError, subprocess.TimeoutExpired):
         version_text = "unknown"
     return {
@@ -1172,6 +1180,32 @@ def minimal_pe() -> bytes:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_tool_metadata_uses_flavor_neutral_wild_version_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "linker.exe"
+            executable.write_bytes(b"linker")
+            wild = Tool("wild", executable, ("-flavor", "link"))
+            lld = Tool("lld-link", executable, ())
+            with mock.patch(
+                f"{__name__}.subprocess.run",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, "Wild 0.9.0 abc\n", ""),
+                    subprocess.CompletedProcess([], 0, "LLD 22.1.8\n", ""),
+                ],
+            ) as run:
+                wild_metadata = tool_metadata(wild)
+                lld_metadata = tool_metadata(lld)
+
+        self.assertEqual(wild_metadata["version"], "Wild 0.9.0 abc")
+        self.assertEqual(lld_metadata["version"], "LLD 22.1.8")
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                [str(executable), "-flavor", "gnu", "--version"],
+                [str(executable), "--version"],
+            ],
+        )
+
     def test_statistics(self) -> None:
         summary = summarize([1.0, 2.0, 3.0, 100.0])
         self.assertEqual(summary["samples"], 4)
