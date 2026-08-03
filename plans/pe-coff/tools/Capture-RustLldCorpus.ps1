@@ -112,14 +112,28 @@ function Test-ReproduceArchive {
     if ($listing.ExitCode -ne 0) { return $false }
     $responseEntry = @($listing.Output | Where-Object { $_ -match '(^|/)response\.txt$' })
     if ($responseEntry.Count -ne 1) { return $false }
-    $response = Invoke-Captured -FilePath 'tar.exe' -ArgumentList @('-xOf', $ArchivePath, $responseEntry[0]) -AllowFailure
-    if ($response.ExitCode -ne 0 -or $response.Output.Count -eq 0) { return $false }
-    $responseText = $response.Output -join [Environment]::NewLine
-    if ($responseText -notmatch '(?im)(^|\s)[/-](out|entry|subsystem|machine):') { return $false }
-    if ($ExtractResponseTo) {
-        [IO.File]::WriteAllText($ExtractResponseTo, $responseText + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $relativeResponse = $responseEntry[0].Replace('\', '/')
+    while ($relativeResponse.StartsWith('./')) { $relativeResponse = $relativeResponse.Substring(2) }
+    if ($relativeResponse.StartsWith('/') -or $relativeResponse -match '^[A-Za-z]:' -or @($relativeResponse.Split('/') | Where-Object { $_ -eq '..' }).Count -gt 0) { return $false }
+
+    $temporaryParent = if ($ExtractResponseTo) { Split-Path -Parent (Get-FullPath $ExtractResponseTo) } else { [IO.Path]::GetTempPath() }
+    if (-not (Test-Path -LiteralPath $temporaryParent -PathType Container)) { return $false }
+    $temporaryDirectory = Join-Path $temporaryParent ('.lld-response-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+    try {
+        $extract = Invoke-Captured -FilePath 'tar.exe' -ArgumentList @('-xf', $ArchivePath, '-C', $temporaryDirectory, $responseEntry[0]) -AllowFailure
+        if ($extract.ExitCode -ne 0) { return $false }
+        $extractedResponse = Get-FullPath (Join-Path $temporaryDirectory ($relativeResponse.Replace('/', [IO.Path]::DirectorySeparatorChar)))
+        if (-not (Test-IsInside -Candidate $extractedResponse -Parent $temporaryDirectory)) { return $false }
+        if (-not (Test-Path -LiteralPath $extractedResponse -PathType Leaf) -or (Get-Item -LiteralPath $extractedResponse).Length -eq 0) { return $false }
+        $responseText = [IO.File]::ReadAllText($extractedResponse)
+        if ($responseText -notmatch '(?im)(^|\s)[/-](out|entry|subsystem|machine):') { return $false }
+        if ($ExtractResponseTo) { Copy-Item -LiteralPath $extractedResponse -Destination $ExtractResponseTo }
+        return $true
     }
-    return $true
+    finally {
+        if (Test-Path -LiteralPath $temporaryDirectory) { Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force }
+    }
 }
 
 function Test-ExtractedResponse {
