@@ -131,6 +131,8 @@ pub(crate) fn link<F: FileSystem>(
         "/NOENTRY is only valid with /DLL"
     );
 
+    let definition = load_definition_file(fs, args)?;
+
     let mut requested = Vec::new();
     for input in &args.common.inputs {
         match &input.spec {
@@ -146,7 +148,8 @@ pub(crate) fn link<F: FileSystem>(
     for request in requested {
         open_input(fs, &request, args, &input_storage, &mut inputs, false)?;
     }
-    let selected = select_inputs_to_fixpoint(fs, args, &input_storage, &mut inputs)?;
+    let selected =
+        select_inputs_to_fixpoint(fs, args, &definition.exports, &input_storage, &mut inputs)?;
     let objects = selected.objects;
     let resources = selected.resources;
     let archive_bytes = selected.archive_bytes;
@@ -169,12 +172,15 @@ pub(crate) fn link<F: FileSystem>(
     let undefined =
         resolved_undefined_symbols(&objects, &roots, &archive_definitions, &runtime_resolution)?;
     let imports = pe_imports::select_from_libraries(&archive_bytes, &undefined)?;
-    let dll_name = args
-        .common
-        .output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("PE output file name is not valid UTF-8")?;
+    let dll_name = if let Some(name) = definition.module_name.as_deref() {
+        name
+    } else {
+        args.common
+            .output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("PE output file name is not valid UTF-8")?
+    };
     let image = build_image(
         &objects,
         &imports,
@@ -203,6 +209,112 @@ pub(crate) fn link<F: FileSystem>(
         write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
     }
     Ok(crate::LinkerOutput { layout: None })
+}
+
+#[derive(Debug)]
+struct LoadedDefinitionFile {
+    exports: Vec<crate::args::coff::ExportSpec>,
+    module_name: Option<String>,
+}
+
+fn load_definition_file<F: FileSystem>(
+    fs: &F,
+    args: &crate::args::coff::CoffArgs,
+) -> Result<LoadedDefinitionFile> {
+    let mut exports = args.exports.clone();
+    let mut module_name = None;
+    for path in &args.definition_files {
+        let (input, _) = fs
+            .open_input(path, args.common.prepopulate_maps)
+            .with_context(|| {
+                format!("failed to open module-definition file `{}`", path.display())
+            })?;
+        let text = std::str::from_utf8(input.bytes())
+            .with_context(|| format!("module-definition file `{}` is not UTF-8", path.display()))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let definition =
+            linker_utils::coff_def::parse_definition_file(text).with_context(|| {
+                format!("while parsing module-definition file `{}`", path.display())
+            })?;
+        if let Some(image) = definition.image {
+            ensure!(
+                image.kind == linker_utils::coff_def::ImageKind::Library,
+                "NAME directives in module-definition files are not supported"
+            );
+            ensure!(
+                args.is_dll,
+                "a LIBRARY module-definition file requires /DLL"
+            );
+            ensure!(
+                image.base.is_none(),
+                "LIBRARY BASE in module-definition files is not supported; use /BASE instead"
+            );
+            module_name = image.name;
+        }
+        ensure!(
+            definition.heap_size.is_none(),
+            "HEAPSIZE in module-definition files is not supported; use /HEAP instead"
+        );
+        ensure!(
+            definition.stack_size.is_none(),
+            "STACKSIZE in module-definition files is not supported; use /STACK instead"
+        );
+        ensure!(
+            definition.version.is_none(),
+            "VERSION in module-definition files is not supported; use /VERSION instead"
+        );
+        ensure!(
+            definition.sections.is_empty(),
+            "SECTIONS/SEGMENTS in module-definition files are not supported; use /SECTION instead"
+        );
+        for export in definition.exports {
+            let target = export.target.unwrap_or_else(|| export.name.clone());
+            merge_export(
+                &mut exports,
+                crate::args::coff::ExportSpec {
+                    name: export.name,
+                    target,
+                    ordinal: export.ordinal,
+                    noname: export.flags.noname,
+                    data: export.flags.data,
+                    private: export.flags.private,
+                },
+                &format!("module-definition file `{}`", path.display()),
+            )?;
+        }
+    }
+    Ok(LoadedDefinitionFile {
+        exports,
+        module_name,
+    })
+}
+
+fn merge_export(
+    exports: &mut Vec<crate::args::coff::ExportSpec>,
+    candidate: crate::args::coff::ExportSpec,
+    source: &str,
+) -> Result<()> {
+    if let Some(existing) = exports.iter().find(|export| export.name == candidate.name) {
+        ensure!(
+            existing == &candidate,
+            "conflicting export `{}` in {source}",
+            candidate.name
+        );
+        return Ok(());
+    }
+    if let Some(ordinal) = candidate.ordinal
+        && let Some(existing) = exports
+            .iter()
+            .find(|export| export.ordinal == Some(ordinal))
+    {
+        ensure!(
+            existing.target == candidate.target && existing.data == candidate.data,
+            "export ordinal {ordinal} in {source} conflicts with export `{}`",
+            existing.name
+        );
+    }
+    exports.push(candidate);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,6 +354,7 @@ type OpenedInput<'data, F> = (PathBuf, &'data <F as FileSystem>::Input, bool);
 fn select_inputs_to_fixpoint<'data, F: FileSystem>(
     fs: &F,
     args: &crate::args::coff::CoffArgs,
+    command_exports: &[crate::args::coff::ExportSpec],
     input_storage: &'data colosseum::sync::Arena<F::Input>,
     inputs: &mut Vec<OpenedInput<'data, F>>,
 ) -> Result<SelectedInputs<'data>> {
@@ -250,6 +363,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
     let mut excluded_default_libraries = args.excluded_default_libraries.clone();
     let mut selection = select_opened_inputs::<F>(
         args,
+        command_exports,
         inputs,
         no_default_libraries,
         &excluded_default_libraries,
@@ -270,6 +384,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
             // non-monotonic case invalidates the incremental resolver cache.
             selection = select_opened_inputs::<F>(
                 args,
+                command_exports,
                 inputs,
                 no_default_libraries,
                 &excluded_default_libraries,
@@ -340,7 +455,7 @@ fn select_inputs_to_fixpoint<'data, F: FileSystem>(
             inputs.len() != old_len,
             "default-library discovery made no progress"
         );
-        selection.extend::<F>(args, &inputs[old_len..])?;
+        selection.extend::<F>(args, command_exports, &inputs[old_len..])?;
     }
 }
 
@@ -378,15 +493,17 @@ impl<'data> OpenSelection<'data> {
     fn extend<F: FileSystem>(
         &mut self,
         args: &crate::args::coff::CoffArgs,
+        command_exports: &[crate::args::coff::ExportSpec],
         inputs: &[OpenedInput<'data, F>],
     ) -> Result<()> {
         add_opened_inputs::<F>(args, inputs, self)?;
-        resolve_open_selection(args, self)
+        resolve_open_selection(args, command_exports, self)
     }
 }
 
 fn select_opened_inputs<'data, F: FileSystem>(
     args: &crate::args::coff::CoffArgs,
+    command_exports: &[crate::args::coff::ExportSpec],
     inputs: &[OpenedInput<'data, F>],
     no_default_libraries: bool,
     excluded_default_libraries: &[String],
@@ -412,7 +529,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
     });
     let active = active.cloned().collect::<Vec<_>>();
     add_opened_inputs::<F>(args, &active, &mut selection)?;
-    resolve_open_selection(args, &mut selection)?;
+    resolve_open_selection(args, command_exports, &mut selection)?;
     Ok(selection)
 }
 
@@ -471,6 +588,7 @@ fn add_opened_inputs<'data, F: FileSystem>(
 
 fn resolve_open_selection(
     args: &crate::args::coff::CoffArgs,
+    command_exports: &[crate::args::coff::ExportSpec],
     selection: &mut OpenSelection<'_>,
 ) -> Result<()> {
     crate::verbose_timing_phase!("Resolve PE archives");
@@ -483,11 +601,13 @@ fn resolve_open_selection(
     )?;
     loop {
         let mut directives = directive_args(args, &selection.objects)?;
-        let mut exports = args.exports.clone();
+        let mut exports = command_exports.to_vec();
         for export in &directives.exports {
-            if !exports.contains(export) {
-                exports.push(export.clone());
-            }
+            merge_export(
+                &mut exports,
+                export.clone(),
+                "selected COFF .drectve section",
+            )?;
         }
         let mut roots = args
             .force_undefined
@@ -507,6 +627,7 @@ fn resolve_open_selection(
         roots.extend(
             exports
                 .iter()
+                .filter(|export| !looks_like_forwarder(export))
                 .map(|export| export.target.as_bytes().to_vec()),
         );
         roots.sort();
@@ -1365,6 +1486,9 @@ fn resolve_export_target<'a>(
     definitions: &HashMap<Vec<u8>, u64>,
     image_base: u64,
 ) -> Result<ExportTarget<'a>> {
+    if looks_like_forwarder(export) {
+        return Ok(ExportTarget::Forwarder(export.target.as_bytes()));
+    }
     let name = export.target.as_bytes();
     let address = if let Some(address) = definitions.get(name).copied() {
         Some(address)
@@ -1379,9 +1503,6 @@ fn resolve_export_target<'a>(
         )
         .context("export target RVA exceeds u32")?;
         return Ok(ExportTarget::Rva(rva));
-    }
-    if looks_like_forwarder(export) {
-        return Ok(ExportTarget::Forwarder(name));
     }
     Err(error!(
         "export `{}` targets undefined symbol `{}`",
@@ -2905,6 +3026,83 @@ mod tests {
     use object::write::Symbol;
     use object::write::SymbolSection;
 
+    #[test]
+    fn loads_rustc_style_definition_exports_and_merges_command_line_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lib.def");
+        std::fs::write(
+            &path,
+            concat!(
+                "\u{feff}LIBRARY \"displaydoc.dll\"\r\n",
+                "EXPORTS\r\n",
+                "    __rustc_proc_macro_decls_0123456789abcdef__ DATA\r\n",
+                "    rust_metadata_displaydoc_0123456789abcdef DATA\r\n",
+                "    public_alias=internal_symbol @42 NONAME PRIVATE\r\n",
+                "    forwarded=KERNEL32.Sleep @43\r\n",
+            ),
+        )
+        .unwrap();
+        let mut args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            ..Default::default()
+        };
+        crate::args::coff::parse(
+            &mut args,
+            [
+                format!("/DEF:{}", path.display()),
+                "/EXPORT:command_line_symbol,DATA".to_owned(),
+            ]
+            .iter(),
+        )
+        .unwrap();
+
+        let definition = load_definition_file(&crate::fs::OsFileSystem::new(), &args).unwrap();
+        assert_eq!(definition.module_name.as_deref(), Some("displaydoc.dll"));
+        let exports = definition.exports;
+        assert_eq!(exports.len(), 5);
+        assert_eq!(exports[0].name, "command_line_symbol");
+        assert!(exports[0].data);
+        assert_eq!(
+            exports[1].target,
+            "__rustc_proc_macro_decls_0123456789abcdef__"
+        );
+        assert!(exports[1].data);
+        assert_eq!(
+            exports[2].target,
+            "rust_metadata_displaydoc_0123456789abcdef"
+        );
+        assert!(exports[2].data);
+        assert_eq!(exports[3].name, "public_alias");
+        assert_eq!(exports[3].target, "internal_symbol");
+        assert_eq!(exports[3].ordinal, Some(42));
+        assert!(exports[3].noname);
+        assert!(exports[3].private);
+        assert_eq!(exports[4].target, "KERNEL32.Sleep");
+    }
+
+    #[test]
+    fn rejects_conflicting_definition_and_command_line_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lib.def");
+        std::fs::write(&path, "LIBRARY x.dll\nEXPORTS\n symbol=other\n").unwrap();
+        let mut args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            ..Default::default()
+        };
+        crate::args::coff::parse(
+            &mut args,
+            [
+                format!("/DEF:{}", path.display()),
+                "/EXPORT:symbol".to_owned(),
+            ]
+            .iter(),
+        )
+        .unwrap();
+
+        let error = load_definition_file(&crate::fs::OsFileSystem::new(), &args).unwrap_err();
+        assert!(error.to_string().contains("conflicting export `symbol`"));
+    }
+
     fn directive_object(
         definition: Option<&[u8]>,
         undefined: Option<&[u8]>,
@@ -3806,7 +4004,9 @@ mod tests {
         let input_storage = colosseum::sync::Arena::new();
         let mut inputs = Vec::new();
         open_input(&fs, &direct_path, &args, &input_storage, &mut inputs, false).unwrap();
-        let selected = select_inputs_to_fixpoint(&fs, &args, &input_storage, &mut inputs).unwrap();
+        let selected =
+            select_inputs_to_fixpoint(&fs, &args, &args.exports, &input_storage, &mut inputs)
+                .unwrap();
 
         assert_eq!(selected.archive_bytes.len(), 2);
         assert_eq!(selected.objects.len(), 3);
@@ -3820,6 +4020,69 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn definition_exports_extract_archive_members_but_forwarders_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let direct_path = directory.path().join("direct.obj");
+        let library_path = directory.path().join("exports.lib");
+        let proc_macro = b"__rustc_proc_macro_decls_0123456789abcdef__";
+        std::fs::write(
+            &direct_path,
+            directive_object(Some(b"unrelated"), None, b""),
+        )
+        .unwrap();
+        std::fs::write(
+            &library_path,
+            single_member_archive(
+                b"exports.obj",
+                &directive_object(Some(proc_macro), Some(b"KERNEL32.Sleep"), b""),
+            ),
+        )
+        .unwrap();
+        let args = crate::args::coff::CoffArgs {
+            no_entry: true,
+            is_dll: true,
+            ..Default::default()
+        };
+        let exports = vec![
+            crate::args::coff::ExportSpec {
+                name: std::str::from_utf8(proc_macro).unwrap().to_owned(),
+                target: std::str::from_utf8(proc_macro).unwrap().to_owned(),
+                ordinal: None,
+                noname: false,
+                data: true,
+                private: false,
+            },
+            crate::args::coff::ExportSpec {
+                name: "sleep".into(),
+                target: "KERNEL32.Sleep".into(),
+                ordinal: None,
+                noname: false,
+                data: false,
+                private: false,
+            },
+        ];
+        let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
+        let mut inputs = Vec::new();
+        open_input(&fs, &direct_path, &args, &input_storage, &mut inputs, false).unwrap();
+        open_input(
+            &fs,
+            &library_path,
+            &args,
+            &input_storage,
+            &mut inputs,
+            false,
+        )
+        .unwrap();
+
+        let selected =
+            select_inputs_to_fixpoint(&fs, &args, &exports, &input_storage, &mut inputs).unwrap();
+        assert_eq!(selected.objects.len(), 2);
+        assert!(selected.roots.iter().any(|root| root == proc_macro));
+        assert!(!selected.roots.iter().any(|root| root == b"KERNEL32.Sleep"));
     }
 
     #[test]
@@ -3931,7 +4194,9 @@ mod tests {
         let input_storage = colosseum::sync::Arena::new();
         let mut inputs = Vec::new();
         open_input(&fs, &direct_path, &args, &input_storage, &mut inputs, false).unwrap();
-        let selected = select_inputs_to_fixpoint(&fs, &args, &input_storage, &mut inputs).unwrap();
+        let selected =
+            select_inputs_to_fixpoint(&fs, &args, &args.exports, &input_storage, &mut inputs)
+                .unwrap();
 
         assert_eq!(
             inputs.len(),
@@ -3975,8 +4240,14 @@ mod tests {
         )
         .unwrap();
         open_input(&fs, &object_path, &args, &input_storage, &mut inputs, false).unwrap();
-        let selected =
-            select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]).unwrap();
+        let selected = select_opened_inputs::<crate::fs::OsFileSystem>(
+            &args,
+            &args.exports,
+            &inputs,
+            false,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(selected.resources.len(), 1);
         assert_eq!(selected.resources[0].data, b"x");
@@ -4008,11 +4279,16 @@ mod tests {
             false,
         )
         .unwrap();
-        let error =
-            match select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]) {
-                Ok(_) => panic!("accepted malformed renamed resource"),
-                Err(error) => error.to_string(),
-            };
+        let error = match select_opened_inputs::<crate::fs::OsFileSystem>(
+            &args,
+            &args.exports,
+            &inputs,
+            false,
+            &[],
+        ) {
+            Ok(_) => panic!("accepted malformed renamed resource"),
+            Err(error) => error.to_string(),
+        };
 
         assert!(error.contains("while reading resource"), "{error}");
         assert!(!error.contains("cannot identify COFF input"), "{error}");
