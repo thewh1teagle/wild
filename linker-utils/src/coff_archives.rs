@@ -334,9 +334,10 @@ impl<'data> CoffArchive<'data> {
                     ));
                 };
                 let member = &mut members[member_index];
-                if !contains_name(&member.definitions, symbol.name()) {
-                    member.definitions.push(Cow::Borrowed(symbol.name()));
-                }
+                member.definitions.push(Cow::Borrowed(symbol.name()));
+            }
+            for member in &mut members {
+                deduplicate_indexed_definitions(&mut member.definitions);
             }
         }
 
@@ -553,6 +554,27 @@ impl<'data> CoffArchive<'data> {
             unresolved,
         }
     }
+}
+
+fn deduplicate_indexed_definitions<'data>(definitions: &mut Vec<Cow<'data, [u8]>>) {
+    const LINEAR_DEDUP_LIMIT: usize = 8;
+    if definitions.len() <= LINEAR_DEDUP_LIMIT {
+        let mut index = 1;
+        while index < definitions.len() {
+            if contains_name(&definitions[..index], definitions[index].as_ref()) {
+                definitions.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        return;
+    }
+
+    // Indexed definitions borrow their names from the archive symbol table. Large Rust objects
+    // can publish thousands of names from one member, so checking the member's growing vector for
+    // every symbol is quadratic. Preserve first-occurrence order with one hash lookup per name.
+    let mut seen = HashSet::<Cow<'data, [u8]>>::with_capacity(definitions.len());
+    definitions.retain(|definition| seen.insert(definition.clone()));
 }
 
 struct ParsedMember<'data> {
@@ -885,6 +907,34 @@ mod tests {
             false,
         );
         assert_eq!(plan.selected().len(), 1);
+    }
+
+    #[test]
+    fn large_indexed_member_definition_lists_are_stably_deduplicated() {
+        let symbols = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "three",
+            "nine", "zero",
+        ];
+        let archive = test_archive(
+            TestArchiveKind::Gnu,
+            &[TestMember {
+                name: "many.obj",
+                data: coff_object(&symbols[..10], &[]),
+                symbols: &symbols,
+            }],
+            false,
+        );
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        let definitions = parsed.members()[0]
+            .definitions()
+            .map(String::from_utf8_lossy)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definitions,
+            [
+                "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"
+            ]
+        );
     }
 
     #[test]
