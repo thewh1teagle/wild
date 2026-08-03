@@ -1502,8 +1502,18 @@ fn guard_metadata_policy(
 struct SelectedComdat {
     object: usize,
     sections: Vec<object::SectionIndex>,
+    selection: linker_utils::coff_symbols::ComdatSelection,
     contents: Vec<u8>,
     relocation_signature: Vec<u8>,
+    timestamp: u32,
+}
+
+fn coff_timestamp(file: &object::File<'_>) -> u32 {
+    match file {
+        object::File::Coff(file) => file.coff_header().time_date_stamp.get(object::LittleEndian),
+        object::File::CoffBig(file) => file.coff_header().time_date_stamp.get(object::LittleEndian),
+        _ => 0,
+    }
 }
 
 fn discarded_comdat_sections(
@@ -1514,16 +1524,58 @@ fn discarded_comdat_sections(
     use linker_utils::coff_symbols::ComdatSelection;
     use linker_utils::coff_symbols::select_comdat;
 
+    let comdat_sections = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(object_index, input)| {
+            input.file().comdats().flat_map(move |comdat| {
+                comdat
+                    .sections()
+                    .map(move |section| (object_index, section))
+            })
+        })
+        .collect::<HashSet<_>>();
+    let mut strong_definitions = HashSet::<Vec<u8>>::new();
+    for (object_index, input) in objects.iter().enumerate() {
+        for symbol in input.file().symbols() {
+            if !symbol.is_global() || !symbol.is_definition() {
+                continue;
+            }
+            if symbol
+                .section_index()
+                .is_some_and(|section| comdat_sections.contains(&(object_index, section)))
+            {
+                continue;
+            }
+            strong_definitions.insert(symbol.name_bytes()?.to_vec());
+        }
+    }
+
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
     let mut discarded = HashSet::new();
     for (object_index, input) in objects.iter().enumerate() {
+        let timestamp = coff_timestamp(input.file());
         for comdat in input.file().comdats() {
             let name = comdat
                 .name_bytes()
                 .context("invalid COFF COMDAT name")?
                 .to_vec();
+            let leader = input
+                .file()
+                .symbol_by_index(comdat.symbol())
+                .context("invalid COFF COMDAT leader")?;
+            // A static COMDAT leader has object-local identity. Rust intentionally emits the
+            // same local NODUPLICATES name in several codegen units; link.exe and lld-link keep
+            // each instance because none participates in global symbol resolution.
+            if !leader.is_global() {
+                continue;
+            }
             // object includes the primary section and all associative children.
             let sections = comdat.sections().collect::<Vec<_>>();
+            if strong_definitions.contains(&name) {
+                discarded.extend(sections.iter().map(|section| (object_index, *section)));
+                continue;
+            }
             let Some(primary) = sections.first().copied() else {
                 continue;
             };
@@ -1549,17 +1601,24 @@ fn discarded_comdat_sections(
                 }
             };
             if let Some(existing) = selected.get(&name) {
+                ensure!(
+                    existing.selection == selection,
+                    "COMDAT `{}` has conflicting selection kinds {:?} and {:?}",
+                    String::from_utf8_lossy(&name),
+                    existing.selection,
+                    selection
+                );
                 let decision = select_comdat(
                     selection,
                     ComdatCandidate {
                         contents: &existing.contents,
                         relocation_signature: &existing.relocation_signature,
-                        timestamp: existing.object as u32,
+                        timestamp: existing.timestamp,
                     },
                     ComdatCandidate {
                         contents: &contents,
                         relocation_signature: &relocation_signature,
-                        timestamp: object_index as u32,
+                        timestamp,
                     },
                 )
                 .with_context(|| {
@@ -1584,8 +1643,10 @@ fn discarded_comdat_sections(
                             SelectedComdat {
                                 object: object_index,
                                 sections,
+                                selection,
                                 contents,
                                 relocation_signature,
+                                timestamp,
                             },
                         );
                     }
@@ -1596,8 +1657,10 @@ fn discarded_comdat_sections(
                     SelectedComdat {
                         object: object_index,
                         sections,
+                        selection,
                         contents,
                         relocation_signature,
+                        timestamp,
                     },
                 );
             }
@@ -2577,6 +2640,49 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn comdat_object(
+        name: &[u8],
+        scope: object::SymbolScope,
+        kind: object::ComdatKind,
+        contents: &[u8],
+        timestamp: u32,
+        associative_child: bool,
+    ) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let primary = object.add_subsection(object::write::StandardSection::Text, name);
+        object.append_section_data(primary, contents, 1);
+        object.section_symbol(primary);
+        let symbol = object.add_symbol(Symbol {
+            name: name.to_vec(),
+            value: 0,
+            size: contents.len() as u64,
+            kind: object::SymbolKind::Text,
+            scope,
+            weak: false,
+            section: SymbolSection::Section(primary),
+            flags: object::SymbolFlags::None,
+        });
+        let mut sections = vec![primary];
+        if associative_child {
+            let child = object.add_subsection(object::write::StandardSection::ReadOnlyData, name);
+            object.append_section_data(child, b"child", 1);
+            object.section_symbol(child);
+            sections.push(child);
+        }
+        object.add_comdat(object::write::Comdat {
+            kind,
+            symbol,
+            sections,
+        });
+        let mut bytes = object.write().unwrap();
+        bytes[4..8].copy_from_slice(&timestamp.to_le_bytes());
+        bytes
+    }
+
     fn single_member_archive(name: &[u8], data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
@@ -2934,6 +3040,120 @@ mod tests {
         assert!(!exports[0].data);
         assert_eq!(exports[1].name, "value");
         assert!(exports[1].data);
+    }
+
+    #[test]
+    fn local_noduplicates_comdats_have_object_local_identity() {
+        let first = comdat_object(
+            b"local",
+            object::SymbolScope::Compilation,
+            object::ComdatKind::NoDuplicates,
+            b"first",
+            0,
+            true,
+        );
+        let second = comdat_object(
+            b"local",
+            object::SymbolScope::Compilation,
+            object::ComdatKind::NoDuplicates,
+            b"second",
+            0,
+            true,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&first).unwrap(),
+            crate::coff::CoffObject::parse(&second).unwrap(),
+        ];
+
+        assert!(discarded_comdat_sections(&objects).unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_noduplicates_comdats_still_reject_live_conflicts() {
+        let first = comdat_object(
+            b"global",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::NoDuplicates,
+            b"first",
+            0,
+            false,
+        );
+        let second = comdat_object(
+            b"global",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::NoDuplicates,
+            b"second",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&first).unwrap(),
+            crate::coff::CoffObject::parse(&second).unwrap(),
+        ];
+
+        let error = discarded_comdat_sections(&objects).unwrap_err().to_string();
+        assert!(error.contains("NODUPLICATES"), "{error}");
+    }
+
+    #[test]
+    fn global_comdat_selection_discards_associative_children_as_a_group() {
+        let cases = [
+            (
+                object::ComdatKind::Any,
+                b"old".as_slice(),
+                b"new".as_slice(),
+                0,
+                0,
+            ),
+            (object::ComdatKind::SameSize, b"old", b"new", 0, 0),
+            (object::ComdatKind::ExactMatch, b"same", b"same", 0, 0),
+            (object::ComdatKind::Largest, b"x", b"larger", 0, 0),
+            (object::ComdatKind::Newest, b"old", b"new", 1, 2),
+        ];
+        for (kind, old, new, old_timestamp, new_timestamp) in cases {
+            let first = comdat_object(
+                b"global",
+                object::SymbolScope::Linkage,
+                kind,
+                old,
+                old_timestamp,
+                true,
+            );
+            let second = comdat_object(
+                b"global",
+                object::SymbolScope::Linkage,
+                kind,
+                new,
+                new_timestamp,
+                true,
+            );
+            let objects = [
+                crate::coff::CoffObject::parse(&first).unwrap(),
+                crate::coff::CoffObject::parse(&second).unwrap(),
+            ];
+
+            let discarded = discarded_comdat_sections(&objects).unwrap();
+            assert_eq!(discarded.len(), 2, "selection {kind:?}");
+        }
+    }
+
+    #[test]
+    fn regular_strong_definition_precedes_global_comdat() {
+        let strong = directive_object(Some(b"shared"), None, b"");
+        let comdat = comdat_object(
+            b"shared",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"comdat",
+            0,
+            true,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&comdat).unwrap(),
+            crate::coff::CoffObject::parse(&strong).unwrap(),
+        ];
+
+        assert_eq!(discarded_comdat_sections(&objects).unwrap().len(), 2);
     }
 
     #[test]
