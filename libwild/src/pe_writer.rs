@@ -29,6 +29,7 @@ use object::ObjectSymbol;
 use object::RelocationKind;
 use object::RelocationTarget;
 use object::SectionFlags;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -3291,6 +3292,45 @@ fn apply_relocations(
     image_base: u64,
     image: &mut [u8],
 ) -> Result<()> {
+    if rayon::current_num_threads() > 1 {
+        let mut jobs = Vec::new();
+        for (object_index, input) in objects.iter().enumerate() {
+            for source in input.file().sections() {
+                let Some(source_id) = locations.get(&(object_index, source.index())) else {
+                    continue;
+                };
+                if source.relocations().next().is_some() {
+                    jobs.push((object_index, source.index(), *source_id));
+                }
+            }
+        }
+        let parallel_image = ParallelImage::new(image);
+        let results = jobs
+            .par_iter()
+            .map(|&(object_index, section_index, source_id)| {
+                apply_section_relocations(
+                    objects,
+                    object_index,
+                    section_index,
+                    source_id,
+                    layout,
+                    locations,
+                    redirects,
+                    definitions,
+                    absolute_symbols,
+                    image_base,
+                    parallel_image,
+                )
+            })
+            .collect::<Vec<_>>();
+        // Indexed parallel collection preserves input-section order, so the first error remains
+        // deterministic even though independent contribution ranges were updated concurrently.
+        for result in results {
+            result?;
+        }
+        return Ok(());
+    }
+
     for (object_index, input) in objects.iter().enumerate() {
         for source in input.file().sections() {
             let Some(source_id) = locations.get(&(object_index, source.index())) else {
@@ -3298,137 +3338,270 @@ fn apply_relocations(
             };
             let placement = &layout.placements[source_id];
             for (offset, relocation) in source.relocations() {
-                use linker_utils::coff::Amd64RelocationInputs;
-                use linker_utils::coff::Amd64RelocationKind;
-                use linker_utils::coff::ImageBase;
-                use linker_utils::coff::Rva;
-                use linker_utils::coff::SectionIndex;
-                use linker_utils::coff::apply_amd64_relocation;
-                let source_file = placement
-                    .file_offset
-                    .ok_or_else(|| error!("relocation in uninitialized section"))?;
-                let (target, target_section, target_section_index, absolute_value) =
-                    match relocation.target() {
-                        RelocationTarget::Symbol(index) => {
-                            let symbol = input
-                                .file()
-                                .symbol_by_index(index)
-                                .context("invalid relocation symbol")?;
-                            let name = symbol.name_bytes()?;
-                            if symbol.is_global()
-                                && let Some(address) = definitions.get(name)
-                            {
-                                if let Some(value) = absolute_symbols.get(name) {
-                                    (0, 0, 0, Some(*value))
-                                } else {
-                                    let (target, section, index) =
-                                        target_location(layout, image_base, *address)?;
-                                    (target, section, index, None)
-                                }
-                            } else if let Some(section) = symbol.section_index() {
-                                let ((target_object, target_section_index), id) =
-                                redirected_location(locations, redirects, (object_index, section))?
-                                    .ok_or_else(|| {
-                                        error!(
-                                            "relocation targets discarded section {object_index}:{section:?} via symbol `{}`",
-                                            String::from_utf8_lossy(name)
-                                        )
-                                    })?;
-                                let target_section = objects[target_object]
-                                    .file()
-                                    .section_by_index(target_section_index)
-                                    .context("COMDAT redirect targets an invalid section")?;
-                                ensure!(
-                                    symbol.address() <= target_section.size(),
-                                    "symbol offset exceeds selected COMDAT section"
-                                );
-                                let target_placement = &layout.placements[&id];
-                                let target = target_placement
-                                    .rva
-                                    .checked_add(
-                                        u32::try_from(symbol.address())
-                                            .context("COFF symbol offset exceeds u32")?,
-                                    )
-                                    .context("COFF symbol RVA overflow")?;
-                                (
-                                    target,
-                                    layout.sections[target_placement.output_section].rva,
-                                    u16::try_from(target_placement.output_section + 1)
-                                        .context("PE section index exceeds u16")?,
-                                    None,
-                                )
-                            } else {
-                                let address = *definitions.get(name).ok_or_else(|| {
-                                    error!("undefined symbol `{}`", String::from_utf8_lossy(name))
-                                })?;
-                                let (target, section, index) =
-                                    target_location(layout, image_base, address)?;
-                                (target, section, index, None)
-                            }
-                        }
-                        RelocationTarget::Section(section) => {
-                            let (_, id) = redirected_location(
-                            locations,
-                            redirects,
-                            (object_index, section),
-                        )?
-                        .ok_or_else(|| {
-                            error!(
-                                "relocation targets discarded section {object_index}:{section:?}"
-                            )
-                        })?;
-                            let target_placement = &layout.placements[&id];
-                            (
-                                target_placement.rva,
-                                layout.sections[target_placement.output_section].rva,
-                                u16::try_from(target_placement.output_section + 1)
-                                    .context("PE section index exceeds u16")?,
-                                None,
-                            )
-                        }
-                        _ => return Err(error!("unsupported COFF relocation target")),
-                    };
-                let typ = match relocation.flags() {
-                    object::RelocationFlags::Coff { typ } => typ,
-                    flags => return Err(error!("expected COFF relocation flags, got {flags:?}")),
-                };
-                let kind = Amd64RelocationKind::from_type(typ)
-                    .context("unsupported AMD64 COFF relocation")?;
-                let at = usize::try_from(u64::from(source_file) + offset)
-                    .context("relocation file offset too large")?;
-                let field = image.get_mut(at..).context("relocation past file data")?;
-                if let Some(value) = absolute_value {
-                    apply_absolute_amd64_relocation(
-                        kind,
-                        field,
-                        value,
-                        image_base,
-                        placement.rva,
-                        offset,
-                    )?;
-                    continue;
-                }
-                apply_amd64_relocation(
-                    kind,
-                    field,
-                    Amd64RelocationInputs {
-                        image_base: ImageBase(image_base),
-                        place: Rva(placement
-                            .rva
-                            .checked_add(
-                                u32::try_from(offset).context("relocation offset exceeds u32")?,
-                            )
-                            .context("relocation place RVA overflow")?),
-                        target: Rva(target),
-                        target_section: Rva(target_section),
-                        target_section_index: SectionIndex(target_section_index),
-                    },
-                )
-                .context("failed to apply AMD64 COFF relocation")?;
+                prepare_relocation(
+                    objects,
+                    object_index,
+                    input,
+                    layout,
+                    locations,
+                    redirects,
+                    definitions,
+                    absolute_symbols,
+                    image_base,
+                    placement,
+                    offset,
+                    &relocation,
+                )?
+                .apply(image)?;
             }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ParallelImage<'image> {
+    address: usize,
+    len: usize,
+    borrow: std::marker::PhantomData<&'image mut [u8]>,
+}
+
+impl<'image> ParallelImage<'image> {
+    fn new(image: &'image mut [u8]) -> Self {
+        Self {
+            address: image.as_mut_ptr() as usize,
+            len: image.len(),
+            borrow: std::marker::PhantomData,
+        }
+    }
+
+    /// Returns the uniquely owned range for one live input contribution.
+    ///
+    /// # Safety
+    /// Callers must only request ranges for distinct contribution IDs. `layout_sections` assigns
+    /// those IDs non-overlapping file ranges, and `source_locations` maps each live input section
+    /// to exactly one ID. The output allocation remains fixed while parallel relocation work runs.
+    unsafe fn contribution(self, start: usize, len: usize) -> Result<&'image mut [u8]> {
+        let end = start
+            .checked_add(len)
+            .context("PE contribution file range overflow")?;
+        ensure!(end <= self.len, "PE contribution extends past file data");
+        // SAFETY: The caller upholds uniqueness, bounds were checked above, and the allocation is
+        // kept alive without reallocation until every parallel task has joined.
+        Ok(unsafe { std::slice::from_raw_parts_mut((self.address as *mut u8).add(start), len) })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedRelocation {
+    at: usize,
+    kind: linker_utils::coff::Amd64RelocationKind,
+    inputs: linker_utils::coff::Amd64RelocationInputs,
+    absolute_value: Option<u64>,
+    contribution_rva: u32,
+    offset: u64,
+}
+
+impl PreparedRelocation {
+    #[inline(always)]
+    fn apply(self, image: &mut [u8]) -> Result<()> {
+        let field = image
+            .get_mut(self.at..)
+            .context("relocation past file data")?;
+        if let Some(value) = self.absolute_value {
+            return apply_absolute_amd64_relocation(
+                self.kind,
+                field,
+                value,
+                self.inputs.image_base.0,
+                self.contribution_rva,
+                self.offset,
+            );
+        }
+        linker_utils::coff::apply_amd64_relocation(self.kind, field, self.inputs)
+            .context("failed to apply AMD64 COFF relocation")
+    }
+}
+
+fn apply_section_relocations(
+    objects: &[crate::coff::CoffObject<'_>],
+    object_index: usize,
+    section_index: object::SectionIndex,
+    source_id: ContributionId,
+    layout: &SectionLayout,
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+    parallel_image: ParallelImage<'_>,
+) -> Result<()> {
+    let input = &objects[object_index];
+    let source = input
+        .file()
+        .section_by_index(section_index)
+        .context("relocation source has an invalid COFF section")?;
+    let placement = &layout.placements[&source_id];
+    let source_file = usize::try_from(
+        placement
+            .file_offset
+            .ok_or_else(|| error!("relocation in uninitialized section"))?,
+    )
+    .context("relocation file offset too large")?;
+    // SAFETY: Every selected input section has its own contribution ID and layout assigns
+    // contribution IDs disjoint file ranges. This task is the sole writer for this source.
+    let contribution = unsafe {
+        parallel_image.contribution(
+            source_file,
+            usize::try_from(placement.size).context("PE contribution size too large")?,
+        )?
+    };
+    for (offset, relocation) in source.relocations() {
+        let mut prepared = prepare_relocation(
+            objects,
+            object_index,
+            input,
+            layout,
+            locations,
+            redirects,
+            definitions,
+            absolute_symbols,
+            image_base,
+            placement,
+            offset,
+            &relocation,
+        )?;
+        prepared.at = prepared
+            .at
+            .checked_sub(source_file)
+            .context("relocation precedes contribution data")?;
+        prepared.apply(contribution)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn prepare_relocation(
+    objects: &[crate::coff::CoffObject<'_>],
+    object_index: usize,
+    input: &crate::coff::CoffObject<'_>,
+    layout: &SectionLayout,
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+    placement: &linker_utils::pe_sections::ContributionPlacement,
+    offset: u64,
+    relocation: &object::Relocation,
+) -> Result<PreparedRelocation> {
+    use linker_utils::coff::Amd64RelocationInputs;
+    use linker_utils::coff::Amd64RelocationKind;
+    use linker_utils::coff::ImageBase;
+    use linker_utils::coff::Rva;
+    use linker_utils::coff::SectionIndex;
+
+    let source_file = placement
+        .file_offset
+        .ok_or_else(|| error!("relocation in uninitialized section"))?;
+    let (target, target_section, target_section_index, absolute_value) = match relocation.target() {
+        RelocationTarget::Symbol(index) => {
+            let symbol = input
+                .file()
+                .symbol_by_index(index)
+                .context("invalid relocation symbol")?;
+            let name = symbol.name_bytes()?;
+            if symbol.is_global()
+                && let Some(address) = definitions.get(name)
+            {
+                if let Some(value) = absolute_symbols.get(name) {
+                    (0, 0, 0, Some(*value))
+                } else {
+                    let (target, section, index) = target_location(layout, image_base, *address)?;
+                    (target, section, index, None)
+                }
+            } else if let Some(section) = symbol.section_index() {
+                let ((target_object, target_section_index), id) =
+                        redirected_location(locations, redirects, (object_index, section))?
+                            .ok_or_else(|| {
+                                error!(
+                                    "relocation targets discarded section {object_index}:{section:?} via symbol `{}`",
+                                    String::from_utf8_lossy(name)
+                                )
+                            })?;
+                let target_section = objects[target_object]
+                    .file()
+                    .section_by_index(target_section_index)
+                    .context("COMDAT redirect targets an invalid section")?;
+                ensure!(
+                    symbol.address() <= target_section.size(),
+                    "symbol offset exceeds selected COMDAT section"
+                );
+                let target_placement = &layout.placements[&id];
+                let target = target_placement
+                    .rva
+                    .checked_add(
+                        u32::try_from(symbol.address())
+                            .context("COFF symbol offset exceeds u32")?,
+                    )
+                    .context("COFF symbol RVA overflow")?;
+                (
+                    target,
+                    layout.sections[target_placement.output_section].rva,
+                    u16::try_from(target_placement.output_section + 1)
+                        .context("PE section index exceeds u16")?,
+                    None,
+                )
+            } else {
+                let address = *definitions.get(name).ok_or_else(|| {
+                    error!("undefined symbol `{}`", String::from_utf8_lossy(name))
+                })?;
+                let (target, section, index) = target_location(layout, image_base, address)?;
+                (target, section, index, None)
+            }
+        }
+        RelocationTarget::Section(section) => {
+            let (_, id) = redirected_location(locations, redirects, (object_index, section))?
+                .ok_or_else(|| {
+                    error!("relocation targets discarded section {object_index}:{section:?}")
+                })?;
+            let target_placement = &layout.placements[&id];
+            (
+                target_placement.rva,
+                layout.sections[target_placement.output_section].rva,
+                u16::try_from(target_placement.output_section + 1)
+                    .context("PE section index exceeds u16")?,
+                None,
+            )
+        }
+        _ => return Err(error!("unsupported COFF relocation target")),
+    };
+    let typ = match relocation.flags() {
+        object::RelocationFlags::Coff { typ } => typ,
+        flags => return Err(error!("expected COFF relocation flags, got {flags:?}")),
+    };
+    let kind = Amd64RelocationKind::from_type(typ).context("unsupported AMD64 COFF relocation")?;
+    let at = usize::try_from(u64::from(source_file) + offset)
+        .context("relocation file offset too large")?;
+    let place = placement
+        .rva
+        .checked_add(u32::try_from(offset).context("relocation offset exceeds u32")?)
+        .context("relocation place RVA overflow")?;
+    Ok(PreparedRelocation {
+        at,
+        kind,
+        inputs: Amd64RelocationInputs {
+            image_base: ImageBase(image_base),
+            place: Rva(place),
+            target: Rva(target),
+            target_section: Rva(target_section),
+            target_section_index: SectionIndex(target_section_index),
+        },
+        absolute_value,
+        contribution_rva: placement.rva,
+        offset,
+    })
 }
 
 fn apply_absolute_amd64_relocation(
