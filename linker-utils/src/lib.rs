@@ -9,6 +9,7 @@ pub mod coff_symbols;
 pub mod elf;
 pub mod loongarch64;
 pub mod pe_base_relocs;
+pub mod pe_debug;
 pub mod pe_exports;
 pub mod pe_load_config;
 pub mod pe_resources;
