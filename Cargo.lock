@@ -941,6 +941,7 @@ dependencies = [
  "leb128",
  "object 0.40.0",
  "paste",
+ "sha2",
 ]
 
 [[package]]
