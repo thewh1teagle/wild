@@ -124,7 +124,9 @@ After the installs and fixes above, this host passes every local gate from
 - `cargo +nightly fmt --all -- --check` — pass.
 - `cargo +1.94.0 clippy` with the `pe` feature — pass.
 - `cargo +1.95.0 test -p linker-utils -p libwild --no-default-features
-  --features pe` — 244 + 144 tests pass (1 opt-in xwin probe ignored).
+  --features pe` — 258 + 154 tests pass (1 opt-in xwin probe ignored). The
+  exact-SHA closeout also passed 347 integration tests (1,232 ignored) and the
+  2/2 full xwin candidate suite.
   Requires `clang-format` installed.
 - `cargo +nightly fuzz run coff_parsers -- -runs=10000` — bounded parser
   smoke passes; generated corpus/artifact files remain ignored or outside the
