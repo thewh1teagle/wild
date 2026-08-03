@@ -10,6 +10,7 @@ use crate::fs::InputFileData;
 use crate::fs::OutputFileData;
 use crate::fs::OutputOptions;
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
 use linker_utils::pe_exports::Export;
 use linker_utils::pe_exports::ExportTarget;
@@ -33,7 +34,6 @@ use object::SectionFlags;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -2166,34 +2166,30 @@ fn live_import_references(
     import_definitions: &HashSet<Vec<u8>>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashSet<Vec<u8>>> {
-    let mut selected_definitions = object_definition_names(objects)?;
-    selected_definitions.extend(import_definitions.iter().cloned());
+    let object_definitions = object_definition_names(objects)?;
     let weak_resolution = weak_external_resolution(objects)?;
-    let resolve = |name: &[u8]| -> Result<Vec<u8>> {
-        if selected_definitions.contains(name) {
-            return Ok(name.to_vec());
-        }
-        let weak_target =
-            weak_resolution.resolve(name, |candidate| selected_definitions.contains(candidate))?;
-        if selected_definitions.contains(weak_target) {
-            return Ok(weak_target.to_vec());
-        }
-        let Ok(name) = std::str::from_utf8(name) else {
-            return Ok(name.to_vec());
-        };
-        Ok(runtime_resolution
-            .resolve_alternate_name(name, |candidate| {
-                selected_definitions.contains(candidate.as_bytes())
-            })?
-            .as_bytes()
-            .to_vec())
-    };
-
     let mut referenced = HashSet::new();
     let mut retain = |name: &[u8]| -> Result<()> {
-        let target = resolve(name)?;
-        if import_definitions.contains(&target) {
-            referenced.insert(target);
+        let is_selected = |candidate: &[u8]| {
+            object_definitions.contains(candidate) || import_definitions.contains(candidate)
+        };
+        let target = if is_selected(name) {
+            name
+        } else {
+            let weak_target = weak_resolution.resolve(name, is_selected)?;
+            if is_selected(weak_target) {
+                weak_target
+            } else {
+                let Ok(name) = std::str::from_utf8(name) else {
+                    return Ok(());
+                };
+                runtime_resolution
+                    .resolve_alternate_name(name, |candidate| is_selected(candidate.as_bytes()))?
+                    .as_bytes()
+            }
+        };
+        if import_definitions.contains(target) && !referenced.contains(target) {
+            referenced.insert(target.to_vec());
         }
         Ok(())
     };

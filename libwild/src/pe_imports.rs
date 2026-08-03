@@ -3,6 +3,8 @@
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
+use hashbrown::HashMap;
+use hashbrown::HashSet;
 #[cfg(test)]
 use linker_utils::coff_imports::ImportLibrary;
 #[cfg(test)]
@@ -14,8 +16,6 @@ use linker_utils::pe_delay_imports::DelayImportDll;
 use linker_utils::pe_delay_imports::DelayImportLayout;
 use linker_utils::pe_delay_imports::DelayImportTarget;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
 
 const ORDINAL_FLAG64: u64 = 1 << 63;
 
