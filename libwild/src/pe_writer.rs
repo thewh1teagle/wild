@@ -396,24 +396,12 @@ fn select_opened_inputs<'data, F: FileSystem>(
         {
             continue;
         }
-        if path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
-        {
-            resources.extend(
-                linker_utils::pe_resources::parse_res(data.bytes())
-                    .with_context(|| format!("while reading `{}`", path.display()))?,
-            );
-            continue;
-        }
-        match object::FileKind::parse(data.bytes())
-            .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
-        {
-            object::FileKind::Coff | object::FileKind::CoffBig => objects.push(
+        match object::FileKind::parse(data.bytes()) {
+            Ok(object::FileKind::Coff | object::FileKind::CoffBig) => objects.push(
                 crate::coff::CoffObject::parse(data.bytes())
                     .with_context(|| format!("while reading `{}`", path.display()))?,
             ),
-            object::FileKind::Archive => {
+            Ok(object::FileKind::Archive) => {
                 archive_bytes.push(data.bytes());
                 archive_whole.push(
                     args.whole_archive
@@ -423,11 +411,26 @@ fn select_opened_inputs<'data, F: FileSystem>(
                             .any(|name| path_matches(path, name)),
                 );
             }
-            kind => {
+            Ok(kind) => {
                 return Err(error!(
                     "unsupported PE input kind {kind:?} in `{}`",
                     path.display()
                 ));
+            }
+            Err(_error)
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
+                    || linker_utils::pe_resources::has_res_null_header(data.bytes()) =>
+            {
+                resources.extend(
+                    linker_utils::pe_resources::parse_res(data.bytes())
+                        .with_context(|| format!("while reading resource `{}`", path.display()))?,
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot identify COFF input `{}`", path.display()));
             }
         }
     }
@@ -2228,6 +2231,26 @@ mod tests {
         bytes
     }
 
+    fn resource_stream() -> Vec<u8> {
+        let mut bytes = vec![0; 32];
+        bytes[4..8].copy_from_slice(&32_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&[0xff, 0xff, 0, 0]);
+        bytes[12..16].copy_from_slice(&[0xff, 0xff, 0, 0]);
+
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xff, 0xff, 24, 0]);
+        bytes.extend_from_slice(&[0xff, 0xff, 1, 0]);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x30_u16.to_le_bytes());
+        bytes.extend_from_slice(&0x409_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(b'x');
+        bytes.extend_from_slice(&[0; 3]);
+        bytes
+    }
+
     fn export_test_object(directives: Option<&[u8]>) -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -2614,6 +2637,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recognizes_renamed_resource_stream_after_known_coff_formats() {
+        let directory = tempfile::tempdir().unwrap();
+        let resource_path = directory.path().join("resource.lib");
+        let object_path = directory.path().join("named-resource.res");
+        std::fs::write(&resource_path, resource_stream()).unwrap();
+        std::fs::write(&object_path, crate::coff::test_object()).unwrap();
+
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            no_entry: true,
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let mut inputs = Vec::new();
+        open_input(&fs, &resource_path, &args, &mut inputs, false).unwrap();
+        open_input(&fs, &object_path, &args, &mut inputs, false).unwrap();
+        let selected =
+            select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]).unwrap();
+
+        assert_eq!(selected.resources.len(), 1);
+        assert_eq!(selected.resources[0].data, b"x");
+        assert_eq!(selected.objects.len(), 1);
+    }
+
+    #[test]
+    fn malformed_renamed_resource_has_resource_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let resource_path = directory.path().join("malformed.lib");
+        let mut malformed = resource_stream();
+        malformed.truncate(malformed.len() - 2);
+        std::fs::write(&resource_path, malformed).unwrap();
+
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            no_entry: true,
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let mut inputs = Vec::new();
+        open_input(&fs, &resource_path, &args, &mut inputs, false).unwrap();
+        let error =
+            match select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]) {
+                Ok(_) => panic!("accepted malformed renamed resource"),
+                Err(error) => error.to_string(),
+            };
+
+        assert!(error.contains("while reading resource"), "{error}");
+        assert!(!error.contains("cannot identify COFF input"), "{error}");
     }
 
     #[test]
