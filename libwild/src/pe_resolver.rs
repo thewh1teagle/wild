@@ -52,7 +52,6 @@ impl ResolverNameState {
     const DEFINED: u8 = 1 << 0;
     const UNRESOLVED: u8 = 1 << 1;
     const DEMANDED: u8 = 1 << 2;
-    const UNRESOLVED_LISTED: u8 = 1 << 3;
 
     pub(super) const fn is_defined(self) -> bool {
         self.0 & Self::DEFINED != 0
@@ -71,16 +70,15 @@ impl ResolverNameState {
         self.0 |= Self::DEMANDED;
     }
 
-    /// Returns true exactly once, when this name first enters the unresolved frontier.
+    /// Returns true when this name enters the active unresolved set.
     fn mark_unresolved(&mut self) -> bool {
         self.mark_demanded();
         if self.is_defined() {
             return false;
         }
+        let newly_unresolved = !self.is_unresolved();
         self.0 |= Self::UNRESOLVED;
-        let newly_listed = self.0 & Self::UNRESOLVED_LISTED == 0;
-        self.0 |= Self::UNRESOLVED_LISTED;
-        newly_listed
+        newly_unresolved
     }
 
     fn mark_defined(&mut self) -> bool {
@@ -175,8 +173,8 @@ impl<'data> ResolverSeed<'data> {
 struct IncrementalSymbolState<'data> {
     names: OrderedNameInterner<'data>,
     states: Vec<ResolverNameState>,
-    /// Append-only frontier of names that have ever become unresolved. Definitions leave stale
-    /// entries which snapshots filter without revisiting the much larger canonical state table.
+    /// Active unresolved names, maintained in byte order. The set is normally small, so insertion
+    /// and removal shifts are cheaper than rescanning or sorting all canonical names every wave.
     unresolved_names: Vec<NameId>,
     weak_resolution: WeakExternalResolution,
     weak_names: Vec<ResolverWeakFallback>,
@@ -364,13 +362,38 @@ impl<'data> IncrementalSymbolState<'data> {
     }
 
     fn define_id(&mut self, id: NameId) -> bool {
-        self.states[id.index()].mark_defined()
+        let was_unresolved = self.states[id.index()].is_unresolved();
+        let changed = self.states[id.index()].mark_defined();
+        if was_unresolved {
+            let name = self.names.bytes(id).expect("state NameId is interned");
+            let position = self
+                .unresolved_names
+                .binary_search_by(|candidate| {
+                    self.names
+                        .bytes(*candidate)
+                        .expect("unresolved NameId is interned")
+                        .cmp(name)
+                })
+                .expect("active unresolved NameId is present");
+            self.unresolved_names.remove(position);
+        }
+        changed
     }
 
     fn mark_unresolved(&mut self, id: NameId) {
         if self.states[id.index()].mark_unresolved() {
+            let name = self.names.bytes(id).expect("state NameId is interned");
+            let position = self
+                .unresolved_names
+                .binary_search_by(|candidate| {
+                    self.names
+                        .bytes(*candidate)
+                        .expect("unresolved NameId is interned")
+                        .cmp(name)
+                })
+                .expect_err("new unresolved NameId is not already active");
             note_vec_push(&self.unresolved_names);
-            self.unresolved_names.push(id);
+            self.unresolved_names.insert(position, id);
         }
     }
 
@@ -396,23 +419,8 @@ impl<'data> IncrementalSymbolState<'data> {
             .is_some_and(|state| state.is_defined())
     }
 
-    fn unresolved_in_byte_order(&self) -> Vec<NameId> {
-        let mut ids = self
-            .unresolved_names
-            .iter()
-            .copied()
-            .filter(|id| {
-                let state = self.states[id.index()];
-                state.is_unresolved() && !state.is_defined()
-            })
-            .collect::<Vec<_>>();
-        ids.sort_by(|&left, &right| {
-            self.names
-                .bytes(left)
-                .expect("state NameId is interned")
-                .cmp(self.names.bytes(right).expect("state NameId is interned"))
-        });
-        ids
+    fn unresolved_in_byte_order(&self) -> &[NameId] {
+        &self.unresolved_names
     }
 }
 
@@ -766,7 +774,8 @@ fn extract_pass<'data>(
         } else {
             let mut demands = symbol_state
                 .unresolved_in_byte_order()
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|name| CanonicalArchiveDemand { name })
                 .collect::<Vec<_>>();
             demands.extend(
@@ -971,7 +980,8 @@ fn fallback_demands<'data>(
     state: &mut IncrementalSymbolState<'data>,
     runtime_resolution: &RuntimeResolution,
 ) -> Result<Vec<NameId>> {
-    let unresolved = state.unresolved_in_byte_order();
+    // Alternate resolution may intern names, so release the active-set borrow before the loop.
+    let unresolved = state.unresolved_in_byte_order().to_vec();
     let mut demands = Vec::with_capacity(unresolved.len() + state.weak_names.len());
     for name in unresolved {
         let resolved = {
@@ -1063,7 +1073,8 @@ fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> R
         .collect();
     let unresolved = state
         .unresolved_in_byte_order()
-        .into_iter()
+        .iter()
+        .copied()
         .map(|name| state.names.bytes(name).unwrap().to_vec())
         .collect();
     Ok((defined, unresolved))
@@ -1083,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_snapshot_frontier_scales_with_demands_not_definitions() {
+    fn active_unresolved_set_scales_with_demands_not_definitions() {
         let mut state = IncrementalSymbolState::new();
         for index in 0..4096 {
             let name = format!("defined_{index:04}");
@@ -1096,17 +1107,19 @@ mod tests {
         assert_eq!(state.unresolved_names.len(), 2);
         let unresolved = state
             .unresolved_in_byte_order()
-            .into_iter()
+            .iter()
+            .copied()
             .map(|id| state.names.bytes(id).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(unresolved, [b"a_demand".as_slice(), b"z_demand".as_slice()]);
 
         let z = state.intern_owned(b"z_demand");
         state.define_id(z);
-        assert_eq!(state.unresolved_names.len(), 2, "definitions remain stale");
+        assert_eq!(state.unresolved_names.len(), 1);
         let unresolved = state
             .unresolved_in_byte_order()
-            .into_iter()
+            .iter()
+            .copied()
             .map(|id| state.names.bytes(id).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(unresolved, [b"a_demand".as_slice()]);
