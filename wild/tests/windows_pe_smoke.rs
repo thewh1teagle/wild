@@ -15,6 +15,7 @@ mod corpus {
         sources: &'static [&'static str],
         exit_code: i32,
         kernel32: bool,
+        #[cfg_attr(windows, allow(dead_code))]
         object_relocations: &'static [&'static str],
     }
 
