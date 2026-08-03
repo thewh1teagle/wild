@@ -254,9 +254,11 @@ pub(crate) mod removal_counters {
             }
 
             let result = snapshot();
-            assert_eq!(result.name_hash_ops, THREADS * ITERATIONS);
-            assert_eq!(result.bytes_copied, THREADS * ITERATIONS * 2);
-            assert_eq!(result.relocation_decodes, THREADS * ITERATIONS);
+            // These counters are intentionally process-global, so unrelated tests running in
+            // parallel may add work after our reset. Our own increments must never be lost.
+            assert!(result.name_hash_ops >= THREADS * ITERATIONS);
+            assert!(result.bytes_copied >= THREADS * ITERATIONS * 2);
+            assert!(result.relocation_decodes >= THREADS * ITERATIONS);
             reset();
         }
     }
