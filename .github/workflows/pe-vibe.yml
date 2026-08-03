@@ -108,6 +108,7 @@ jobs:
         with:
           workspaces: vibe-source -> target
           shared-key: pe-vibe-${{ matrix.profile }}
+          cache-on-failure: true
 
       - name: Download Wild linker
         uses: actions/download-artifact@v4
