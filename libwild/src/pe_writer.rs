@@ -2321,67 +2321,37 @@ fn collect_contributions_with_roots_metadata(
         )?);
     }
     let contributions_phase = crate::timing_guard!(PE_DETAIL_CONTRIBUTIONS);
-    for (object_index, input) in objects.iter().enumerate() {
-        for section in input.file().sections() {
-            let raw_name = section.name_bytes().context("invalid COFF section name")?;
-            let flags = match section.flags() {
-                SectionFlags::Coff { characteristics } => characteristics.0,
-                _ => 0,
-            };
-            let class = linker_utils::coff_symbols::classify_section(flags)
-                .context("invalid COFF section flags")?;
-            if guard_metadata_policy(raw_name, args.guard.control_flow)?
-                == GuardMetadataPolicy::Discard
-            {
-                continue;
-            }
-            if class.discardable
-                || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
-                || matches!(
-                    class.contents,
-                    linker_utils::coff_symbols::SectionContents::Metadata
-                )
-            {
-                continue;
-            }
-            if comdats.discarded.contains(&(object_index, section.index())) {
-                continue;
-            }
-            let name = merged_name(raw_name, args)?;
-            let size = u32::try_from(section.size()).context("COFF section too large")?;
-            let kind = if matches!(
-                class.contents,
-                linker_utils::coff_symbols::SectionContents::UninitializedData
-            ) {
-                ContributionKind::Bss
-            } else {
-                ContributionKind::Data
-            };
-            let data = if kind == ContributionKind::Bss {
-                Vec::new()
-            } else {
-                section
-                    .data()
-                    .context("invalid COFF section contents")?
-                    .to_vec()
-            };
-            let alignment = u32::try_from(section.align().max(1))
-                .context("COFF section alignment too large")?;
-            output.push(Contribution {
-                source: Source::Object {
-                    object: object_index,
-                    section: section.index(),
-                },
-                spec: SectionContribution {
-                    id: ContributionId(output.len() as u32),
-                    name,
-                    characteristics: output_characteristics(flags),
-                    alignment,
-                    size,
-                    kind,
-                },
-                data,
-            });
+    if rayon::current_num_threads() == 1 {
+        // Avoid Rayon and retaining every per-object descriptor vector at once for the required
+        // single-thread baseline. IDs are assigned authoritatively after empty-group filtering.
+        for (object_index, input) in objects.iter().enumerate() {
+            materialize_object_contributions_into(
+                object_index,
+                input,
+                &comdats,
+                args,
+                &mut output,
+            )?;
+        }
+    } else {
+        // Each object owns its input sections, payload copies and result vector. Indexed collection
+        // keeps the slots in input order; unwrapping them serially preserves the first object-order
+        // diagnostic, and ordered flattening restores the original object/section contribution
+        // order exactly.
+        let object_results = objects
+            .par_iter()
+            .enumerate()
+            .map(|(object_index, input)| {
+                materialize_object_contributions(object_index, input, &comdats, args)
+            })
+            .collect::<Vec<_>>();
+        let object_contributions = object_results
+            .into_iter()
+            .collect::<Result<Vec<Vec<Contribution>>>>()?;
+        let contribution_count = object_contributions.iter().map(Vec::len).sum();
+        output.reserve(contribution_count);
+        for contributions in object_contributions {
+            output.extend(contributions);
         }
     }
     // lld-link gives an empty input contribution a boundary location only when its merged
@@ -2418,6 +2388,90 @@ fn collect_contributions_with_roots_metadata(
     }
     drop(contributions_phase);
     Ok((output, comdats.redirects))
+}
+
+fn materialize_object_contributions(
+    object_index: usize,
+    input: &crate::coff::CoffObject<'_>,
+    comdats: &ComdatResolution,
+    args: &crate::args::coff::CoffArgs,
+) -> Result<Vec<Contribution>> {
+    let mut output = Vec::new();
+    materialize_object_contributions_into(object_index, input, comdats, args, &mut output)?;
+    Ok(output)
+}
+
+fn materialize_object_contributions_into(
+    object_index: usize,
+    input: &crate::coff::CoffObject<'_>,
+    comdats: &ComdatResolution,
+    args: &crate::args::coff::CoffArgs,
+    output: &mut Vec<Contribution>,
+) -> Result<()> {
+    for section in input.file().sections() {
+        let raw_name = section.name_bytes().context("invalid COFF section name")?;
+        let flags = match section.flags() {
+            SectionFlags::Coff { characteristics } => characteristics.0,
+            _ => 0,
+        };
+        let class = linker_utils::coff_symbols::classify_section(flags)
+            .context("invalid COFF section flags")?;
+        if guard_metadata_policy(raw_name, args.guard.control_flow)? == GuardMetadataPolicy::Discard
+        {
+            continue;
+        }
+        if class.discardable
+            || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
+            || matches!(
+                class.contents,
+                linker_utils::coff_symbols::SectionContents::Metadata
+            )
+        {
+            continue;
+        }
+        if comdats.discarded.contains(&(object_index, section.index())) {
+            continue;
+        }
+        let name = merged_name(raw_name, args)?;
+        let size = u32::try_from(section.size()).context("COFF section too large")?;
+        let kind = if matches!(
+            class.contents,
+            linker_utils::coff_symbols::SectionContents::UninitializedData
+        ) {
+            ContributionKind::Bss
+        } else {
+            ContributionKind::Data
+        };
+        let data = if kind == ContributionKind::Bss {
+            Vec::new()
+        } else {
+            section
+                .data()
+                .context("invalid COFF section contents")?
+                .to_vec()
+        };
+        let alignment =
+            u32::try_from(section.align().max(1)).context("COFF section alignment too large")?;
+        output.push(Contribution {
+            source: Source::Object {
+                object: object_index,
+                section: section.index(),
+            },
+            spec: SectionContribution {
+                // This ID is provisional in parallel object-local vectors. Empty-output-group
+                // filtering below assigns compact, globally ordered IDs before any downstream
+                // consumer observes the contributions.
+                id: ContributionId(output.len() as u32),
+                name,
+                characteristics: output_characteristics(flags),
+                alignment,
+                size,
+                kind,
+            },
+            data,
+        });
+    }
+    Ok(())
 }
 
 fn opt_ref_enabled(args: &crate::args::coff::CoffArgs) -> bool {
@@ -5721,6 +5775,88 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn mixed_contribution_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0xc3], 1);
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+
+        let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        object.append_section_data(data, &[1, 2, 3], 4);
+        let bss = object.add_section(
+            Vec::new(),
+            b".bss".to_vec(),
+            object::SectionKind::UninitializedData,
+        );
+        object.append_section_bss(bss, 9, 8);
+        let merged = object.add_section(Vec::new(), b".foo$x".to_vec(), object::SectionKind::Data);
+        object.append_section_data(merged, &[4, 5], 2);
+
+        let non_empty = object.add_section(
+            Vec::new(),
+            b".rdata$a".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(non_empty, &[6], 1);
+        let mixed_empty = object.add_section(
+            Vec::new(),
+            b".rdata$z".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(mixed_empty, &[], 8);
+        let wholly_empty = object.add_section(
+            Vec::new(),
+            b".empty$z".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(wholly_empty, &[], 8);
+
+        let discardable =
+            object.add_section(Vec::new(), b".debug$S".to_vec(), object::SectionKind::Debug);
+        object.append_section_data(discardable, &[7], 1);
+        let linker = object.add_section(
+            Vec::new(),
+            b".drectve".to_vec(),
+            object::SectionKind::Linker,
+        );
+        object.append_section_data(linker, b" /DEFAULTLIB:none", 1);
+        // `object::write` deliberately rejects COFF metadata sections, so emit an ordinary
+        // section and clear its characteristics in the finished test object below.
+        let metadata = object.add_section(
+            Vec::new(),
+            b".meta".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(metadata, &[8], 1);
+        let guard = object.add_section(
+            Vec::new(),
+            b".gfids$y".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(guard, &[0; 4], 4);
+        let mut bytes = object.write().unwrap();
+        let section_count = usize::from(u16::from_le_bytes(bytes[2..4].try_into().unwrap()));
+        let metadata_header = (0..section_count)
+            .map(|index| 20 + index * 40)
+            .find(|&offset| &bytes[offset..offset + 5] == b".meta")
+            .unwrap();
+        bytes[metadata_header + 36..metadata_header + 40].fill(0);
+        bytes
+    }
+
     #[test]
     fn args_drive_writer_configuration() {
         let args = crate::args::coff::CoffArgs {
@@ -6223,6 +6359,142 @@ mod tests {
             assert_eq!(actual, expected, "thread count {threads}");
             assert!(!actual.contains(b"dead_import".as_slice()));
         }
+    }
+
+    #[test]
+    fn parallel_contribution_materialization_matches_single_thread() {
+        let mixed = mixed_contribution_object();
+        let live = comdat_object(
+            b"live",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"live",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&mixed).unwrap(),
+            crate::coff::CoffObject::parse(&live).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            force_undefined: vec!["live".into()],
+            merges: vec![crate::args::coff::SectionMerge {
+                from: ".foo".into(),
+                to: ".data".into(),
+            }],
+            ..Default::default()
+        };
+
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let (contributions, redirects) = collect_contributions_with_roots(
+                        &objects,
+                        &args,
+                        &[b"entry".to_vec(), b"live".to_vec()],
+                        &Default::default(),
+                    )
+                    .unwrap();
+                    let signature = contributions
+                        .iter()
+                        .map(|contribution| {
+                            let source = match contribution.source {
+                                Source::Object { object, section } => Some((object, section.0)),
+                                Source::Synthetic => None,
+                            };
+                            (
+                                source,
+                                contribution.spec.id,
+                                contribution.spec.name.clone(),
+                                contribution.spec.characteristics,
+                                contribution.spec.alignment,
+                                contribution.spec.size,
+                                contribution.spec.kind,
+                                contribution.data.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let image = build_image(
+                        &objects,
+                        &[],
+                        &[],
+                        b"parallel-contributions.exe",
+                        Some("entry"),
+                        &args,
+                        PeWriterConfig::default(),
+                        &[],
+                        &Default::default(),
+                    )
+                    .unwrap()
+                    .bytes;
+                    (signature, redirects, image)
+                })
+        };
+
+        let baseline = run(1);
+        for threads in [2, 4, 10] {
+            assert_eq!(run(threads), baseline, "thread count {threads}");
+        }
+
+        let signature = &baseline.0;
+        assert!(
+            signature
+                .iter()
+                .enumerate()
+                .all(|(index, contribution)| { contribution.1 == ContributionId(index as u32) })
+        );
+        assert!(signature.iter().any(|contribution| {
+            contribution.2 == b".bss"
+                && contribution.6 == ContributionKind::Bss
+                && contribution.7.is_empty()
+        }));
+        assert!(
+            signature
+                .iter()
+                .any(|contribution| contribution.2 == b".data$x")
+        );
+        assert!(
+            signature
+                .iter()
+                .any(|contribution| contribution.2 == b".rdata$z" && contribution.5 == 0)
+        );
+        for omitted in [
+            b".empty$z".as_slice(),
+            b".debug$S",
+            b".drectve",
+            b".meta",
+            b".gfids$y",
+        ] {
+            assert!(
+                signature
+                    .iter()
+                    .all(|contribution| contribution.2 != omitted),
+                "section {} must be filtered",
+                String::from_utf8_lossy(omitted)
+            );
+        }
+        assert!(
+            signature
+                .iter()
+                .any(|contribution| { matches!(contribution.0, Some((1, _))) })
+        );
+        assert!(
+            signature
+                .iter()
+                .all(|contribution| { !matches!(contribution.0, Some((2, _))) })
+        );
     }
 
     #[test]
