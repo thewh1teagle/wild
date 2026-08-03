@@ -6,6 +6,7 @@ pub mod coff_symbols;
 pub mod elf;
 pub mod loongarch64;
 pub mod pe_base_relocs;
+pub mod pe_sections;
 pub mod ppc64;
 pub mod relaxation;
 pub mod riscv64;
