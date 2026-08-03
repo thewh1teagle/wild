@@ -36,7 +36,21 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
-const LOAD_CONFIG_SECURITY_COOKIE_OFFSET: u32 = 88;
+const LOAD_CONFIG_SYMBOL: &[u8] = b"_load_config_used";
+const GUARD_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
+    b"__guard_fids_count",
+    b"__guard_fids_table",
+    b"__guard_flags",
+    b"__guard_iat_count",
+    b"__guard_iat_table",
+    b"__guard_longjmp_count",
+    b"__guard_longjmp_table",
+    b"__guard_eh_cont_count",
+    b"__guard_eh_cont_table",
+    b"__enclave_config",
+    b"__volatile_metadata",
+    b"__guard_memcpy_fptr",
+];
 
 #[path = "pe_entry.rs"]
 mod pe_entry;
@@ -520,6 +534,9 @@ fn select_opened_inputs<'data, F: FileSystem>(
         archive_definitions: BTreeSet::new(),
         resolver: pe_resolver::ResolverSession::new(),
     };
+    for symbol in GUARD_ABSOLUTE_ZERO_SYMBOLS {
+        selection.resolver.define_linker_symbol(symbol);
+    }
     let active = inputs.iter().filter(|(path, _, is_default)| {
         !*is_default
             || (!no_default_libraries
@@ -630,6 +647,16 @@ fn resolve_open_selection(
                 .filter(|export| !looks_like_forwarder(export))
                 .map(|export| export.target.as_bytes().to_vec()),
         );
+        // link.exe and lld-link retain the CRT load-configuration object when
+        // an archive makes it available. It is loader metadata rather than an
+        // ordinary program reference, so no input undefined symbol pulls it
+        // out of libcmt/msvcrt by itself.
+        if selection
+            .resolver
+            .has_archive_definition(LOAD_CONFIG_SYMBOL)
+        {
+            roots.push(LOAD_CONFIG_SYMBOL.to_vec());
+        }
         roots.sort();
         roots.dedup();
 
@@ -880,6 +907,7 @@ fn resolved_undefined_symbols(
             undefined.insert(target.to_vec());
         }
     }
+    undefined.retain(|name| !GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name.as_slice()));
     Ok(undefined)
 }
 
@@ -970,27 +998,13 @@ fn build_image(
         },
         debug_characteristics(),
     )?;
-    let has_security_cookie =
-        has_live_defined_symbol(objects, &contributions, b"__security_cookie")?;
-    let load_config_id = add_synthetic(
-        &mut contributions,
-        b".loadcfg",
-        if has_security_cookie {
-            linker_utils::pe_load_config::IMAGE_LOAD_CONFIG_DIRECTORY64_COMPAT_SIZE as usize
-        } else {
-            0
-        },
-        readonly_data_characteristics(),
-    )?;
-
     let dynamic_base = args.dynamic_base && !args.fixed;
     let mut reloc_id = None;
     let mut reloc_data = Vec::new();
     let mut layout = make_layout(&contributions, config)?;
     if dynamic_base {
         for _ in 0..3 {
-            let mut dir64 = dir64_rvas(objects, &contributions, &layout)?;
-            add_load_config_relocation(&mut dir64, load_config_id, &layout)?;
+            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
             let next = build_amd64_base_relocation_table(dir64, layout.size_of_image)
                 .context("failed to build PE base relocation table")?;
             if next.is_empty() {
@@ -1021,8 +1035,7 @@ fn build_image(
             layout = next_layout;
         }
         if let Some(id) = reloc_id {
-            let mut dir64 = dir64_rvas(objects, &contributions, &layout)?;
-            add_load_config_relocation(&mut dir64, load_config_id, &layout)?;
+            let dir64 = dir64_rvas(objects, &contributions, &layout)?;
             reloc_data = build_amd64_base_relocation_table(dir64, layout.size_of_image)?;
             let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
             contribution.spec.size = reloc_data.len() as u32;
@@ -1099,44 +1112,18 @@ fn build_image(
             .or_insert(config.image_base + u64::from(*rva));
     }
     add_image_base_symbol(&mut definitions, config.image_base);
+    for symbol in GUARD_ABSOLUTE_ZERO_SYMBOLS {
+        definitions.entry(symbol.to_vec()).or_insert(0);
+    }
     bind_weak_externals(objects, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
-    let load_config_directory = if let Some(id) = load_config_id {
-        let cookie_va = definitions
-            .get(b"__security_cookie".as_slice())
-            .copied()
-            .context("__security_cookie disappeared during PE symbol resolution")?;
-        let cookie_rva = u32::try_from(
-            cookie_va
-                .checked_sub(config.image_base)
-                .context("__security_cookie precedes the image base")?,
-        )
-        .context("__security_cookie RVA exceeds u32")?;
-        let placement = &layout.placements[&id];
-        let encoded = linker_utils::pe_load_config::encode_pe_load_config64(
-            &linker_utils::pe_load_config::PeLoadConfig64 {
-                image_base: config.image_base,
-                directory_rva: placement.rva,
-                size_of_image: layout.size_of_image,
-                security_cookie_rva: Some(cookie_rva),
-                guard_cf_check_function_pointer_rva: None,
-                guard_cf_dispatch_function_pointer_rva: None,
-                guard_cf_function_rvas: Vec::new(),
-                guard_eh_continuation_rvas: Vec::new(),
-                guard_flags: 0,
-            },
-        )
-        .context("failed to build PE load-config directory")?;
-        let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
-        ensure!(
-            encoded.bytes.len() == contribution.data.len(),
-            "PE load-config section changed size after layout"
-        );
-        contribution.data.copy_from_slice(&encoded.bytes);
-        Some((encoded.data_directory_rva, encoded.data_directory_size))
-    } else {
-        None
-    };
+    let load_config_directory = load_config_directory(
+        objects,
+        &contributions,
+        &layout,
+        &definitions,
+        config.image_base,
+    )?;
     let entry_rva = match entry_name {
         Some(name) => {
             let va = definitions
@@ -1384,41 +1371,90 @@ fn canonicalize_exception_directory(
     Ok(Some((table.directory.rva, table.directory.size)))
 }
 
-fn has_live_defined_symbol(
+fn load_config_directory(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
-    name: &[u8],
-) -> Result<bool> {
+    layout: &SectionLayout,
+    definitions: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+) -> Result<Option<(u32, u32)>> {
+    let Some(&selected_va) = definitions.get(LOAD_CONFIG_SYMBOL) else {
+        return Ok(None);
+    };
     let locations = source_locations(contributions);
     for (object_index, object) in objects.iter().enumerate() {
         for symbol in object.file().symbols() {
-            if symbol.name_bytes()? == name
-                && (symbol.is_common()
-                    || symbol
-                        .section_index()
-                        .is_some_and(|section| locations.contains_key(&(object_index, section))))
-            {
-                return Ok(true);
+            if !symbol.is_global() || symbol.name_bytes()? != LOAD_CONFIG_SYMBOL {
+                continue;
             }
+            let Some(section_index) = symbol.section_index() else {
+                continue;
+            };
+            let Some(id) = locations.get(&(object_index, section_index)) else {
+                continue;
+            };
+            let placement = &layout.placements[id];
+            let symbol_offset = u32::try_from(symbol.address())
+                .context("`_load_config_used` section offset exceeds u32")?;
+            let symbol_rva = placement
+                .rva
+                .checked_add(symbol_offset)
+                .context("`_load_config_used` RVA overflow")?;
+            if image_base + u64::from(symbol_rva) != selected_va {
+                continue;
+            }
+
+            let contribution = contributions
+                .iter()
+                .find(|contribution| contribution.spec.id == *id)
+                .context("`_load_config_used` contribution disappeared")?;
+            ensure!(
+                contribution.spec.kind == ContributionKind::Data,
+                "`_load_config_used` points to uninitialized data"
+            );
+            let section = object
+                .file()
+                .section_by_index(section_index)
+                .context("`_load_config_used` references an invalid section")?;
+            ensure!(
+                section.align() >= 8 && symbol.address().is_multiple_of(8),
+                "`_load_config_used` must be 8-byte aligned"
+            );
+            let data = section
+                .data()
+                .context("`_load_config_used` points to uninitialized data")?;
+            let offset = usize::try_from(symbol.address())
+                .context("`_load_config_used` section offset exceeds usize")?;
+            let size_field_end = offset
+                .checked_add(4)
+                .context("`_load_config_used` section offset overflow")?;
+            let size_field = data
+                .get(offset..size_field_end)
+                .context("`_load_config_used` section is too small")?;
+            let size = u32::from_le_bytes(size_field.try_into().unwrap());
+            ensure!(
+                size >= 4,
+                "`_load_config_used` declares an invalid size {size}"
+            );
+            let end = symbol_offset
+                .checked_add(size)
+                .context("`_load_config_used` size overflow")?;
+            ensure!(
+                u64::from(end) <= section.size(),
+                "`_load_config_used` declares size {size} beyond its containing section"
+            );
+            ensure!(
+                symbol_rva
+                    .checked_add(size)
+                    .is_some_and(|end| end <= layout.size_of_image),
+                "`_load_config_used` extends beyond the PE image"
+            );
+            return Ok(Some((symbol_rva, size)));
         }
     }
-    Ok(false)
-}
-
-fn add_load_config_relocation(
-    rvas: &mut Vec<u32>,
-    load_config_id: Option<ContributionId>,
-    layout: &SectionLayout,
-) -> Result<()> {
-    if let Some(id) = load_config_id {
-        rvas.push(
-            layout.placements[&id]
-                .rva
-                .checked_add(LOAD_CONFIG_SECURITY_COOKIE_OFFSET)
-                .context("load-config relocation RVA overflow")?,
-        );
-    }
-    Ok(())
+    Err(error!(
+        "selected `_load_config_used` definition is not backed by initialized section data"
+    ))
 }
 
 fn estimated_export_size(
@@ -2203,6 +2239,19 @@ fn dir64_rvas(
     layout: &SectionLayout,
 ) -> Result<Vec<u32>> {
     let locations = source_locations(contributions);
+    let live_definitions = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(object_index, input)| {
+            let locations = &locations;
+            input.file().symbols().filter_map(move |symbol| {
+                let section = symbol.section_index()?;
+                (symbol.is_global() && locations.contains_key(&(object_index, section)))
+                    .then(|| symbol.name_bytes().ok().map(<[u8]>::to_vec))
+                    .flatten()
+            })
+        })
+        .collect::<HashSet<_>>();
     let mut rvas = Vec::new();
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
@@ -2211,6 +2260,18 @@ fn dir64_rvas(
             };
             for (offset, relocation) in section.relocations() {
                 if relocation.kind() == RelocationKind::Absolute && relocation.size() == 64 {
+                    if let RelocationTarget::Symbol(index) = relocation.target() {
+                        let symbol = input
+                            .file()
+                            .symbol_by_index(index)
+                            .context("invalid relocation symbol")?;
+                        let name = symbol.name_bytes()?;
+                        if GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name)
+                            && !live_definitions.contains(name)
+                        {
+                            continue;
+                        }
+                    }
                     rvas.push(
                         layout.placements[id]
                             .rva
@@ -2319,7 +2380,9 @@ fn apply_relocations(
                 let source_file = placement
                     .file_offset
                     .ok_or_else(|| error!("relocation in uninitialized section"))?;
-                let (target, target_section, target_section_index) = match relocation.target() {
+                let (target, target_section, target_section_index, absolute_zero) = match relocation
+                    .target()
+                {
                     RelocationTarget::Symbol(index) => {
                         let symbol = input
                             .file()
@@ -2329,7 +2392,13 @@ fn apply_relocations(
                         if symbol.is_global()
                             && let Some(address) = definitions.get(name)
                         {
-                            target_location(layout, image_base, *address)?
+                            if *address == 0 && GUARD_ABSOLUTE_ZERO_SYMBOLS.contains(&name) {
+                                (0, 0, 0, true)
+                            } else {
+                                let (target, section, index) =
+                                    target_location(layout, image_base, *address)?;
+                                (target, section, index, false)
+                            }
                         } else if let Some(section) = symbol.section_index() {
                             let ((target_object, target_section_index), id) =
                                 redirected_location(locations, redirects, (object_index, section))?
@@ -2360,12 +2429,15 @@ fn apply_relocations(
                                 layout.sections[target_placement.output_section].rva,
                                 u16::try_from(target_placement.output_section + 1)
                                     .context("PE section index exceeds u16")?,
+                                false,
                             )
                         } else {
                             let address = *definitions.get(name).ok_or_else(|| {
                                 error!("undefined symbol `{}`", String::from_utf8_lossy(name))
                             })?;
-                            target_location(layout, image_base, address)?
+                            let (target, section, index) =
+                                target_location(layout, image_base, address)?;
+                            (target, section, index, false)
                         }
                     }
                     RelocationTarget::Section(section) => {
@@ -2385,6 +2457,7 @@ fn apply_relocations(
                             layout.sections[target_placement.output_section].rva,
                             u16::try_from(target_placement.output_section + 1)
                                 .context("PE section index exceeds u16")?,
+                            false,
                         )
                     }
                     _ => return Err(error!("unsupported COFF relocation target")),
@@ -2398,6 +2471,21 @@ fn apply_relocations(
                 let at = usize::try_from(u64::from(source_file) + offset)
                     .context("relocation file offset too large")?;
                 let field = image.get_mut(at..).context("relocation past file data")?;
+                if absolute_zero {
+                    ensure!(
+                        matches!(
+                            kind,
+                            Amd64RelocationKind::Absolute
+                                | Amd64RelocationKind::Address64
+                                | Amd64RelocationKind::Address32
+                                | Amd64RelocationKind::Address32NoBase
+                        ),
+                        "unsupported {kind:?} relocation to absolute-zero linker symbol"
+                    );
+                    // The field already contains its implicit addend. Adding
+                    // the absolute symbol value zero leaves it unchanged.
+                    continue;
+                }
                 apply_amd64_relocation(
                     kind,
                     field,
@@ -3362,7 +3450,7 @@ mod tests {
         object.write().unwrap()
     }
 
-    fn security_cookie_object() -> Vec<u8> {
+    fn crt_load_config_object(declared_size: u32, symbol_offset: u64) -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
             object::Architecture::X86_64,
@@ -3370,7 +3458,7 @@ mod tests {
         );
         let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
         object.append_section_data(data, &0x2b99_2ddf_a232u64.to_le_bytes(), 8);
-        object.add_symbol(Symbol {
+        let cookie = object.add_symbol(Symbol {
             name: b"__security_cookie".to_vec(),
             value: 0,
             size: 8,
@@ -3380,6 +3468,91 @@ mod tests {
             section: SymbolSection::Section(data),
             flags: object::SymbolFlags::None,
         });
+        let config = object.add_section(
+            Vec::new(),
+            b".rdata$loadcfg".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        let config_size = 312usize;
+        let mut contents = vec![0xa5; usize::try_from(symbol_offset).unwrap()];
+        contents.resize(contents.len() + config_size, 0);
+        contents
+            [usize::try_from(symbol_offset).unwrap()..usize::try_from(symbol_offset).unwrap() + 4]
+            .copy_from_slice(&declared_size.to_le_bytes());
+        object.append_section_data(config, &contents, 8);
+        object.add_symbol(Symbol {
+            name: LOAD_CONFIG_SYMBOL.to_vec(),
+            value: symbol_offset,
+            size: u64::from(declared_size),
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(config),
+            flags: object::SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                config,
+                Relocation {
+                    offset: symbol_offset + 88,
+                    symbol: cookie,
+                    addend: 0,
+                    flags: object::RelocationFlags::Coff {
+                        typ: object::pe::IMAGE_REL_AMD64_ADDR64,
+                    },
+                },
+            )
+            .unwrap();
+        object.write().unwrap()
+    }
+
+    fn guard_absolute_load_config_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let config = object.add_section(
+            Vec::new(),
+            b".rdata$loadcfg".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        let mut contents = vec![0; 112];
+        contents[..4].copy_from_slice(&112u32.to_le_bytes());
+        object.append_section_data(config, &contents, 8);
+        object.add_symbol(Symbol {
+            name: LOAD_CONFIG_SYMBOL.to_vec(),
+            value: 0,
+            size: 112,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(config),
+            flags: object::SymbolFlags::None,
+        });
+        let count = object.add_symbol(Symbol {
+            name: b"__guard_fids_count".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                config,
+                Relocation {
+                    offset: 104,
+                    symbol: count,
+                    addend: 0,
+                    flags: object::RelocationFlags::Coff {
+                        typ: object::pe::IMAGE_REL_AMD64_ADDR64,
+                    },
+                },
+            )
+            .unwrap();
         object.write().unwrap()
     }
 
@@ -4573,8 +4746,210 @@ mod tests {
     }
 
     #[test]
-    fn emits_security_cookie_load_config_and_relocation() {
-        let bytes = security_cookie_object();
+    fn retains_crt_load_config_at_its_symbol_and_applies_relocations() {
+        let bytes = crt_load_config_object(312, 8);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let config = PeWriterConfig {
+            image_base: 0x0000_0001_8000_0000,
+            ..PeWriterConfig::default()
+        };
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"cookie.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            config,
+            &[],
+            &Default::default(),
+        )
+        .unwrap()
+        .bytes;
+        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
+        assert_ne!(directory_rva, 0);
+        assert_eq!(
+            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            312
+        );
+        assert_ne!(
+            u32::from_le_bytes(image[0x130..0x134].try_into().unwrap()),
+            0
+        );
+        let reloc_size =
+            usize::try_from(u32::from_le_bytes(image[0x134..0x138].try_into().unwrap())).unwrap();
+        let file = object::File::parse(image.as_slice()).unwrap();
+        assert!(file.section_by_name(".loadcfg").is_none());
+        let rdata = file.section_by_name(".rdata").unwrap();
+        let rdata_rva = u32::try_from(rdata.address() - config.image_base).unwrap();
+        let directory_offset = usize::try_from(directory_rva - rdata_rva).unwrap();
+        let directory = &rdata.data().unwrap()[directory_offset..directory_offset + 312];
+        assert_eq!(u32::from_le_bytes(directory[..4].try_into().unwrap()), 312);
+        let data_va = file.section_by_name(".data").unwrap().address();
+        assert_eq!(
+            u64::from_le_bytes(directory[88..96].try_into().unwrap()),
+            data_va
+        );
+        let relocations = linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
+            &file.section_by_name(".reloc").unwrap().data().unwrap()[..reloc_size],
+            u32::from_le_bytes(image[0xd0..0xd4].try_into().unwrap()),
+        )
+        .unwrap();
+        assert!(relocations.contains(&(directory_rva + 88)));
+
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let fixed_args = crate::args::coff::CoffArgs {
+            fixed: true,
+            ..Default::default()
+        };
+        let fixed = build_image(
+            &[object],
+            &[],
+            &[],
+            b"cookie-fixed.exe",
+            None,
+            &fixed_args,
+            config,
+            &[],
+            &Default::default(),
+        )
+        .unwrap()
+        .bytes;
+        assert_eq!(
+            u32::from_le_bytes(fixed[0x130..0x134].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn absolute_zero_guard_load_config_fields_are_not_base_relocations() {
+        let bytes = guard_absolute_load_config_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"guard-zero.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap()
+        .bytes;
+        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
+        assert_ne!(directory_rva, 0);
+        assert_eq!(
+            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            112
+        );
+        assert_eq!(
+            u32::from_le_bytes(image[0x130..0x134].try_into().unwrap()),
+            0
+        );
+        let file = object::File::parse(image.as_slice()).unwrap();
+        let rdata = file.section_by_name(".rdata").unwrap();
+        let rdata_rva =
+            u32::try_from(rdata.address() - PeWriterConfig::default().image_base).unwrap();
+        let offset = usize::try_from(directory_rva - rdata_rva).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(
+                rdata.data().unwrap()[offset + 104..offset + 112]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn rejects_misaligned_crt_load_config_symbol() {
+        let bytes = crt_load_config_object(312, 4);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let error = build_image(
+            &[object],
+            &[],
+            &[],
+            b"misaligned-load-config.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{error:?}").contains("must be 8-byte aligned"));
+    }
+
+    #[test]
+    fn rejects_uninitialized_crt_load_config_symbol() {
+        let mut input = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let bss = input.add_section(
+            Vec::new(),
+            b".bss".to_vec(),
+            object::SectionKind::UninitializedData,
+        );
+        input.append_section_bss(bss, 320, 8);
+        input.add_symbol(Symbol {
+            name: LOAD_CONFIG_SYMBOL.to_vec(),
+            value: 0,
+            size: 320,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(bss),
+            flags: object::SymbolFlags::None,
+        });
+        let bytes = input.write().unwrap();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let error = build_image(
+            &[object],
+            &[],
+            &[],
+            b"bss-load-config.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{error:?}").contains("uninitialized data"));
+    }
+
+    #[test]
+    fn security_cookie_without_crt_load_config_does_not_synthesize_one() {
+        let bytes = crt_load_config_object(312, 8);
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        object.append_section_data(data, &0x2b99_2ddf_a232u64.to_le_bytes(), 8);
+        object.add_symbol(Symbol {
+            name: b"__security_cookie".to_vec(),
+            value: 0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(data),
+            flags: object::SymbolFlags::None,
+        });
+        assert!(
+            file.symbols()
+                .any(|symbol| symbol.name().unwrap() == "_load_config_used")
+        );
+        let bytes = object.write().unwrap();
         let object = crate::coff::CoffObject::parse(&bytes).unwrap();
         let image = build_image(
             &[object],
@@ -4589,26 +4964,34 @@ mod tests {
         )
         .unwrap()
         .bytes;
-        let directory_rva = u32::from_le_bytes(image[0x160..0x164].try_into().unwrap());
-        assert_ne!(directory_rva, 0);
         assert_eq!(
-            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
-            linker_utils::pe_load_config::IMAGE_LOAD_CONFIG_DIRECTORY64_COMPAT_SIZE
-        );
-        assert_ne!(
-            u32::from_le_bytes(image[0x130..0x134].try_into().unwrap()),
+            u32::from_le_bytes(image[0x160..0x164].try_into().unwrap()),
             0
         );
-        let file = object::File::parse(image.as_slice()).unwrap();
-        let section = file.section_by_name(".loadcfg").unwrap();
-        let parsed = linker_utils::pe_load_config::parse_pe_load_config64(
-            section.data().unwrap(),
-            directory_rva,
-            PeWriterConfig::default().image_base,
-            u32::from_le_bytes(image[0xd0..0xd4].try_into().unwrap()),
+        assert_eq!(
+            u32::from_le_bytes(image[0x164..0x168].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_crt_load_config_size() {
+        let bytes = crt_load_config_object(313, 8);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let error = build_image(
+            &[object],
+            &[],
+            &[],
+            b"bad-load-config.exe",
+            None,
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
         )
+        .err()
         .unwrap();
-        assert!(parsed.security_cookie_rva.is_some());
+        assert!(format!("{error:?}").contains("beyond its containing section"));
     }
 
     #[test]
