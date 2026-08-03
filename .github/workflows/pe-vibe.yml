@@ -171,104 +171,109 @@ jobs:
           }
 
       - name: Force a fresh Vibe package link
+        shell: pwsh
         working-directory: vibe-source
-        run: >-
-          cargo clean --manifest-path desktop/src-tauri/Cargo.toml
-          --package vibe
-          --target x86_64-pc-windows-msvc
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          cargo clean --manifest-path Cargo.toml --package vibe `
+            --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo clean failed with exit code $LASTEXITCODE"
+          }
+          $executable = Join-Path `
+            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE) `
+            'vibe.exe'
+          if (Test-Path $executable) {
+            throw "cargo clean left a cached Vibe executable at $executable"
+          }
 
       - name: Build Vibe ${{ matrix.profile }} with Wild
         working-directory: vibe-source/desktop
-        env:
-          # Wild's save-dir support records every loaded link input plus a
-          # relocatable run-with script. WILD_SAVE_BASE is concurrency-safe,
-          # unlike WILD_SAVE_DIR, when Cargo invokes multiple linkers.
-          WILD_SAVE_BASE: ${{ runner.temp }}\wild-save-${{ matrix.profile }}
         run: >-
           pnpm exec tauri build ${{ matrix.build-flag }} --no-bundle
           --target x86_64-pc-windows-msvc
 
-      - name: Locate Vibe linker repro
-        if: always()
-        shell: pwsh
-        env:
-          VIBE_PROFILE: ${{ matrix.profile }}
-        run: |
-          $base = Join-Path $env:RUNNER_TEMP "wild-save-$env:VIBE_PROFILE"
-          if (-not (Test-Path $base)) {
-            Write-Warning "Wild did not create a save base at $base"
-            exit 0
-          }
-
-          # WILD_SAVE_BASE allocates monotonically numbered directories when
-          # each linker starts. Cargo links the final application only after
-          # every dependency and build script has completed, so the highest
-          # completed invocation is the Vibe executable. The output name is
-          # deliberately rewritten to $OUT in saved replays and cannot be
-          # discovered reliably by searching the recorded arguments.
-          $candidate = Get-ChildItem $base -Directory |
-            Where-Object {
-              (Test-Path (Join-Path $_.FullName 'run-with')) -and
-              ($_.Name -match '^\d+$')
-            } |
-            Sort-Object { [int]$_.Name } -Descending |
-            Select-Object -First 1
-          if ($null -eq $candidate) {
-            Write-Warning "No completed saved link invocation under $base"
-            Get-ChildItem $base -Directory | Select-Object -ExpandProperty FullName
-            exit 0
-          }
-
-          $files = Get-ChildItem $candidate.FullName -File -Recurse
-          $bytes = ($files | Measure-Object Length -Sum).Sum
-          Write-Host "Captured Vibe link repro at $($candidate.FullName)"
-          Write-Host "Repro contains $($files.Count) files and $bytes bytes"
-          Get-ChildItem $candidate.FullName -File -Filter 'at-*.txt' |
-            Select-String -Pattern '(?i)^/out:' |
-            ForEach-Object { Write-Host "Saved output: $($_.Line)" }
-          Get-Content (Join-Path $candidate.FullName 'run-with') | Select-Object -Last 3
-          "VIBE_LINK_REPRO=$($candidate.FullName)" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Replay Vibe link with lld-link
-        id: replay
-        continue-on-error: true
+      - name: Preserve Wild Vibe output
         shell: pwsh
         working-directory: vibe-source
         env:
           VIBE_PROFILE: ${{ matrix.profile }}
         run: |
-          if (-not $env:VIBE_LINK_REPRO -or -not (Test-Path $env:VIBE_LINK_REPRO)) {
-            throw "The successful Wild build did not produce a Vibe link replay"
+          $source = (Resolve-Path `
+            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE)).Path
+          $destination = Join-Path $env:RUNNER_TEMP "vibe-wild-$env:VIBE_PROFILE"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          foreach ($name in @('vibe.exe', 'sona.exe', 'ffmpeg.exe')) {
+            $file = Join-Path $source $name
+            if (-not (Test-Path $file)) {
+              throw "Wild build did not produce $file"
+            }
+            Copy-Item $file $destination -Force
           }
-
-          $runWith = Join-Path $env:VIBE_LINK_REPRO 'run-with'
-          $bash = (Get-Command bash.exe -ErrorAction Stop).Source
-          $lld = (Get-Command lld-link.exe -ErrorAction Stop).Source
-          $lldDirectory = Join-Path $env:RUNNER_TEMP "vibe-lld-$env:VIBE_PROFILE"
-          New-Item -ItemType Directory -Force $lldDirectory | Out-Null
-          "VIBE_LLD_DIRECTORY=$lldDirectory" |
+          "VIBE_WILD_DIRECTORY=$destination" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $lldExecutable = Join-Path $lldDirectory 'vibe.exe'
-          $lldPdb = Join-Path $lldDirectory 'vibe.pdb'
-          $replayLog = Join-Path $lldDirectory 'lld-link-replay.txt'
 
-          # The replay script accepts the linker before `--` and extra linker
-          # arguments after it. Keep MSYS from rewriting lld-link's /out path.
-          $env:MSYS2_ARG_CONV_EXCL = '/out:;/pdb:'
-          & $bash $runWith $lld '--' "/out:$lldExecutable" "/pdb:$lldPdb" 2>&1 |
-            Tee-Object -FilePath $replayLog
+      - name: Force a fresh Vibe package link for lld-link
+        shell: pwsh
+        working-directory: vibe-source
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          cargo clean --manifest-path Cargo.toml --package vibe `
+            --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) {
-            throw "lld-link replay failed with exit code $LASTEXITCODE"
+            throw "cargo clean failed with exit code $LASTEXITCODE"
           }
-          if (-not (Test-Path $lldExecutable)) {
-            throw "lld-link replay did not produce $lldExecutable"
+          $executable = Join-Path `
+            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE) `
+            'vibe.exe'
+          if (Test-Path $executable) {
+            throw "cargo clean left the previous Vibe executable at $executable"
+          }
+          $marker = Join-Path $env:RUNNER_TEMP "vibe-lld-$env:VIBE_PROFILE.started"
+          [DateTime]::UtcNow.ToString('o') | Set-Content $marker -Encoding ascii
+          "VIBE_LLD_BUILD_MARKER=$marker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Vibe ${{ matrix.profile }} with lld-link
+        shell: pwsh
+        working-directory: vibe-source/desktop
+        run: |
+          $lld = (Get-Command lld-link.exe -ErrorAction Stop).Source
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lld
+          pnpm exec tauri build ${{ matrix.build-flag }} --no-bundle `
+            --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vibe lld-link build failed with exit code $LASTEXITCODE"
           }
 
-          $wildDirectory = Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
-          foreach ($sidecar in @('sona.exe', 'ffmpeg.exe')) {
-            Copy-Item (Join-Path $wildDirectory $sidecar) $lldDirectory
+      - name: Preserve lld-link Vibe output
+        shell: pwsh
+        working-directory: vibe-source
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          $source = (Resolve-Path `
+            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE)).Path
+          $destination = Join-Path $env:RUNNER_TEMP "vibe-lld-$env:VIBE_PROFILE"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          foreach ($name in @('vibe.exe', 'sona.exe', 'ffmpeg.exe')) {
+            $file = Join-Path $source $name
+            if (-not (Test-Path $file)) {
+              throw "lld-link build did not produce $file"
+            }
+            if ($name -eq 'vibe.exe') {
+              $marker = Get-Item $env:VIBE_LLD_BUILD_MARKER
+              $output = Get-Item $file
+              if ($output.LastWriteTimeUtc -le $marker.LastWriteTimeUtc) {
+                throw "lld-link vibe.exe is not newer than its build marker"
+              }
+            }
+            Copy-Item $file $destination -Force
           }
+          "VIBE_LLD_DIRECTORY=$destination" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Configure scoped Vibe crash dumps
         shell: pwsh
@@ -335,6 +340,15 @@ jobs:
               RedirectStandardOutput = $stdout
               RedirectStandardError = $stderr
               WorkingDirectory = Split-Path $Executable
+            }
+            $probeRoot = Join-Path $env:RUNNER_TEMP "$safeLabel-cli-profile"
+            $probeAppData = Join-Path $probeRoot 'roaming'
+            $probeLocalAppData = Join-Path $probeRoot 'local'
+            New-Item -ItemType Directory -Force `
+              -Path @($probeAppData, $probeLocalAppData) | Out-Null
+            $parameters.Environment = @{
+              APPDATA = $probeAppData
+              LOCALAPPDATA = $probeLocalAppData
             }
             if ($Arguments.Count -gt 0) {
               $parameters.ArgumentList = $Arguments
@@ -403,6 +417,39 @@ jobs:
             }
           }
 
+          function Find-FirstDifferentByte(
+            [string]$LeftPath,
+            [string]$RightPath
+          ) {
+            $left = [System.IO.File]::OpenRead($LeftPath)
+            $right = [System.IO.File]::OpenRead($RightPath)
+            try {
+              [byte[]]$leftBuffer = [byte[]]::new(65536)
+              [byte[]]$rightBuffer = [byte[]]::new(65536)
+              [long]$offset = 0
+              while ($true) {
+                $leftCount = $left.Read($leftBuffer, 0, $leftBuffer.Length)
+                $rightCount = $right.Read($rightBuffer, 0, $rightBuffer.Length)
+                $commonCount = [Math]::Min($leftCount, $rightCount)
+                for ($index = 0; $index -lt $commonCount; $index++) {
+                  if ($leftBuffer[$index] -ne $rightBuffer[$index]) {
+                    return $offset + $index
+                  }
+                }
+                if ($leftCount -ne $rightCount) {
+                  return $offset + $commonCount
+                }
+                if ($leftCount -eq 0) {
+                  return [long]-1
+                }
+                $offset += $leftCount
+              }
+            } finally {
+              $left.Dispose()
+              $right.Dispose()
+            }
+          }
+
           function Test-Gui([string]$Label, [string]$Executable) {
             $safeLabel = $Label -replace '[^A-Za-z0-9_.-]', '-'
             $stdout = Join-Path $diagnostics "$safeLabel-gui.stdout.txt"
@@ -436,21 +483,34 @@ jobs:
               if ($process.HasExited) {
                 $process.Refresh()
                 Add-Failure "$Label GUI exited early with $(Format-ExitCode $process.ExitCode)"
-                return
+                return [pscustomobject]@{
+                  Outcome = "early-exit:$($process.ExitCode)"
+                  WindowCreated = $false
+                }
               }
               if ($windowHandle -eq [IntPtr]::Zero) {
                 Add-Failure "$Label GUI stayed alive but did not create a top-level window within 20 seconds"
-                return
+                return [pscustomobject]@{
+                  Outcome = 'no-window'
+                  WindowCreated = $false
+                }
               }
               Start-Sleep -Seconds 5
               if ($process.HasExited) {
                 $process.Refresh()
                 Add-Failure "$Label GUI exited after creating its window with $(Format-ExitCode $process.ExitCode)"
-                return
+                return [pscustomobject]@{
+                  Outcome = "post-window-exit:$($process.ExitCode)"
+                  WindowCreated = $true
+                }
               }
               "window_handle=0x$($windowHandle.ToInt64().ToString('x'))" |
                 Set-Content (Join-Path $diagnostics "$safeLabel-gui.result.txt") -Encoding utf8
               Write-Host "$Label GUI created a window and remained alive"
+              return [pscustomobject]@{
+                Outcome = 'window-alive'
+                WindowCreated = $true
+              }
             } finally {
               if ($null -ne $process -and -not $process.HasExited) {
                 & taskkill.exe /PID $process.Id /T /F | Out-Host
@@ -461,20 +521,40 @@ jobs:
             }
           }
 
-          $wildDirectory = (Resolve-Path `
-            (Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE)).Path
+          $wildDirectory = (Resolve-Path $env:VIBE_WILD_DIRECTORY).Path
+          $lldDirectory = (Resolve-Path $env:VIBE_LLD_DIRECTORY).Path
           $variants = @(
             [pscustomobject]@{ Name = 'wild'; Directory = $wildDirectory }
+            [pscustomobject]@{ Name = 'lld'; Directory = $lldDirectory }
           )
-          if ($env:VIBE_LLD_DIRECTORY) {
-            $lldExecutable = Join-Path $env:VIBE_LLD_DIRECTORY 'vibe.exe'
-            if (Test-Path $lldExecutable) {
-              $variants += [pscustomobject]@{
-                Name = 'lld'
-                Directory = (Resolve-Path $env:VIBE_LLD_DIRECTORY).Path
-              }
-            }
+
+          $wildExecutable = Join-Path $wildDirectory 'vibe.exe'
+          $lldExecutable = Join-Path $lldDirectory 'vibe.exe'
+          $wildFile = Get-Item $wildExecutable
+          $lldFile = Get-Item $lldExecutable
+          $wildHash = (Get-FileHash $wildExecutable -Algorithm SHA256).Hash
+          $lldHash = (Get-FileHash $lldExecutable -Algorithm SHA256).Hash
+          $byteIdentical = $wildFile.Length -eq $lldFile.Length -and $wildHash -eq $lldHash
+          $firstDifference = if ($byteIdentical) {
+            [long]-1
+          } else {
+            Find-FirstDifferentByte $wildExecutable $lldExecutable
           }
+          $firstDifferenceHex = if ($firstDifference -lt 0) {
+            'none'
+          } else {
+            '0x{0:x}' -f $firstDifference
+          }
+          @(
+            "profile=$env:VIBE_PROFILE"
+            "wild_size=$($wildFile.Length)"
+            "wild_sha256=$wildHash"
+            "lld_size=$($lldFile.Length)"
+            "lld_sha256=$lldHash"
+            "byte_identical=$($byteIdentical.ToString().ToLowerInvariant())"
+            "first_differing_offset=$firstDifference"
+            "first_differing_offset_hex=$firstDifferenceHex"
+          ) | Tee-Object -FilePath (Join-Path $diagnostics 'binary-comparison.txt')
 
           # This pinned Vibe revision treats any argv[1] as CLI mode and
           # forwards it to sona. Baseline the sidecars before testing that
@@ -497,6 +577,8 @@ jobs:
           }
 
           $llvmReadObj = (Get-Command llvm-readobj.exe -ErrorAction Stop).Source
+          $cliResults = @{}
+          $guiResults = @{}
           foreach ($variant in $variants) {
             $label = "Vibe $env:VIBE_PROFILE ($($variant.Name))"
             $executable = Join-Path $variant.Directory 'vibe.exe'
@@ -518,12 +600,56 @@ jobs:
 
             $cli = Invoke-Probe "$($variant.Name)-vibe-help" `
               $executable @('--help') 30000
+            $cliResults[$variant.Name] = $cli
             if ($cli.TimedOut) {
               Write-Warning "$label CLI wrapper timed out after 30 seconds"
             } elseif (-not $sona.TimedOut -and $cli.ExitCode -ne $sona.ExitCode) {
               Write-Warning "$label CLI wrapper exited with $(Format-ExitCode $cli.ExitCode); sona baseline was $(Format-ExitCode $sona.ExitCode)"
             }
-            Test-Gui $label $executable
+            $guiResults[$variant.Name] = Test-Gui $label $executable
+          }
+
+          if (-not $cliResults.ContainsKey('wild') -or -not $cliResults.ContainsKey('lld')) {
+            Add-Failure 'Could not collect both Wild and lld-link CLI outcomes'
+          } else {
+            $wildCli = $cliResults['wild']
+            $lldCli = $cliResults['lld']
+            $wildCliOutcome = if ($wildCli.TimedOut) {
+              'timeout'
+            } else {
+              "exit:$($wildCli.ExitCode)"
+            }
+            $lldCliOutcome = if ($lldCli.TimedOut) {
+              'timeout'
+            } else {
+              "exit:$($lldCli.ExitCode)"
+            }
+            if ($wildCliOutcome -ne $lldCliOutcome) {
+              Add-Failure "Wild/lld CLI outcomes differ: Wild=$wildCliOutcome, lld=$lldCliOutcome"
+            }
+
+            $wildCliStdout = Get-Content $wildCli.Stdout -Raw -ErrorAction SilentlyContinue
+            $lldCliStdout = Get-Content $lldCli.Stdout -Raw -ErrorAction SilentlyContinue
+            if ($wildCliStdout -cne $lldCliStdout) {
+              Add-Failure 'Wild/lld CLI stdout differs'
+            }
+            $wildCliStderr = Get-Content $wildCli.Stderr -Raw -ErrorAction SilentlyContinue
+            $lldCliStderr = Get-Content $lldCli.Stderr -Raw -ErrorAction SilentlyContinue
+            $wildAptabasePanic = $wildCliStderr -match 'AptabaseClient'
+            $lldAptabasePanic = $lldCliStderr -match 'AptabaseClient'
+            if ($wildAptabasePanic -ne $lldAptabasePanic) {
+              Add-Failure "Wild/lld Aptabase panic markers differ: Wild=$wildAptabasePanic, lld=$lldAptabasePanic"
+            }
+          }
+
+          if (-not $guiResults.ContainsKey('wild') -or -not $guiResults.ContainsKey('lld')) {
+            Add-Failure 'Could not collect both Wild and lld-link GUI outcomes'
+          } else {
+            $wildGuiOutcome = $guiResults['wild'].Outcome
+            $lldGuiOutcome = $guiResults['lld'].Outcome
+            if ($wildGuiOutcome -ne $lldGuiOutcome) {
+              Add-Failure "Wild/lld GUI outcomes differ: Wild=$wildGuiOutcome, lld=$lldGuiOutcome"
+            }
           }
 
           @(
@@ -532,6 +658,10 @@ jobs:
             "sona_exit=$($sona.ExitCode)"
             "ffmpeg_timed_out=$($ffmpeg.TimedOut)"
             "ffmpeg_exit=$($ffmpeg.ExitCode)"
+            "wild_sha256=$wildHash"
+            "lld_sha256=$lldHash"
+            "byte_identical=$byteIdentical"
+            "first_differing_offset=$firstDifference"
             "failures=$($failures.Count)"
             $failures
           ) | Set-Content (Join-Path $diagnostics 'acceptance-summary.txt') -Encoding utf8
@@ -539,6 +669,16 @@ jobs:
           if ($failures.Count -ne 0) {
             throw "Vibe acceptance failed:`n$($failures -join "`n")"
           }
+
+      - name: Upload Vibe ${{ matrix.profile }} comparison diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-${{ matrix.profile }}-comparison-diagnostics
+          path: ${{ runner.temp }}\vibe-${{ matrix.profile }}-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 6
 
       - name: Capture Vibe ${{ matrix.profile }} failure evidence
         if: failure()
@@ -550,11 +690,12 @@ jobs:
           $evidence = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE-failure-evidence"
           New-Item -ItemType Directory -Force $evidence | Out-Null
 
-          $targetDirectory = Join-Path 'target/x86_64-pc-windows-msvc' $env:VIBE_PROFILE
-          foreach ($name in @('vibe.exe', 'sona.exe', 'ffmpeg.exe')) {
-            $source = Join-Path $targetDirectory $name
-            if (Test-Path $source) {
-              Copy-Item $source $evidence
+          foreach ($output in @(
+            [pscustomobject]@{ Name = 'wild-output'; Path = $env:VIBE_WILD_DIRECTORY }
+            [pscustomobject]@{ Name = 'lld-output'; Path = $env:VIBE_LLD_DIRECTORY }
+          )) {
+            if ($output.Path -and (Test-Path $output.Path)) {
+              Copy-Item $output.Path (Join-Path $evidence $output.Name) -Recurse
             }
           }
 
@@ -572,13 +713,6 @@ jobs:
             Copy-Item $env:VIBE_DIAGNOSTIC_DIRECTORY `
               (Join-Path $evidence 'acceptance-diagnostics') -Recurse
           }
-          if ($env:VIBE_LLD_DIRECTORY -and (Test-Path $env:VIBE_LLD_DIRECTORY)) {
-            Copy-Item $env:VIBE_LLD_DIRECTORY (Join-Path $evidence 'lld-output') -Recurse
-          }
-          if ($env:VIBE_LINK_REPRO -and (Test-Path $env:VIBE_LINK_REPRO)) {
-            Copy-Item $env:VIBE_LINK_REPRO (Join-Path $evidence 'link-repro') -Recurse
-          }
-
           $started = (Get-Date).ToUniversalTime().AddMinutes(-10)
           if ($env:VIBE_RUNTIME_START_FILE -and (Test-Path $env:VIBE_RUNTIME_START_FILE)) {
             $recorded = Get-Content $env:VIBE_RUNTIME_START_FILE -Raw
@@ -616,10 +750,10 @@ jobs:
           @(
             "profile=$env:VIBE_PROFILE"
             "captured_utc=$([DateTime]::UtcNow.ToString('o'))"
-            "link_repro=$env:VIBE_LINK_REPRO"
+            "wild_directory=$env:VIBE_WILD_DIRECTORY"
+            "lld_directory=$env:VIBE_LLD_DIRECTORY"
             "dump_directory=$env:VIBE_DUMP_DIRECTORY"
             "diagnostic_directory=$env:VIBE_DIAGNOSTIC_DIRECTORY"
-            "lld_directory=$env:VIBE_LLD_DIRECTORY"
           ) | Set-Content $manifest -Encoding utf8
           Get-ChildItem $evidence -File -Recurse |
             Where-Object FullName -ne $manifest |
