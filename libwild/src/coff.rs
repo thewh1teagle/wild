@@ -18,6 +18,7 @@ pub(crate) struct Pe;
 #[derive(Debug)]
 pub(crate) struct CoffObject<'data> {
     file: object::File<'data>,
+    bytes: &'data [u8],
 }
 
 impl<'data> CoffObject<'data> {
@@ -37,7 +38,7 @@ impl<'data> CoffObject<'data> {
             file.kind() == object::ObjectKind::Relocatable,
             "Only relocatable COFF objects are currently supported"
         );
-        Ok(Self { file })
+        Ok(Self { file, bytes })
     }
 
     pub(crate) fn section_count(&self) -> usize {
@@ -50,6 +51,10 @@ impl<'data> CoffObject<'data> {
 
     pub(crate) fn file(&self) -> &object::File<'data> {
         &self.file
+    }
+
+    pub(crate) fn bytes(&self) -> &'data [u8] {
+        self.bytes
     }
 }
 

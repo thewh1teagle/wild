@@ -7,6 +7,7 @@ use crate::error::Result;
 use linker_utils::coff_archives::CoffArchive;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
 use linker_utils::coff_runtime::RuntimeResolution;
+use linker_utils::coff_runtime::WeakExternalResolution;
 use linker_utils::coff_runtime::parse_legacy_alias_object;
 use linker_utils::coff_symbols::ArchiveDemand;
 use linker_utils::coff_symbols::ArchiveDemandKind;
@@ -21,6 +22,7 @@ type SymbolState = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 struct IncrementalSymbolState {
     defined: BTreeSet<Vec<u8>>,
     unresolved: BTreeSet<Vec<u8>>,
+    weak_resolution: WeakExternalResolution,
 }
 
 impl IncrementalSymbolState {
@@ -28,20 +30,25 @@ impl IncrementalSymbolState {
         let mut state = Self {
             defined: BTreeSet::new(),
             unresolved: roots.iter().cloned().collect(),
+            weak_resolution: WeakExternalResolution::default(),
         };
-        for object in objects {
-            state.absorb_object(object)?;
+        for (index, object) in objects.iter().enumerate() {
+            state.absorb_object(object, index)?;
         }
         Ok(state)
     }
 
-    fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>) -> Result<()> {
+    fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>, index: usize) -> Result<()> {
+        for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
+            self.weak_resolution
+                .apply(record, &format!("selected COFF object #{index}"))?;
+        }
         for symbol in object.file().symbols() {
             let name = symbol.name_bytes().context("invalid COFF symbol name")?;
             if name.is_empty() || !symbol.is_global() {
                 continue;
             }
-            if symbol.is_undefined() && !symbol.is_common() {
+            if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
                 self.unresolved.insert(name.to_vec());
             } else if symbol.is_definition() || symbol.is_common() {
                 self.defined.insert(name.to_vec());
@@ -133,22 +140,45 @@ fn extract_pass<'data>(
         // earlier library must suppress a competing definition in a later one during this
         // same pass. Keep the outer loop because a later library may introduce a new demand
         // that can be satisfied by an earlier library on the next pass.
-        let unresolved = if use_alternates {
-            resolve_alternate_demands(
+        let fallback_names;
+        let demands = if use_alternates {
+            fallback_names = fallback_demands(
                 symbol_state.unresolved.clone(),
                 &symbol_state.defined,
                 runtime_resolution,
-            )?
+                &symbol_state.weak_resolution,
+            )?;
+            fallback_names
+                .iter()
+                .map(|name| ArchiveDemand {
+                    name,
+                    kind: ArchiveDemandKind::Strong,
+                })
+                .collect::<Vec<_>>()
         } else {
-            symbol_state.unresolved.clone()
+            let mut demands = symbol_state
+                .unresolved
+                .iter()
+                .map(|name| ArchiveDemand {
+                    name: name.as_slice(),
+                    kind: ArchiveDemandKind::Strong,
+                })
+                .collect::<Vec<_>>();
+            demands.extend(
+                symbol_state
+                    .weak_resolution
+                    .records()
+                    .filter(|(symbol, _, search)| {
+                        *search == linker_utils::coff_symbols::WeakSearch::Library
+                            && !symbol_state.defined.contains(*symbol)
+                    })
+                    .map(|(symbol, _, _)| ArchiveDemand {
+                        name: symbol,
+                        kind: ArchiveDemandKind::WeakLibrary,
+                    }),
+            );
+            demands
         };
-        let demands = unresolved
-            .iter()
-            .map(|name| ArchiveDemand {
-                name,
-                kind: ArchiveDemandKind::Strong,
-            })
-            .collect::<Vec<_>>();
         let defined_refs = symbol_state
             .defined
             .iter()
@@ -169,7 +199,7 @@ fn extract_pass<'data>(
                                 String::from_utf8_lossy(member.name())
                             )
                         })?;
-                    symbol_state.absorb_object(&object)?;
+                    symbol_state.absorb_object(&object, objects.len())?;
                     objects.push(object);
                     changed = true;
                 }
@@ -209,12 +239,13 @@ fn extract_pass<'data>(
     Ok(changed)
 }
 
-fn resolve_alternate_demands(
+fn fallback_demands(
     unresolved: BTreeSet<Vec<u8>>,
     defined: &BTreeSet<Vec<u8>>,
     runtime_resolution: &RuntimeResolution,
+    weak_resolution: &WeakExternalResolution,
 ) -> Result<BTreeSet<Vec<u8>>> {
-    unresolved
+    let mut names = unresolved
         .into_iter()
         .map(|name| {
             let Ok(text) = std::str::from_utf8(&name) else {
@@ -225,7 +256,17 @@ fn resolve_alternate_demands(
                 .map(|resolved| resolved.as_bytes().to_vec())
                 .map_err(Into::into)
         })
-        .collect()
+        .collect::<Result<BTreeSet<_>>>()?;
+    for (symbol, _, _) in weak_resolution.records() {
+        if defined.contains(symbol) {
+            continue;
+        }
+        let target = weak_resolution.resolve(symbol, |name| defined.contains(name))?;
+        if !defined.contains(target) {
+            names.insert(target.to_vec());
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -347,6 +388,31 @@ mod tests {
         assert!(!defined.contains(b"fallback".as_slice()));
     }
 
+    #[test]
+    fn weak_search_policy_controls_primary_archive_extraction() {
+        for (search, extracts_primary) in [
+            (pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY.0, false),
+            (pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS.0, false),
+            (pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY.0, true),
+            (pe::IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY.0, false),
+        ] {
+            let root = weak_object(search);
+            let library = archive(&[("primary.obj", coff_object(&["primary"], &[]))]);
+            let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+
+            extract(
+                &mut objects,
+                &[&library],
+                &[false],
+                &[],
+                &mut RuntimeResolution::new(),
+            )
+            .unwrap();
+
+            assert_eq!(objects.len() == 2, extracts_primary, "search type {search}");
+        }
+    }
+
     fn coff_object(definitions: &[&str], undefined: &[&str]) -> Vec<u8> {
         let symbol_count = definitions.len() + undefined.len();
         let mut bytes = vec![0; 20 + 40];
@@ -374,6 +440,29 @@ mod tests {
         symbol[12..14].copy_from_slice(&section.to_le_bytes());
         symbol[16] = pe::IMAGE_SYM_CLASS_EXTERNAL.0;
         bytes.extend_from_slice(&symbol);
+    }
+
+    fn weak_object(search: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 20 + 40];
+        bytes[0..2].copy_from_slice(&pe::IMAGE_FILE_MACHINE_AMD64.0.to_le_bytes());
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&60u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        bytes[20..25].copy_from_slice(b".text");
+        bytes[56..60]
+            .copy_from_slice(&(pe::IMAGE_SCN_CNT_CODE.0 | pe::IMAGE_SCN_MEM_READ.0).to_le_bytes());
+        push_symbol(&mut bytes, "fallback", 1);
+        let mut weak = [0; 18];
+        weak[..7].copy_from_slice(b"primary");
+        weak[16] = pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0;
+        weak[17] = 1;
+        bytes.extend_from_slice(&weak);
+        let mut auxiliary = [0; 18];
+        auxiliary[..4].copy_from_slice(&0u32.to_le_bytes());
+        auxiliary[4..8].copy_from_slice(&search.to_le_bytes());
+        bytes.extend_from_slice(&auxiliary);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
     }
 
     fn short_import(symbol: &str, dll: &str) -> Vec<u8> {
