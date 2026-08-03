@@ -108,6 +108,25 @@ pub(crate) struct ManifestDependency {
     pub(crate) value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestExecutionLevel {
+    AsInvoker,
+    HighestAvailable,
+    RequireAdministrator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManifestUac {
+    pub(crate) level: ManifestExecutionLevel,
+    pub(crate) ui_access: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestEmbed {
+    DefaultId,
+    Id(u16),
+}
+
 /// One `/EXPORT:` directive in its link.exe-compatible form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExportSpec {
@@ -156,7 +175,20 @@ pub struct CoffArgs {
     pub(crate) import_library: Option<Box<Path>>,
     pub(crate) pdb: Option<Box<Path>>,
     pub(crate) manifest: bool,
+    /// Whether a manifest switch/directive was explicitly supplied.
+    pub(crate) manifest_requested: bool,
+    /// Whether `/MANIFEST` itself was supplied, as opposed to an option that
+    /// merely contributes to the manifest.
+    pub(crate) manifest_mode_requested: bool,
+    /// Resource ID selected by `/MANIFEST:EMBED[,ID=n]`.
+    pub(crate) manifest_embed: Option<ManifestEmbed>,
+    pub(crate) manifest_inputs: Vec<Box<Path>>,
+    pub(crate) manifest_file: Option<Box<Path>>,
+    pub(crate) manifest_uac: Option<ManifestUac>,
+    pub(crate) manifest_uac_requested: bool,
     pub(crate) manifest_dependencies: Vec<ManifestDependency>,
+    /// DLL names selected for delay loading by `/DELAYLOAD:name`.
+    pub(crate) delay_load_dlls: Vec<String>,
     pub(crate) runtime_resolution: RuntimeResolution,
     pub(crate) guard: GuardOptions,
     pub(crate) guard_symbols: Vec<GuardSymbol>,
@@ -218,7 +250,15 @@ impl Default for CoffArgs {
             import_library: None,
             pdb: None,
             manifest: true,
+            manifest_requested: false,
+            manifest_mode_requested: false,
+            manifest_embed: None,
+            manifest_inputs: Vec::new(),
+            manifest_file: None,
+            manifest_uac: None,
+            manifest_uac_requested: false,
             manifest_dependencies: Vec::new(),
+            delay_load_dlls: Vec::new(),
             runtime_resolution: RuntimeResolution::new(),
             guard: GuardOptions {
                 control_flow: OptSetting::Default,
@@ -329,12 +369,14 @@ where
     let mut input = input.peekable();
 
     while let Some(arg) = input.next() {
-        if !arg.starts_with('/') {
+        let Some((prefix, option)) = arg
+            .strip_prefix('/')
+            .map(|option| ('/', option))
+            .or_else(|| arg.strip_prefix('-').map(|option| ('-', option)))
+        else {
             add_input(args, arg);
             continue;
-        }
-
-        let option = &arg[1..];
+        };
         let (name, inline_value) = option
             .split_once(':')
             .map_or((option, None), |(name, value)| (name, Some(value)));
@@ -428,6 +470,7 @@ where
                 &mut input,
             )?)?),
             "manifestdependency" => {
+                args.manifest_requested = true;
                 let value = required_value("/MANIFESTDEPENDENCY", inline_value, &mut input)?;
                 args.manifest_dependencies.push(ManifestDependency {
                     value: value.to_owned(),
@@ -438,6 +481,7 @@ where
             // link.exe and lld-link accept it on the command line and in
             // `.drectve`, but it does not alter the linked image.
             "throwingnew" if inline_value.is_none() => {}
+            "throwingnew" => bail!("/THROWINGNEW does not accept a value"),
             "disallowlib" => {
                 let value = required_value("/DISALLOWLIB", inline_value, &mut input)?;
                 args.disallowed_libraries.push(value.to_owned());
@@ -537,7 +581,123 @@ where
                 // link input.
                 let _ = required_value("/NATVIS", inline_value, &mut input)?;
             }
-            "manifest" => args.manifest = parse_yes_no("/MANIFEST", inline_value)?,
+            "manifest" => {
+                args.manifest_requested = true;
+                args.manifest_mode_requested = true;
+                match inline_value {
+                    Some(value) if value.eq_ignore_ascii_case("no") => {
+                        args.manifest = false;
+                        args.manifest_embed = None;
+                    }
+                    Some(value)
+                        if value
+                            .get(..5)
+                            .is_some_and(|mode| mode.eq_ignore_ascii_case("embed")) =>
+                    {
+                        args.manifest = true;
+                        args.manifest_embed = Some(parse_manifest_embed(value)?);
+                    }
+                    None => {
+                        args.manifest = true;
+                        args.manifest_embed = None;
+                    }
+                    Some(value) => bail!(
+                        "unsupported /MANIFEST value `{value}`; expected /MANIFEST, /MANIFEST:NO, or /MANIFEST:EMBED[,ID=n]"
+                    ),
+                }
+            }
+            // These link.exe/lld-link switches affect diagnostics, manifests, or optional
+            // loader policy that v1 does not emit. Parse their values so they never become
+            // object-file inputs, but deliberately leave the image unchanged.
+            "manifestuac" => {
+                args.manifest_requested = true;
+                args.manifest_uac_requested = true;
+                args.manifest_uac = match inline_value {
+                    Some(value) if value.eq_ignore_ascii_case("no") => None,
+                    None => Some(ManifestUac {
+                        level: ManifestExecutionLevel::AsInvoker,
+                        ui_access: false,
+                    }),
+                    Some(value) => Some(parse_manifest_uac(value)?),
+                };
+            }
+            "manifestfile" => {
+                args.manifest_requested = true;
+                args.manifest_file = Some(Box::from(Path::new(required_value(
+                    "/MANIFESTFILE",
+                    inline_value,
+                    &mut input,
+                )?)));
+            }
+            "manifestinput" => {
+                args.manifest_requested = true;
+                args.manifest_inputs
+                    .push(Box::from(Path::new(required_value(
+                        "/MANIFESTINPUT",
+                        inline_value,
+                        &mut input,
+                    )?)));
+            }
+            "ignore" | "tlbid" | "order" | "stub" | "dependentloadflag" => {
+                let _ = required_value("linker option", inline_value, &mut input)?;
+            }
+            // lld-link accepts both the bare spelling and `/FUNCTIONPADMIN:size`.
+            // Function padding is not emitted yet, but a following object must not be
+            // consumed as an optional value for the bare form.
+            "functionpadmin" => {
+                if let Some(value) = inline_value {
+                    ensure!(
+                        !value.is_empty(),
+                        "/FUNCTIONPADMIN expects a non-empty size"
+                    );
+                    let _ = parse_integer("/FUNCTIONPADMIN", value)?;
+                }
+            }
+            "errorreport" => {
+                // link.exe accepts this both with and without a mode.
+                let _ = inline_value;
+            }
+            "wx" => {
+                let _ = parse_yes_no("/WX", inline_value)?;
+            }
+            "release" => {
+                if inline_value.is_some() {
+                    bail!("{arg} does not accept a value");
+                }
+            }
+            "appcontainer" => {
+                let _ = parse_yes_no("/APPCONTAINER", inline_value)?;
+            }
+            "swaprun" => match inline_value {
+                None => {}
+                Some(value)
+                    if value.eq_ignore_ascii_case("cd") || value.eq_ignore_ascii_case("net") => {}
+                Some(value) => bail!("unsupported /SWAPRUN value `{value}`; expected CD or NET"),
+            },
+            "map" => {
+                // /MAP has an optional output path. Actual map output is deferred with PDBs.
+                let _ = inline_value;
+            }
+            "largeaddressaware" | "highentropyva" => {
+                let _ = parse_yes_no("linker option", inline_value)?;
+            }
+            "incremental" => match inline_value {
+                Some(value) if value.eq_ignore_ascii_case("no") => {}
+                _ => args.common.unrecognized_options.push(arg.to_owned()),
+            },
+            // These require linker stages that are deliberately deferred. Keep their existing
+            // hard diagnostic rather than silently producing a partial implementation.
+            "delayload" => {
+                let value = required_value("/DELAYLOAD", inline_value, &mut input)?;
+                args.delay_load_dlls.push(value.to_owned());
+            }
+            "ltcg" => args.common.unrecognized_options.push(arg.to_owned()),
+            // Keep security features explicitly rejected until their corresponding PE metadata
+            // is emitted; accepting them would create an image with misleading protection bits.
+            "cetcompat" => match inline_value {
+                Some(value) if value.eq_ignore_ascii_case("no") => {}
+                _ => bail!("/CETCOMPAT is not supported; /CETCOMPAT:NO is accepted to disable it"),
+            },
             "merge" => args.merges.push(parse_merge(required_value(
                 "/MERGE",
                 inline_value,
@@ -550,8 +710,8 @@ where
             )?)?),
             // On Unix hosts an absolute path also begins with '/'. Do not mistake it for an
             // option merely because the link.exe spelling uses the same prefix.
-            _ if option.contains('/') => add_input(args, arg),
-            _ => args.common.unrecognized_options.push(arg.to_owned()),
+            _ if prefix == '/' && option.contains('/') => add_input(args, arg),
+            _ => tracing::warn!("ignoring unrecognized linker option `{arg}`"),
         }
     }
     Ok(())
@@ -773,15 +933,84 @@ fn parse_yes_no(option: &str, value: Option<&str>) -> Result<bool> {
     }
 }
 
+fn parse_manifest_embed(value: &str) -> Result<ManifestEmbed> {
+    let mut fields = value.split(',');
+    let mode = fields.next().unwrap_or_default();
+    ensure!(
+        mode.eq_ignore_ascii_case("embed"),
+        "invalid /MANIFEST mode `{value}`"
+    );
+    let mut id = None;
+    for field in fields {
+        let (key, value) = field
+            .split_once('=')
+            .context("/MANIFEST:EMBED expects optional ID=n")?;
+        ensure!(
+            key.eq_ignore_ascii_case("id"),
+            "unsupported /MANIFEST:EMBED option `{key}`"
+        );
+        ensure!(id.is_none(), "duplicate /MANIFEST:EMBED ID");
+        let parsed = parse_integer("/MANIFEST:EMBED,ID", value)?;
+        let parsed = u16::try_from(parsed).context("/MANIFEST:EMBED ID exceeds u16")?;
+        ensure!(parsed != 0, "/MANIFEST:EMBED ID must not be zero");
+        id = Some(parsed);
+    }
+    Ok(id.map_or(ManifestEmbed::DefaultId, ManifestEmbed::Id))
+}
+
+fn parse_manifest_uac(value: &str) -> Result<ManifestUac> {
+    let value = value.trim_matches(['\'', '"']);
+    let mut level = None;
+    let mut ui_access = false;
+    for field in value.split_whitespace() {
+        let (key, value) = field
+            .split_once('=')
+            .context("/MANIFESTUAC expects level=name [uiAccess=true|false]")?;
+        let value = value.trim_matches(['\'', '"']);
+        if key.eq_ignore_ascii_case("level") {
+            ensure!(level.is_none(), "duplicate /MANIFESTUAC level");
+            level = Some(match value.to_ascii_lowercase().as_str() {
+                "asinvoker" => ManifestExecutionLevel::AsInvoker,
+                "highestavailable" => ManifestExecutionLevel::HighestAvailable,
+                "requireadministrator" => ManifestExecutionLevel::RequireAdministrator,
+                _ => bail!("unsupported /MANIFESTUAC level `{value}`"),
+            });
+        } else if key.eq_ignore_ascii_case("uiaccess") {
+            ui_access = match value {
+                value if value.eq_ignore_ascii_case("true") => true,
+                value if value.eq_ignore_ascii_case("false") => false,
+                _ => bail!("/MANIFESTUAC uiAccess must be true or false"),
+            };
+        } else {
+            bail!("unsupported /MANIFESTUAC field `{key}`");
+        }
+    }
+    Ok(ManifestUac {
+        level: level.unwrap_or(ManifestExecutionLevel::AsInvoker),
+        ui_access,
+    })
+}
+
 fn parse_opt(options: &mut OptimizationOptions, value: &str) -> Result {
     for value in value.split(',') {
-        match value.to_ascii_lowercase().as_str() {
+        let (setting, parameter) = value
+            .split_once('=')
+            .map_or((value, None), |(setting, parameter)| {
+                (setting, Some(parameter))
+            });
+        match setting.to_ascii_lowercase().as_str() {
             "ref" => options.ref_ = OptSetting::Enabled,
             "noref" => options.ref_ = OptSetting::Disabled,
-            "icf" => options.icf = OptSetting::Enabled,
+            // lld-link accepts /OPT:ICF=N. The iteration count only matters to an ICF
+            // implementation, which is intentionally deferred, so preserve the enabled state.
+            "icf" if parameter.is_none_or(|value| !value.is_empty()) => {
+                options.icf = OptSetting::Enabled;
+            }
             "noicf" => options.icf = OptSetting::Disabled,
+            // lld-link recognizes this optimization but it has no PE-v1 implementation.
+            "lbr" if parameter.is_none() => {}
             _ => bail!(
-                "unsupported /OPT value `{value}`; supported values are REF, NOREF, ICF, and NOICF"
+                "unsupported /OPT value `{value}`; supported values are REF, NOREF, ICF, NOICF, and LBR"
             ),
         }
     }
@@ -1140,15 +1369,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_machine_and_unknown_options() {
+    fn rejects_unsupported_machine_and_warns_for_unknown_options() {
         let mut args = CoffArgs::default();
         assert!(parse(&mut args, ["/machine:arm64"].into_iter()).is_err());
-        assert!(parse(&mut args, ["/not-a-real-option"].into_iter()).is_err());
+        parse(&mut args, ["/not-a-real-option"].into_iter()).unwrap();
+        assert!(args.common.unrecognized_options.is_empty());
     }
 
     #[test]
-    fn rejects_ltcg_and_incremental_linking_options() {
-        for option in ["/LTCG", "/INCREMENTAL"] {
+    fn rejects_ltcg_and_enabled_incremental_linking_options() {
+        for option in ["/LTCG", "/INCREMENTAL", "/INCREMENTAL:YES"] {
             let error = parse(&mut CoffArgs::default(), [option].into_iter())
                 .unwrap_err()
                 .to_string();
@@ -1161,6 +1391,206 @@ mod tests {
             assert!(error.contains("unrecognized option"), "{option}: {error}");
             assert!(error.contains(option), "{option}: {error}");
         }
+
+        parse(&mut CoffArgs::default(), ["/INCREMENTAL:NO"].into_iter()).unwrap();
+        parse_directives(&mut CoffArgs::default(), "/INCREMENTAL:NO").unwrap();
+    }
+
+    #[test]
+    fn accepts_common_msvc_compatibility_options_as_noops() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            [
+                "/IGNORE:4078",
+                "/ERRORREPORT:NONE",
+                "/TLBID:1",
+                "/MANIFEST:EMBED,ID=1",
+                "/MANIFESTUAC:\"level='asInvoker' uiAccess='false'\"",
+                "/MANIFESTFILE:app.manifest",
+                "/MANIFESTINPUT:input.manifest",
+                "/WX",
+                "/MAP:app.map",
+                "/ORDER:@order.txt",
+                "/STUB:stub.exe",
+                "/RELEASE",
+                "/APPCONTAINER:NO",
+                "/LARGEADDRESSAWARE:NO",
+                "/HIGHENTROPYVA",
+                "/DEPENDENTLOADFLAG:0x800",
+                "/FUNCTIONPADMIN",
+                "/CETCOMPAT:NO",
+                "/SWAPRUN:NET",
+                "/OPT:LBR,ICF=3",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(args.manifest);
+        assert_eq!(args.manifest_embed, Some(ManifestEmbed::Id(1)));
+        assert_eq!(
+            args.manifest_file.as_deref(),
+            Some(Path::new("app.manifest"))
+        );
+        assert_eq!(
+            args.manifest_inputs,
+            [Box::from(Path::new("input.manifest"))]
+        );
+        assert_eq!(
+            args.manifest_uac,
+            Some(ManifestUac {
+                level: ManifestExecutionLevel::AsInvoker,
+                ui_access: false,
+            })
+        );
+        assert_eq!(args.optimization.icf, OptSetting::Enabled);
+        assert!(args.common.inputs.is_empty());
+    }
+
+    #[test]
+    fn parses_stock_cmake_msbuild_release_link_line() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            [
+                "/nologo",
+                "CMakeFiles\\app.dir\\main.cpp.obj",
+                "/out:Release\\app.exe",
+                "/implib:Release\\app.lib",
+                "/pdb:Release\\app.pdb",
+                "/version:0.0",
+                "/machine:x64",
+                "/INCREMENTAL:NO",
+                "/subsystem:console",
+                "/MANIFEST:EMBED,ID=1",
+                "/MANIFESTUAC:level='asInvoker' uiAccess='false'",
+                "/ERRORREPORT:QUEUE",
+                "/TLBID:1",
+                "/DYNAMICBASE",
+                "/NXCOMPAT",
+                "/HIGHENTROPYVA",
+                "/LARGEADDRESSAWARE",
+                "/OPT:REF,ICF",
+                "/FUNCTIONPADMIN",
+                "/APPCONTAINER:NO",
+                "/CETCOMPAT:NO",
+                "kernel32.lib",
+                "user32.lib",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(&*args.common.output, Path::new("Release\\app.exe"));
+        assert_eq!(args.optimization.ref_, OptSetting::Enabled);
+        assert_eq!(args.optimization.icf, OptSetting::Enabled);
+        assert_eq!(args.manifest_embed, Some(ManifestEmbed::Id(1)));
+        assert!(args.common.unrecognized_options.is_empty());
+        assert_eq!(args.common.inputs.len(), 3);
+        for (input, expected) in args.common.inputs.iter().zip([
+            "CMakeFiles\\app.dir\\main.cpp.obj",
+            "kernel32.lib",
+            "user32.lib",
+        ]) {
+            assert!(matches!(
+                input.spec,
+                InputSpec::File(ref path) if &**path == Path::new(expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_manifest_modes_and_last_uac_setting_wins() {
+        let mut executable = CoffArgs::default();
+        parse(
+            &mut executable,
+            [
+                "/MANIFEST:EMBED",
+                "/MANIFESTUAC:level='highestAvailable' uiAccess='true'",
+                "/MANIFESTUAC:NO",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(executable.manifest_embed, Some(ManifestEmbed::DefaultId));
+        assert!(executable.manifest_uac_requested);
+        assert_eq!(executable.manifest_uac, None);
+
+        let mut explicit = CoffArgs::default();
+        parse(
+            &mut explicit,
+            [
+                "/MANIFEST:EMBED,ID=42",
+                "/MANIFESTUAC",
+                "/MANIFESTINPUT:first.manifest",
+                "/MANIFESTINPUT:second.manifest",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(explicit.manifest_embed, Some(ManifestEmbed::Id(42)));
+        assert_eq!(
+            explicit.manifest_uac,
+            Some(ManifestUac {
+                level: ManifestExecutionLevel::AsInvoker,
+                ui_access: false,
+            })
+        );
+        assert_eq!(explicit.manifest_inputs.len(), 2);
+
+        let mut disabled = CoffArgs::default();
+        parse(
+            &mut disabled,
+            ["/MANIFEST:EMBED", "/MANIFEST:NO"].into_iter(),
+        )
+        .unwrap();
+        assert!(!disabled.manifest);
+        assert_eq!(disabled.manifest_embed, None);
+    }
+
+    #[test]
+    fn accepts_dash_prefixed_msvc_options() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            [
+                "-out:hello.exe",
+                "-defaultlib:ucrt.lib",
+                "-incremental:no",
+                "-opt:icf=2",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(&*args.common.output, Path::new("hello.exe"));
+        assert_eq!(args.default_libraries, ["ucrt.lib"]);
+        assert_eq!(args.optimization.icf, OptSetting::Enabled);
+    }
+
+    #[test]
+    fn parses_delay_load_dlls_on_command_line_and_in_directives() {
+        let mut args = CoffArgs::default();
+        parse(
+            &mut args,
+            ["/DELAYLOAD:kernel32.dll", "-delayload:user32.dll"].into_iter(),
+        )
+        .unwrap();
+        parse_directives(&mut args, "/DELAYLOAD:ole32.dll").unwrap();
+        assert_eq!(
+            args.delay_load_dlls,
+            ["kernel32.dll", "user32.dll", "ole32.dll"]
+        );
+        assert!(parse(&mut CoffArgs::default(), ["/DELAYLOAD:"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn keeps_cetcompat_explicitly_unsupported() {
+        parse(&mut CoffArgs::default(), ["/CETCOMPAT:NO"].into_iter()).unwrap();
+        let error = parse(&mut CoffArgs::default(), ["/CETCOMPAT"].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CETCOMPAT"));
+        assert!(parse(&mut CoffArgs::default(), ["/CETCOMPAT:YES"].into_iter()).is_err());
     }
 
     #[test]
@@ -1685,9 +2115,7 @@ mod tests {
             "/DYNAMICBASE:YES",
             "/FIXED:MAYBE",
             "/NXCOMPAT:TRUE",
-            "/OPT:LBR",
             "/FORCE:DUPLICATES",
-            "/MANIFEST:EMBED",
             "/MERGE:.a",
             "/SECTION:.text,X",
             "/DEBUG:FASTLINK",

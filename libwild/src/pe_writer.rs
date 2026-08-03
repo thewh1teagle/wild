@@ -162,13 +162,16 @@ pub(crate) fn link<F: FileSystem>(
     }
     let selected =
         select_inputs_to_fixpoint(fs, args, &definition.exports, &input_storage, &mut inputs)?;
+    let mut resources = selected.resources;
+    prepare_manifest(fs, args, &selected.directives, &mut resources)?;
     let objects = selected.objects;
-    let resources = selected.resources;
     let archive_bytes = selected.archive_bytes;
     let entry_name = selected.entry_name;
     let exports = selected.exports;
     let archive_definitions = selected.archive_definitions;
-    let runtime_resolution = selected.runtime_resolution;
+    let runtime_resolution = selected.directives.runtime_resolution;
+    let mut delay_load_dlls = args.delay_load_dlls.clone();
+    delay_load_dlls.extend(selected.directives.delay_load_dlls);
     let mut roots = selected.roots;
     // Preserve the accumulated runtime state through final resolution. Includes already took
     // part in extraction, and keeping this merge here makes that downstream contract explicit.
@@ -193,7 +196,7 @@ pub(crate) fn link<F: FileSystem>(
             .and_then(|name| name.to_str())
             .context("PE output file name is not valid UTF-8")?
     };
-    let image = build_image(
+    let image = build_image_with_delay_loads(
         &objects,
         &imports,
         &exports,
@@ -203,6 +206,8 @@ pub(crate) fn link<F: FileSystem>(
         PeWriterConfig::from_args(args)?,
         &resources,
         &runtime_resolution,
+        &delay_load_dlls,
+        &roots,
     )?;
     let mut output = fs.create_output(
         args.common.output.clone(),
@@ -221,6 +226,129 @@ pub(crate) fn link<F: FileSystem>(
         write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
     }
     Ok(crate::LinkerOutput { layout: None })
+}
+
+fn prepare_manifest<F: FileSystem>(
+    fs: &F,
+    args: &crate::args::coff::CoffArgs,
+    directives: &crate::args::coff::CoffArgs,
+    resources: &mut Vec<ResourceRecord>,
+) -> Result<()> {
+    let requested = args.manifest_requested || directives.manifest_requested;
+    let (enabled, embed) = if args.manifest_mode_requested {
+        (args.manifest, args.manifest_embed)
+    } else if directives.manifest_mode_requested {
+        (directives.manifest, directives.manifest_embed)
+    } else {
+        (args.manifest, None)
+    };
+    if !requested || !enabled {
+        return Ok(());
+    }
+
+    let manifest_inputs = directives
+        .manifest_inputs
+        .iter()
+        .chain(&args.manifest_inputs)
+        .collect::<Vec<_>>();
+    ensure!(
+        manifest_inputs.is_empty() || embed.is_some(),
+        "/MANIFESTINPUT requires /MANIFEST:EMBED"
+    );
+
+    use linker_utils::pe_manifest::ExecutionLevel;
+    let dependencies = directives
+        .manifest_dependencies
+        .iter()
+        .chain(&args.manifest_dependencies)
+        .map(|dependency| dependency.value.as_str())
+        .collect::<Vec<_>>();
+    let uac = if args.manifest_uac_requested {
+        args.manifest_uac
+    } else if directives.manifest_uac_requested {
+        directives.manifest_uac
+    } else if args.is_dll {
+        None
+    } else {
+        Some(crate::args::coff::ManifestUac {
+            level: crate::args::coff::ManifestExecutionLevel::AsInvoker,
+            ui_access: false,
+        })
+    };
+    let execution_level = uac.map(|uac| match uac.level {
+        crate::args::coff::ManifestExecutionLevel::AsInvoker => ExecutionLevel::AsInvoker,
+        crate::args::coff::ManifestExecutionLevel::HighestAvailable => {
+            ExecutionLevel::HighestAvailable
+        }
+        crate::args::coff::ManifestExecutionLevel::RequireAdministrator => {
+            ExecutionLevel::RequireAdministrator
+        }
+    });
+    let generated = linker_utils::pe_manifest::GeneratedManifest {
+        dependencies: &dependencies,
+        execution_level,
+        ui_access: uac.is_some_and(|uac| uac.ui_access),
+    };
+    let bytes = if manifest_inputs.is_empty() {
+        linker_utils::pe_manifest::generate_manifest(&generated)
+    } else {
+        let mut inputs = Vec::with_capacity(manifest_inputs.len());
+        for path in manifest_inputs {
+            let (input, _) = fs
+                .open_input(path, args.common.prepopulate_maps)
+                .with_context(|| format!("failed to open manifest input `{}`", path.display()))?;
+            inputs.push(input.bytes().to_vec());
+        }
+        linker_utils::pe_manifest::merge_manifest_documents(
+            &inputs.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &generated,
+        )?
+    };
+
+    let manifest_file = args
+        .manifest_file
+        .as_deref()
+        .or(directives.manifest_file.as_deref());
+    if let Some(path) = manifest_file {
+        fs.write_auxiliary(path, &bytes)
+            .with_context(|| format!("failed to write manifest file `{}`", path.display()))?;
+    } else if embed.is_none() {
+        let mut path = args.common.output.as_os_str().to_owned();
+        path.push(".manifest");
+        let path = PathBuf::from(path);
+        fs.write_auxiliary(&path, &bytes)
+            .with_context(|| format!("failed to write manifest file `{}`", path.display()))?;
+    }
+
+    let Some(embed) = embed else {
+        return Ok(());
+    };
+    let id = match embed {
+        crate::args::coff::ManifestEmbed::DefaultId => {
+            linker_utils::pe_manifest::default_manifest_id(args.is_dll)
+        }
+        crate::args::coff::ManifestEmbed::Id(id) => id,
+    };
+    ensure!(
+        !resources.iter().any(|record| {
+            record.resource_type
+                == linker_utils::pe_resources::ResourceId::Id(
+                    linker_utils::pe_manifest::RT_MANIFEST,
+                )
+                && record.name == linker_utils::pe_resources::ResourceId::Id(id)
+                && record.language == linker_utils::pe_manifest::MANIFEST_LANGUAGE_NEUTRAL
+        }),
+        "manifest resource ID {id} conflicts with an input resource"
+    );
+    resources.push(
+        linker_utils::pe_manifest::manifest_resource(
+            id,
+            linker_utils::pe_manifest::MANIFEST_LANGUAGE_NEUTRAL,
+            bytes,
+        )
+        .context("failed to create embedded manifest resource")?,
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -355,7 +483,7 @@ struct SelectedInputs<'data> {
     entry_name: Option<String>,
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
-    runtime_resolution: linker_utils::coff_runtime::RuntimeResolution,
+    directives: crate::args::coff::CoffArgs,
     archive_definitions: BTreeSet<Vec<u8>>,
     #[cfg(test)]
     resolver_object_scans: usize,
@@ -495,7 +623,7 @@ impl<'data> OpenSelection<'data> {
             entry_name: self.entry_name,
             exports: self.exports,
             roots: self.roots,
-            runtime_resolution: self.directives.runtime_resolution,
+            directives: self.directives,
             archive_definitions: self.archive_definitions,
             #[cfg(test)]
             resolver_object_scans,
@@ -654,6 +782,15 @@ fn resolve_open_selection(
             .has_archive_definition(LOAD_CONFIG_SYMBOL)
         {
             roots.push(LOAD_CONFIG_SYMBOL.to_vec());
+        }
+        // The delay helper is referenced by linker-generated thunks rather than an input
+        // relocation, so explicitly root it before archive extraction can reach delayimp.lib.
+        if (!args.delay_load_dlls.is_empty() || !directives.delay_load_dlls.is_empty())
+            && selection
+                .resolver
+                .has_archive_definition(b"__delayLoadHelper2")
+        {
+            roots.push(b"__delayLoadHelper2".to_vec());
         }
         roots.sort();
         roots.dedup();
@@ -979,6 +1116,7 @@ fn absolute_symbol_values(
     Ok(absolute)
 }
 
+#[cfg(test)]
 fn build_image(
     objects: &[crate::coff::CoffObject<'_>],
     imports: &[pe_imports::Import],
@@ -990,15 +1128,94 @@ fn build_image(
     resources: &[ResourceRecord],
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
-    let (mut contributions, comdat_redirects) = collect_contributions(objects, args)?;
+    build_image_with_delay_loads(
+        objects,
+        imports,
+        exports,
+        dll_name,
+        entry_name,
+        args,
+        config,
+        resources,
+        runtime_resolution,
+        &args.delay_load_dlls,
+        &[],
+    )
+}
+
+fn build_image_with_delay_loads(
+    objects: &[crate::coff::CoffObject<'_>],
+    imports: &[pe_imports::Import],
+    exports: &[crate::args::coff::ExportSpec],
+    dll_name: &[u8],
+    entry_name: Option<&str>,
+    args: &crate::args::coff::CoffArgs,
+    config: PeWriterConfig,
+    resources: &[ResourceRecord],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+    delay_load_dlls: &[String],
+    selected_roots: &[Vec<u8>],
+) -> Result<BuiltImage> {
+    let (mut imports, mut delay_imports) =
+        pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
+    // Archive selection and section GC deliberately remain separate: resolution must see every
+    // undefined reference in order to extract the right archive members, while /OPT:REF only
+    // decides which already-selected COMDAT contributions reach the image.
+    let mut gc_roots = args
+        .force_undefined
+        .iter()
+        .map(|symbol| symbol.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    gc_roots.extend_from_slice(selected_roots);
+    gc_roots.extend(
+        runtime_resolution
+            .include_roots()
+            .map(|symbol| symbol.as_bytes().to_vec()),
+    );
+    // CRT load configuration is loader metadata, not an ordinary relocation target. Retain it
+    // when present even in direct unit-level image construction that has no archive root list.
+    gc_roots.push(LOAD_CONFIG_SYMBOL.to_vec());
+    if let Some(entry) = entry_name {
+        gc_roots.push(entry.as_bytes().to_vec());
+    }
+    gc_roots.extend(
+        exports
+            .iter()
+            .filter(|export| !looks_like_forwarder(export))
+            .map(|export| export.target.as_bytes().to_vec()),
+    );
+    if !delay_imports.is_empty() {
+        // This target exists only in linker-generated thunks, so /OPT:REF cannot discover it
+        // through an input-object relocation graph.
+        gc_roots.push(b"__delayLoadHelper2".to_vec());
+    }
+    gc_roots.sort();
+    gc_roots.dedup();
+    let (mut contributions, comdat_redirects) =
+        collect_contributions_with_roots(objects, args, &gc_roots, runtime_resolution)?;
+    if opt_ref_enabled(args) {
+        let mut import_definitions = pe_imports::definition_names(&imports);
+        import_definitions.extend(pe_imports::definition_names(&delay_imports));
+        let live_imports = live_import_references(
+            objects,
+            &contributions,
+            &gc_roots,
+            &import_definitions,
+            runtime_resolution,
+        )?;
+        pe_imports::retain_referenced(&mut imports, &live_imports);
+        pe_imports::retain_referenced(&mut delay_imports, &live_imports);
+    }
     let absolute_symbols = absolute_symbol_values(objects, runtime_resolution)?;
     let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
         (0, 0)
     } else {
-        pe_imports::section_sizes(imports)?
+        pe_imports::section_sizes(&imports)?
     };
+    let (didat_size, delay_thunk_size) = pe_imports::delay_section_sizes(&delay_imports)?;
+    let (delay_pdata_size, delay_xdata_size) = pe_imports::delay_unwind_sizes(&delay_imports)?;
     let thunk_id = add_synthetic(
         &mut contributions,
         b".text$wild_imports",
@@ -1010,6 +1227,30 @@ fn build_image(
         b".idata",
         idata_size,
         data_characteristics(),
+    )?;
+    let delay_thunk_id = add_synthetic(
+        &mut contributions,
+        b".text$wild_delay_imports",
+        delay_thunk_size,
+        text_characteristics(),
+    )?;
+    let didat_id = add_synthetic(
+        &mut contributions,
+        b".didat",
+        didat_size,
+        data_characteristics(),
+    )?;
+    let delay_xdata_id = add_synthetic(
+        &mut contributions,
+        b".rdata$wild_delay_unwind",
+        delay_xdata_size,
+        readonly_data_characteristics(),
+    )?;
+    let delay_pdata_id = add_synthetic(
+        &mut contributions,
+        b".pdata$wild_delay_unwind",
+        delay_pdata_size,
+        readonly_data_characteristics(),
     )?;
     let edata_size = estimated_export_size(dll_name, exports)?;
     let edata_id = add_synthetic(
@@ -1049,7 +1290,15 @@ fn build_image(
     let mut layout = make_layout(&contributions, config)?;
     if dynamic_base {
         for _ in 0..3 {
-            let dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
+            let delay_iat_slots = delay_iat_slots(
+                &delay_imports,
+                didat_id,
+                delay_thunk_id,
+                &layout,
+                config.image_base,
+            )?;
+            let mut dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
+            dir64.extend_from_slice(&delay_iat_slots);
             let next = build_amd64_base_relocation_table(dir64, layout.size_of_image)
                 .context("failed to build PE base relocation table")?;
             if next.is_empty() {
@@ -1080,7 +1329,15 @@ fn build_image(
             layout = next_layout;
         }
         if let Some(id) = reloc_id {
-            let dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
+            let delay_iat_slots = delay_iat_slots(
+                &delay_imports,
+                didat_id,
+                delay_thunk_id,
+                &layout,
+                config.image_base,
+            )?;
+            let mut dir64 = dir64_rvas(objects, &contributions, &layout, &absolute_symbols)?;
+            dir64.extend_from_slice(&delay_iat_slots);
             reloc_data = build_amd64_base_relocation_table(dir64, layout.size_of_image)?;
             let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
             contribution.spec.size = reloc_data.len() as u32;
@@ -1100,9 +1357,32 @@ fn build_image(
         .checked_add(u64::from(layout.size_of_image))
         .context("PE virtual address space overflows u64")?;
 
+    let emitted_delay_unwind = match (delay_thunk_id, delay_xdata_id, delay_pdata_id) {
+        (Some(thunks), Some(xdata), Some(_)) => pe_imports::emit_delay_unwind(
+            &delay_imports,
+            layout.placements[&thunks].rva,
+            layout.placements[&xdata].rva,
+        )?,
+        _ => pe_imports::DelayUnwindInfo::default(),
+    };
+    if let Some(id) = delay_xdata_id {
+        contributions
+            .iter_mut()
+            .find(|contribution| contribution.spec.id == id)
+            .unwrap()
+            .data = emitted_delay_unwind.xdata;
+    }
+    if let Some(id) = delay_pdata_id {
+        contributions
+            .iter_mut()
+            .find(|contribution| contribution.spec.id == id)
+            .unwrap()
+            .data = emitted_delay_unwind.pdata;
+    }
+
     let emitted_imports = match (idata_id, thunk_id) {
         (Some(idata), thunk) => pe_imports::emit(
-            imports,
+            &imports,
             layout.placements[&idata].rva,
             thunk.map_or(0, |id| layout.placements[&id].rva),
         )?,
@@ -1121,6 +1401,34 @@ fn build_image(
             .find(|c| c.spec.id == id)
             .unwrap()
             .data = emitted_imports.thunks.clone();
+    }
+    // Produce a first deterministic delay image to publish its synthetic definitions before
+    // ordinary COFF relocations are resolved. The helper call is patched after definitions are
+    // known below.
+    let mut emitted_delay_imports = match (didat_id, delay_thunk_id) {
+        (Some(didat), Some(thunks)) => pe_imports::emit_delay(
+            &delay_imports,
+            layout.placements[&didat].rva,
+            layout.placements[&thunks].rva,
+            layout.size_of_image,
+            config.image_base,
+            0,
+        )?,
+        _ => pe_imports::EmittedDelayImports::default(),
+    };
+    if let Some(id) = didat_id {
+        contributions
+            .iter_mut()
+            .find(|c| c.spec.id == id)
+            .unwrap()
+            .data = emitted_delay_imports.didat.clone();
+    }
+    if let Some(id) = delay_thunk_id {
+        contributions
+            .iter_mut()
+            .find(|c| c.spec.id == id)
+            .unwrap()
+            .data = emitted_delay_imports.thunks.clone();
     }
     let resource_directory = if let Some(id) = resource_id {
         let section = linker_utils::pe_resources::build_resource_section(
@@ -1156,12 +1464,49 @@ fn build_image(
             .entry(name.clone())
             .or_insert(config.image_base + u64::from(*rva));
     }
+    for (name, rva) in &emitted_delay_imports.symbols {
+        definitions
+            .entry(name.clone())
+            .or_insert(config.image_base + u64::from(*rva));
+    }
     add_image_base_symbol(&mut definitions, config.image_base);
     for (symbol, value) in &absolute_symbols {
         definitions.entry(symbol.clone()).or_insert(*value);
     }
     bind_weak_externals(objects, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
+    if !delay_imports.is_empty() {
+        let helper_va = definitions
+            .get(b"__delayLoadHelper2".as_slice())
+            .copied()
+            .context("/DELAYLOAD requires __delayLoadHelper2 from delayimp.lib")?;
+        let helper_rva = u32::try_from(
+            helper_va
+                .checked_sub(config.image_base)
+                .context("__delayLoadHelper2 precedes image base")?,
+        )
+        .context("__delayLoadHelper2 lies outside image")?;
+        let didat = didat_id.unwrap();
+        let thunks = delay_thunk_id.unwrap();
+        emitted_delay_imports = pe_imports::emit_delay(
+            &delay_imports,
+            layout.placements[&didat].rva,
+            layout.placements[&thunks].rva,
+            layout.size_of_image,
+            config.image_base,
+            helper_rva,
+        )?;
+        contributions
+            .iter_mut()
+            .find(|c| c.spec.id == didat)
+            .unwrap()
+            .data = emitted_delay_imports.didat.clone();
+        contributions
+            .iter_mut()
+            .find(|c| c.spec.id == thunks)
+            .unwrap()
+            .data = emitted_delay_imports.thunks.clone();
+    }
     let load_config_directory = load_config_directory(
         objects,
         &contributions,
@@ -1289,6 +1634,7 @@ fn build_image(
         entry_name,
         emitted_imports.import_directory,
         emitted_imports.iat_directory,
+        emitted_delay_imports.directory,
         reloc_id.is_some() && !reloc_data.is_empty(),
         export_directory
             .as_ref()
@@ -1339,6 +1685,27 @@ fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u6
     definitions
         .entry(b"__ImageBase".to_vec())
         .or_insert(address);
+}
+
+fn delay_iat_slots(
+    imports: &[pe_imports::Import],
+    didat_id: Option<ContributionId>,
+    thunk_id: Option<ContributionId>,
+    layout: &SectionLayout,
+    image_base: u64,
+) -> Result<Vec<u32>> {
+    match (didat_id, thunk_id) {
+        (Some(didat), Some(thunks)) => Ok(pe_imports::emit_delay(
+            imports,
+            layout.placements[&didat].rva,
+            layout.placements[&thunks].rva,
+            layout.size_of_image,
+            image_base,
+            0,
+        )?
+        .iat_slots),
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn bind_weak_externals(
@@ -1564,9 +1931,19 @@ fn resolve_export_target<'a>(
     ))
 }
 
+#[cfg(test)]
 fn collect_contributions(
     objects: &[crate::coff::CoffObject<'_>],
     args: &crate::args::coff::CoffArgs,
+) -> Result<(Vec<Contribution>, SectionRedirects)> {
+    collect_contributions_with_roots(objects, args, &[], &args.runtime_resolution)
+}
+
+fn collect_contributions_with_roots(
+    objects: &[crate::coff::CoffObject<'_>],
+    args: &crate::args::coff::CoffArgs,
+    roots: &[Vec<u8>],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     if args.guard.control_flow == crate::args::coff::OptSetting::Enabled {
         return Err(error!(
@@ -1574,7 +1951,15 @@ fn collect_contributions(
         ));
     }
     let mut output = Vec::new();
-    let comdats = discarded_comdat_sections(objects)?;
+    let mut comdats = discarded_comdat_sections(objects)?;
+    if opt_ref_enabled(args) {
+        comdats.discarded.extend(unreferenced_comdat_sections(
+            objects,
+            &comdats,
+            roots,
+            runtime_resolution,
+        )?);
+    }
     for (object_index, input) in objects.iter().enumerate() {
         for section in input.file().sections() {
             let raw_name = section.name_bytes().context("invalid COFF section name")?;
@@ -1671,6 +2056,81 @@ fn collect_contributions(
         contribution.spec.id = ContributionId(index as u32);
     }
     Ok((output, comdats.redirects))
+}
+
+fn opt_ref_enabled(args: &crate::args::coff::CoffArgs) -> bool {
+    match args.optimization.ref_ {
+        crate::args::coff::OptSetting::Enabled => true,
+        crate::args::coff::OptSetting::Disabled => false,
+        // lld-link enables REF for ordinary release links and disables it when /DEBUG is
+        // present. An explicit /OPT setting above always wins over that profile default.
+        crate::args::coff::OptSetting::Default => !args.debug,
+    }
+}
+
+fn live_import_references(
+    objects: &[crate::coff::CoffObject<'_>],
+    contributions: &[Contribution],
+    roots: &[Vec<u8>],
+    import_definitions: &HashSet<Vec<u8>>,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashSet<Vec<u8>>> {
+    let mut selected_definitions = object_definition_names(objects)?;
+    selected_definitions.extend(import_definitions.iter().cloned());
+    let weak_resolution = weak_external_resolution(objects)?;
+    let resolve = |name: &[u8]| -> Result<Vec<u8>> {
+        if selected_definitions.contains(name) {
+            return Ok(name.to_vec());
+        }
+        let weak_target =
+            weak_resolution.resolve(name, |candidate| selected_definitions.contains(candidate))?;
+        if selected_definitions.contains(weak_target) {
+            return Ok(weak_target.to_vec());
+        }
+        let Ok(name) = std::str::from_utf8(name) else {
+            return Ok(name.to_vec());
+        };
+        Ok(runtime_resolution
+            .resolve_alternate_name(name, |candidate| {
+                selected_definitions.contains(candidate.as_bytes())
+            })?
+            .as_bytes()
+            .to_vec())
+    };
+
+    let mut referenced = HashSet::new();
+    let mut retain = |name: &[u8]| -> Result<()> {
+        let target = resolve(name)?;
+        if import_definitions.contains(&target) {
+            referenced.insert(target);
+        }
+        Ok(())
+    };
+    for root in roots {
+        retain(root)?;
+    }
+    for contribution in contributions {
+        let Source::Object { object, section } = contribution.source else {
+            continue;
+        };
+        let section = objects[object]
+            .file()
+            .section_by_index(section)
+            .context("live contribution has an invalid source section")?;
+        for (_, relocation) in section.relocations() {
+            let RelocationTarget::Symbol(symbol) = relocation.target() else {
+                continue;
+            };
+            let symbol = objects[object]
+                .file()
+                .symbol_by_index(symbol)
+                .context("live relocation has an invalid symbol")?;
+            if symbol.is_global() && symbol.section_index().is_none() {
+                retain(symbol.name_bytes()?)?;
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2116,6 +2576,166 @@ fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<
     Ok(resolution)
 }
 
+/// Return the selected COMDAT sections which are not reachable from a linker root.
+///
+/// COFF's section GC unit is a COMDAT group, not an input object: an associative child (for
+/// example a function's unwind record) follows its leader.  Non-COMDAT sections intentionally
+/// start live.  They contain PE/CRT conventions such as `.CRT$XCU`, TLS state and loader
+/// metadata that do not necessarily have a normal relocation edge from the entry point.
+fn unreferenced_comdat_sections(
+    objects: &[crate::coff::CoffObject<'_>],
+    comdats: &ComdatResolution,
+    roots: &[Vec<u8>],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashSet<ObjectSectionKey>> {
+    let mut group_members = HashMap::<ObjectSectionKey, Vec<ObjectSectionKey>>::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for group in cached_comdat_sections(object.file())?.into_values() {
+            let members = group
+                .sections
+                .iter()
+                .map(|section| (object_index, *section))
+                .collect::<Vec<_>>();
+            for member in &members {
+                group_members.insert(*member, members.clone());
+            }
+        }
+    }
+    let resolve = |mut key: ObjectSectionKey| -> Result<Option<ObjectSectionKey>> {
+        for _ in 0..=comdats.redirects.len() {
+            if !comdats.discarded.contains(&key) {
+                return Ok(Some(key));
+            }
+            let Some(next) = comdats.redirects.get(&key) else {
+                return Ok(None);
+            };
+            key = *next;
+        }
+        Err(error!("cycle in COMDAT section redirects"))
+    };
+
+    // Relocations to external symbols have no section on their local symbol record. Resolve
+    // them through the selected global definition, while direct/local relocations use the
+    // symbol's own section below.
+    let mut definitions = HashMap::<Vec<u8>, ObjectSectionKey>::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for symbol in object.file().symbols() {
+            if !symbol.is_global() || !symbol.is_definition() {
+                continue;
+            }
+            let Some(section) = symbol.section_index() else {
+                continue;
+            };
+            let Some(section) = resolve((object_index, section))? else {
+                continue;
+            };
+            definitions
+                .entry(symbol.name_bytes()?.to_vec())
+                .or_insert(section);
+        }
+    }
+    let weak_resolution = weak_external_resolution(objects)?;
+    let resolve_definition = |name: &[u8]| -> Result<Option<ObjectSectionKey>> {
+        if let Some(&section) = definitions.get(name) {
+            return Ok(Some(section));
+        }
+
+        // A weak external is undefined at the relocation site; its auxiliary symbol names
+        // the selected fallback definition. Follow that chain before deciding the target
+        // COMDAT is dead. A strong definition of any intermediate name stops the chain.
+        let weak_target =
+            weak_resolution.resolve(name, |candidate| definitions.contains_key(candidate))?;
+        if let Some(&section) = definitions.get(weak_target) {
+            return Ok(Some(section));
+        }
+
+        // `/alternatename` has the same selected-definition rule as weak externals. Keep the
+        // source spelling strong when it exists, and otherwise retain its final selected
+        // fallback. Non-UTF-8 COFF names cannot participate in this textual directive.
+        let Ok(name) = std::str::from_utf8(name) else {
+            return Ok(None);
+        };
+        let target = runtime_resolution.resolve_alternate_name(name, |candidate| {
+            definitions.contains_key(candidate.as_bytes())
+        })?;
+        Ok(definitions.get(target.as_bytes()).copied())
+    };
+
+    let mut live = HashSet::<ObjectSectionKey>::new();
+    let mut pending = Vec::<ObjectSectionKey>::new();
+    let mark_live = |key: ObjectSectionKey,
+                     live: &mut HashSet<ObjectSectionKey>,
+                     pending: &mut Vec<ObjectSectionKey>| {
+        let members = group_members
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| vec![key]);
+        for member in members {
+            if live.insert(member) {
+                pending.push(member);
+            }
+        }
+    };
+
+    // See the function comment above: all ordinary sections are roots.  This also makes REF
+    // compatible with objects compiled without /Gy, where a whole .text section is indivisible.
+    for (object_index, object) in objects.iter().enumerate() {
+        for section in object.file().sections() {
+            let key = (object_index, section.index());
+            if !section_is_comdat(object.file(), section.index())
+                && let Some(key) = resolve(key)?
+            {
+                mark_live(key, &mut live, &mut pending);
+            }
+        }
+    }
+    for root in roots {
+        if let Some(section) = resolve_definition(root)? {
+            mark_live(section, &mut live, &mut pending);
+        }
+    }
+
+    while let Some((object_index, section_index)) = pending.pop() {
+        let section = objects[object_index]
+            .file()
+            .section_by_index(section_index)
+            .context("invalid live COFF section")?;
+        for (_, relocation) in section.relocations() {
+            let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                continue;
+            };
+            let symbol = objects[object_index]
+                .file()
+                .symbol_by_index(symbol_index)
+                .context("invalid COFF relocation symbol")?;
+            let target = if let Some(section) = symbol.section_index() {
+                resolve((object_index, section))?
+            } else if symbol.is_global() {
+                resolve_definition(symbol.name_bytes()?)?
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                mark_live(target, &mut live, &mut pending);
+            }
+        }
+    }
+
+    let mut discarded = HashSet::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for section in object.file().sections() {
+            let key = (object_index, section.index());
+            if section_is_comdat(object.file(), section.index())
+                && !comdats.discarded.contains(&key)
+                && !live.contains(&key)
+            {
+                discarded.insert(key);
+            }
+        }
+    }
+    Ok(discarded)
+}
+
 fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u8>> {
     let separator = input.iter().position(|byte| *byte == b'$');
     let (base, suffix) = separator.map_or((input, &[][..]), |at| (&input[..at], &input[at + 1..]));
@@ -2209,7 +2829,13 @@ fn add_synthetic(
             id,
             name: name.to_vec(),
             characteristics,
-            alignment: if name.starts_with(b".text") { 16 } else { 8 },
+            alignment: if name.starts_with(b".text") {
+                16
+            } else if name.starts_with(b".pdata") {
+                4
+            } else {
+                8
+            },
             size,
             kind: ContributionKind::Data,
         },
@@ -2885,6 +3511,7 @@ fn write_headers(
     entry_name: Option<&str>,
     import_directory: Option<(u32, u32)>,
     iat_directory: Option<(u32, u32)>,
+    delay_import_directory: Option<(u32, u32)>,
     has_relocs: bool,
     export_directory: Option<(u32, u32)>,
     resource_directory: Option<(u32, u32)>,
@@ -3030,6 +3657,11 @@ fn write_headers(
     if let Some((rva, size)) = iat_directory {
         put_u32(image, opt + 208, rva);
         put_u32(image, opt + 212, size);
+    }
+    if let Some((rva, size)) = delay_import_directory {
+        // IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT (13).
+        put_u32(image, opt + 216, rva);
+        put_u32(image, opt + 220, size);
     }
     if let Some((rva, size)) = tls_directory {
         put_u32(image, opt + 184, rva);
@@ -3707,6 +4339,43 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn weak_comdat_object(alias: &[u8], fallback: &[u8]) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_subsection(object::write::StandardSection::Text, fallback);
+        object.append_section_data(text, &[0xc3], 1);
+        object.section_symbol(text);
+        let fallback_symbol = object.add_symbol(Symbol {
+            name: fallback.to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_symbol(Symbol {
+            name: alias.to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: true,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::Any,
+            symbol: fallback_symbol,
+            sections: vec![text],
+        });
+        object.write().unwrap()
+    }
+
     fn long_section_name_object() -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -3964,6 +4633,290 @@ mod tests {
                 0x08, 0x00, 0x00, 0x00, // SECREL: byte 8 within `.rdata`.
             ]
         );
+    }
+
+    #[test]
+    fn opt_ref_discards_unreachable_comdat_groups_and_keeps_rooted_ones() {
+        let live = comdat_object(
+            b"live",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"live",
+            0,
+            true,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            true,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&live).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"live".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            contributions.len(),
+            2,
+            "the live COMDAT and its associate remain"
+        );
+        assert!(
+            contributions
+                .iter()
+                .all(|contribution| match contribution.source {
+                    Source::Object { object, .. } => object == 0,
+                    Source::Synthetic => false,
+                })
+        );
+    }
+
+    #[test]
+    fn opt_noref_preserves_unreachable_comdats() {
+        let live = comdat_object(
+            b"live",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"live",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&live).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Disabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"live".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(contributions.len(), 2);
+    }
+
+    #[test]
+    fn opt_ref_follows_relocations_into_comdats() {
+        let caller = relocation_object(b"caller", b"target");
+        let target = comdat_object(
+            b"target",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"target",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&target).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"caller".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(contributions.len(), 2);
+        assert!(
+            contributions
+                .iter()
+                .all(|contribution| match contribution.source {
+                    Source::Object { object, .. } => object != 2,
+                    Source::Synthetic => false,
+                })
+        );
+    }
+
+    #[test]
+    fn opt_ref_follows_weak_external_fallback_into_comdat() {
+        let caller = relocation_object(b"caller", b"weak_alias");
+        let target = weak_comdat_object(b"weak_alias", b"fallback");
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&target).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"caller".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert!(contributions.iter().any(|contribution| {
+            matches!(contribution.source, Source::Object { object: 1, .. })
+        }));
+        assert!(contributions.iter().all(|contribution| {
+            !matches!(contribution.source, Source::Object { object: 2, .. })
+        }));
+    }
+
+    #[test]
+    fn opt_ref_follows_alternatename_fallback_into_comdat() {
+        let caller = relocation_object(b"caller", b"alias");
+        let target = comdat_object(
+            b"fallback",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"fallback",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&target).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+        let mut runtime_resolution = linker_utils::coff_runtime::RuntimeResolution::new();
+        runtime_resolution
+            .parse_and_apply("/alternatename:alias=fallback", "directives.obj")
+            .unwrap();
+
+        let (contributions, _) = collect_contributions_with_roots(
+            &objects,
+            &args,
+            &[b"caller".to_vec()],
+            &runtime_resolution,
+        )
+        .unwrap();
+
+        assert!(contributions.iter().any(|contribution| {
+            matches!(contribution.source, Source::Object { object: 1, .. })
+        }));
+        assert!(contributions.iter().all(|contribution| {
+            !matches!(contribution.source, Source::Object { object: 2, .. })
+        }));
+    }
+
+    #[test]
+    fn opt_ref_default_matches_lld_release_and_debug_profiles() {
+        let live = comdat_object(
+            b"live",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"live",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&live).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+
+        let (release, _) = collect_contributions_with_roots(
+            &objects,
+            &Default::default(),
+            &[b"live".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(release.len(), 1);
+
+        let debug = crate::args::coff::CoffArgs {
+            debug: true,
+            ..Default::default()
+        };
+        let (debug, _) = collect_contributions_with_roots(
+            &objects,
+            &debug,
+            &[b"live".to_vec()],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(debug.len(), 2);
     }
 
     #[test]
@@ -4366,7 +5319,10 @@ mod tests {
         assert_eq!(selected.objects.len(), 3);
         assert_eq!(selected.resolver_object_scans, selected.objects.len());
         assert_eq!(
-            selected.runtime_resolution.mismatch_value("RuntimeLibrary"),
+            selected
+                .directives
+                .runtime_resolution
+                .mismatch_value("RuntimeLibrary"),
             Some("MD")
         );
         assert!(
@@ -4504,6 +5460,210 @@ mod tests {
         assert!(same_library_name("Runtime.LIB", "runtime"));
         assert!(path_matches(Path::new("sdk/Foo.LIB"), "FOO"));
         assert!(!same_library_name("foo.dll", "foo"));
+    }
+
+    #[test]
+    fn embeds_generated_manifest_with_requested_id_uac_and_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar = directory.path().join("app.manifest");
+        let args = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_mode_requested: true,
+            manifest_embed: Some(crate::args::coff::ManifestEmbed::Id(7)),
+            manifest_file: Some(sidecar.clone().into_boxed_path()),
+            manifest_dependencies: vec![crate::args::coff::ManifestDependency {
+                value: "type='win32' name='Common-Controls' version='6.0.0.0'".into(),
+            }],
+            manifest_uac: Some(crate::args::coff::ManifestUac {
+                level: crate::args::coff::ManifestExecutionLevel::RequireAdministrator,
+                ui_access: true,
+            }),
+            manifest_uac_requested: true,
+            ..Default::default()
+        };
+        let mut resources = Vec::new();
+
+        prepare_manifest(
+            &crate::fs::OsFileSystem,
+            &args,
+            &Default::default(),
+            &mut resources,
+        )
+        .unwrap();
+
+        assert_eq!(resources.len(), 1);
+        let record = &resources[0];
+        assert_eq!(
+            record.resource_type,
+            linker_utils::pe_resources::ResourceId::Id(linker_utils::pe_manifest::RT_MANIFEST)
+        );
+        assert_eq!(record.name, linker_utils::pe_resources::ResourceId::Id(7));
+        let xml = std::str::from_utf8(&record.data).unwrap();
+        assert!(xml.contains("Common-Controls"));
+        assert!(xml.contains("requireAdministrator"));
+        assert!(xml.contains("uiAccess=\"true\""));
+        assert_eq!(std::fs::read(sidecar).unwrap(), record.data);
+
+        let object_bytes = long_section_name_object();
+        let object = crate::coff::CoffObject::parse(&object_bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"manifest.exe",
+            Some("entry"),
+            &args,
+            PeWriterConfig::default(),
+            &resources,
+            &Default::default(),
+        )
+        .unwrap();
+        let file = object::File::parse(image.bytes.as_slice()).unwrap();
+        let rsrc = file.section_by_name(".rsrc").unwrap();
+        assert!(
+            rsrc.data()
+                .unwrap()
+                .windows(b"requireAdministrator".len())
+                .any(|window| window == b"requireAdministrator")
+        );
+    }
+
+    #[test]
+    fn manifest_embed_rejects_conflicting_resource_id() {
+        let args = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_mode_requested: true,
+            manifest_embed: Some(crate::args::coff::ManifestEmbed::Id(1)),
+            ..Default::default()
+        };
+        let mut resources = vec![
+            linker_utils::pe_manifest::manifest_resource(
+                1,
+                linker_utils::pe_manifest::MANIFEST_LANGUAGE_NEUTRAL,
+                b"input".to_vec(),
+            )
+            .unwrap(),
+        ];
+
+        let error = prepare_manifest(
+            &crate::fs::OsFileSystem,
+            &args,
+            &Default::default(),
+            &mut resources,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("conflicts with an input resource"));
+    }
+
+    #[test]
+    fn manifest_inputs_and_selected_directives_merge_into_dll_resource() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.manifest");
+        let second = directory.path().join("second.manifest");
+        std::fs::write(
+            &first,
+            br#"<?xml version="1.0"?><assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><assemblyIdentity type="win32" name="app" version="1.0.0.0"/></assembly>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            br#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><description>second input</description></assembly>"#,
+        )
+        .unwrap();
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            manifest_requested: true,
+            manifest_mode_requested: true,
+            manifest_embed: Some(crate::args::coff::ManifestEmbed::DefaultId),
+            manifest_inputs: vec![first.into_boxed_path(), second.into_boxed_path()],
+            ..Default::default()
+        };
+        let directives = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_dependencies: vec![crate::args::coff::ManifestDependency {
+                value: "type='win32' name='Directive.Dependency' version='1.2.3.4'".into(),
+            }],
+            ..Default::default()
+        };
+        let mut resources = Vec::new();
+
+        prepare_manifest(&crate::fs::OsFileSystem, &args, &directives, &mut resources).unwrap();
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].name,
+            linker_utils::pe_resources::ResourceId::Id(linker_utils::pe_manifest::DLL_MANIFEST_ID)
+        );
+        let xml = std::str::from_utf8(&resources[0].data).unwrap();
+        assert!(xml.contains("second input"));
+        assert!(xml.contains("Directive.Dependency"));
+        assert!(!xml.contains("requestedExecutionLevel"));
+    }
+
+    #[test]
+    fn manifest_resource_conflict_is_language_specific() {
+        let args = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_mode_requested: true,
+            manifest_embed: Some(crate::args::coff::ManifestEmbed::Id(1)),
+            ..Default::default()
+        };
+        let mut resources = vec![
+            linker_utils::pe_manifest::manifest_resource(1, 0x409, b"<assembly/>".to_vec())
+                .unwrap(),
+        ];
+
+        prepare_manifest(
+            &crate::fs::OsFileSystem,
+            &args,
+            &Default::default(),
+            &mut resources,
+        )
+        .unwrap();
+
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().any(|record| record.language == 0));
+        assert!(resources.iter().any(|record| record.language == 0x409));
+    }
+
+    #[test]
+    fn manifest_input_requires_embedding_and_sidecar_uses_full_output_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.manifest");
+        std::fs::write(&input, b"<assembly></assembly>").unwrap();
+        let invalid = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_inputs: vec![input.into_boxed_path()],
+            ..Default::default()
+        };
+        let error = prepare_manifest(
+            &crate::fs::OsFileSystem,
+            &invalid,
+            &Default::default(),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires /MANIFEST:EMBED"));
+
+        let output = directory.path().join("sidecar.exe");
+        let mut args = crate::args::coff::CoffArgs {
+            manifest_requested: true,
+            manifest_mode_requested: true,
+            ..Default::default()
+        };
+        args.common.output = output.into();
+        prepare_manifest(
+            &crate::fs::OsFileSystem,
+            &args,
+            &Default::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(directory.path().join("sidecar.exe.manifest").is_file());
+        assert!(!directory.path().join("sidecar.manifest").exists());
     }
 
     #[test]
@@ -5105,7 +6265,7 @@ mod tests {
             &args,
             PeWriterConfig::default(),
             &[],
-            &selected.runtime_resolution,
+            &selected.directives.runtime_resolution,
         )
         .unwrap()
         .bytes;

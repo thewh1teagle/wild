@@ -1,0 +1,28 @@
+[package]
+name = "wild-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+linker-utils = { path = "../linker-utils" }
+object = { version = "0.40", default-features = false, features = [
+  "coff",
+  "read_core",
+  "std",
+  "unaligned",
+] }
+
+[[bin]]
+name = "coff_parsers"
+path = "fuzz_targets/coff_parsers.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz targets are intentionally outside Wild's normal workspace.
+[workspace]

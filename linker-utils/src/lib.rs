@@ -15,6 +15,7 @@ pub mod pe_debug;
 pub mod pe_delay_imports;
 pub mod pe_exports;
 pub mod pe_load_config;
+pub mod pe_manifest;
 pub mod pe_resources;
 pub mod pe_sections;
 pub mod pe_tls;
