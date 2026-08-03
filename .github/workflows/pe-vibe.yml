@@ -1,0 +1,169 @@
+name: PE/COFF Vibe acceptance
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: pe-vibe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VIBE_REVISION: 1c5466b21b2228d708d9140d0f2ec71f69c0bb3e
+
+jobs:
+  windows-vibe:
+    name: Vibe debug and release (Windows x86-64)
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out Wild
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out audited Vibe revision
+        uses: actions/checkout@v7
+        with:
+          repository: thewh1teagle/vibe
+          ref: 1c5466b21b2228d708d9140d0f2ec71f69c0bb3e
+          path: vibe-source
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: vibe-source/desktop/pnpm-lock.yaml
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: 0.11.6
+          enable-cache: true
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            vibe-source -> target
+
+      - name: Verify pinned Vibe revision
+        shell: pwsh
+        working-directory: vibe-source
+        run: |
+          $revision = git rev-parse HEAD
+          if ($revision -ne $env:VIBE_REVISION) {
+            throw "Expected Vibe $env:VIBE_REVISION, checked out $revision"
+          }
+
+      - name: Build Wild
+        run: >-
+          cargo build --profile ci -p wild-linker
+          --no-default-features --features pe
+
+      - name: Select Wild as link.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/pe-linker | Out-Null
+          Copy-Item target/ci/wild.exe target/pe-linker/link.exe
+          $linker = (Resolve-Path target/pe-linker/link.exe).Path
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Vibe frontend dependencies
+        working-directory: vibe-source/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Vibe sidecars
+        uses: actions/cache@v4
+        with:
+          path: vibe-source/desktop/src-tauri/binaries
+          key: vibe-sidecars-windows-x64-${{ env.VIBE_REVISION }}
+
+      - name: Download Vibe sidecars
+        shell: pwsh
+        working-directory: vibe-source
+        run: |
+          uv run scripts/pre_build.py --target x86_64-pc-windows-msvc
+          $binaries = 'desktop/src-tauri/binaries'
+          foreach ($name in @(
+            'sona-x86_64-pc-windows-msvc.exe',
+            'ffmpeg-x86_64-pc-windows-msvc.exe'
+          )) {
+            if (-not (Test-Path (Join-Path $binaries $name))) {
+              throw "pre_build.py did not produce $name"
+            }
+          }
+
+      - name: Build Vibe debug with Wild
+        working-directory: vibe-source/desktop
+        run: >-
+          pnpm exec tauri build --debug --no-bundle
+          --target x86_64-pc-windows-msvc
+
+      - name: Build Vibe release with Wild
+        working-directory: vibe-source/desktop
+        env:
+          # Wild v1 intentionally excludes LTO; Vibe enables it in its release profile.
+          CARGO_PROFILE_RELEASE_LTO: 'false'
+        run: >-
+          pnpm exec tauri build --no-bundle
+          --target x86_64-pc-windows-msvc
+
+      - name: Verify Vibe executables on Windows
+        shell: pwsh
+        working-directory: vibe-source
+        run: |
+          function Test-VibeExecutable([string] $profile) {
+            $directory = Join-Path 'target/x86_64-pc-windows-msvc' $profile
+            $executable = Join-Path $directory 'vibe.exe'
+            if (-not (Test-Path $executable)) {
+              throw "Missing Vibe $profile executable: $executable"
+            }
+
+            $headers = (& dumpbin.exe /headers $executable | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $headers -notmatch '8664 machine \(x64\)') {
+              throw "Vibe $profile is not an x86-64 PE executable"
+            }
+
+            $stdout = Join-Path $env:RUNNER_TEMP "vibe-$profile.stdout.txt"
+            $stderr = Join-Path $env:RUNNER_TEMP "vibe-$profile.stderr.txt"
+            $process = Start-Process -FilePath (Resolve-Path $executable).Path `
+              -ArgumentList '--help' -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+            if (-not $process.WaitForExit(30000)) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Host
+              throw "Vibe $profile did not finish its --help smoke test within 30 seconds"
+            }
+            $process.Refresh()
+            if ($process.ExitCode -ne 0) {
+              Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | Out-Host
+              throw "Vibe $profile exited with code $($process.ExitCode)"
+            }
+          }
+
+          Test-VibeExecutable 'debug'
+          Test-VibeExecutable 'release'
