@@ -5,6 +5,7 @@
 use super::pe_ir::NameId;
 use super::pe_ir::PeIr;
 use super::pe_ir::RelocationCsr;
+use super::pe_ir::RelocationRecord;
 use super::pe_ir::SectionId;
 use super::pe_ir::SymbolId;
 use super::pe_symbol_db::ProviderKind;
@@ -16,12 +17,6 @@ use crate::error::Context;
 use crate::error::Result;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
-
-#[inline]
-fn count_relocation_decode() {
-    #[cfg(not(test))]
-    crate::perf::removal_counters::increment_relocation_decodes();
-}
 
 #[inline]
 fn count_hot_allocations(count: u64) {
@@ -194,12 +189,14 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         Err(error!("cycle in weak symbol fallbacks"))
     }
 
-    fn resolve_occurrence(&self, symbols: &SymbolDb, target: SymbolId) -> Result<ResolvedTarget> {
-        let symbol = self
-            .ir
-            .symbols
-            .get(target.index())
-            .context("relocation refers to an invalid symbol occurrence")?;
+    fn resolve_occurrence(
+        &self,
+        symbols: &SymbolDb,
+        relocation: RelocationRecord,
+    ) -> Result<ResolvedTarget> {
+        // Keep target validation at the live-edge boundary. In particular, malformed targets in
+        // discarded sections never cross `relocation_target` and remain non-diagnostic.
+        let symbol = self.ir.relocation_target(relocation)?;
         if let Some(section) = symbol.section.get() {
             return Ok(ResolvedTarget {
                 section: Some(section),
@@ -398,8 +395,7 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                 .for_section(section)
                 .context("live section has no relocation CSR row")?;
             for relocation in relocations {
-                count_relocation_decode();
-                let target = self.resolve_occurrence(input.symbols, relocation.target)?;
+                let target = self.resolve_occurrence(input.symbols, *relocation)?;
                 if relocation.typ == 1 && !target.absolute {
                     dir64_needs.push(Dir64Need {
                         section,
@@ -468,6 +464,7 @@ mod tests {
         let sections = (0..4)
             .map(|index| SectionRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: index + 1,
                 name: NameId::from_u32(0),
                 data: None,
                 size: 8,
@@ -478,39 +475,50 @@ mod tests {
                 } else {
                     SectionContents::Data
                 },
+                comdat_selection: 0,
+                associative_section: OptionalSectionId::NONE,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let symbols = vec![
             SymbolRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: 0,
                 name: NameId::from_u32(0),
                 section: OptionalSectionId::some(SectionId::from_u32(1)),
                 value: 0,
                 size: 0,
                 flags: 0,
                 storage_class: 0,
-                reserved: 0,
+                typ: 0,
+                weak_default: OptionalSymbolId::NONE,
+                diagnostic: SymbolDiagnostic::None,
             },
             SymbolRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: 1,
                 name: NameId::from_u32(1),
                 section: OptionalSectionId::NONE,
                 value: 0,
                 size: 0,
                 flags: 0,
                 storage_class: 0,
-                reserved: 0,
+                typ: 0,
+                weak_default: OptionalSymbolId::NONE,
+                diagnostic: SymbolDiagnostic::None,
             },
             SymbolRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: 2,
                 name: NameId::from_u32(2),
                 section: OptionalSectionId::NONE,
                 value: 0,
                 size: 0,
                 flags: 0,
                 storage_class: 0,
-                reserved: 0,
+                typ: 0,
+                weak_default: OptionalSymbolId::NONE,
+                diagnostic: SymbolDiagnostic::None,
             },
         ]
         .into_boxed_slice();
@@ -542,11 +550,11 @@ mod tests {
             sources: SourceFiles::new(vec![b""]),
             names: (0..3)
                 .map(|_| NameRecord {
-                    source: SourceRange {
+                    source: Some(SourceRange {
                         file: FileId::from_u32(0),
                         start: 0,
                         len: 0,
-                    },
+                    }),
                     hash: 0,
                 })
                 .collect::<Vec<_>>()
@@ -658,25 +666,28 @@ mod tests {
     #[test]
     fn associative_children_preserve_event_order() {
         let sections = (0..4)
-            .map(|_| SectionRecord {
+            .map(|index| SectionRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: index + 1,
                 name: NameId::from_u32(0),
                 data: None,
                 size: 1,
                 alignment: 1,
                 characteristics: 0,
                 contents: SectionContents::Data,
+                comdat_selection: 0,
+                associative_section: OptionalSectionId::NONE,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let ir = PeIr {
             sources: SourceFiles::new(vec![b""]),
             names: vec![NameRecord {
-                source: SourceRange {
+                source: Some(SourceRange {
                     file: FileId::from_u32(0),
                     start: 0,
                     len: 0,
-                },
+                }),
                 hash: 0,
             }]
             .into_boxed_slice(),
@@ -738,5 +749,104 @@ mod tests {
                 SectionId::from_u32(3),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_relocation_target_is_diagnostic_only_when_source_is_live() {
+        let sections = (0..2)
+            .map(|index| SectionRecord {
+                object: ObjectId::from_u32(0),
+                raw_index: index + 1,
+                name: NameId::from_u32(0),
+                data: None,
+                size: 1,
+                alignment: 1,
+                characteristics: 0,
+                contents: SectionContents::Data,
+                comdat_selection: 0,
+                associative_section: OptionalSectionId::NONE,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let ir = PeIr {
+            sources: SourceFiles::new(vec![b""]),
+            names: vec![NameRecord {
+                source: Some(SourceRange {
+                    file: FileId::from_u32(0),
+                    start: 0,
+                    len: 0,
+                }),
+                hash: 0,
+            }]
+            .into_boxed_slice(),
+            objects: vec![ObjectRecord {
+                file: FileId::from_u32(0),
+                sections: DenseRange::new(0, 2),
+                symbols: DenseRange::new(0, 1),
+                input_ordinal: 0,
+            }]
+            .into_boxed_slice(),
+            sections,
+            symbols: vec![SymbolRecord {
+                object: ObjectId::from_u32(0),
+                raw_index: 17,
+                name: NameId::from_u32(0),
+                section: OptionalSectionId::NONE,
+                value: 0,
+                size: 0,
+                flags: 0,
+                storage_class: 0,
+                typ: 0,
+                weak_default: OptionalSymbolId::NONE,
+                diagnostic: SymbolDiagnostic::InvalidRelocationTarget,
+            }]
+            .into_boxed_slice(),
+            relocations: RelocationCsr {
+                // Section 0 has no edges; section 1 owns the malformed edge.
+                starts: vec![0, 0, 1].into_boxed_slice(),
+                records: vec![RelocationRecord {
+                    offset: 0,
+                    target: SymbolId::from_u32(0),
+                    typ: 4,
+                    flags: 0,
+                }]
+                .into_boxed_slice(),
+            },
+        };
+        let database = SymbolDb {
+            entries: Box::new([]),
+            providers: Box::new([]),
+            absolute_values: Box::new([]),
+        };
+        let discarded_events = [GcEvent::RootSection {
+            section: SectionId::from_u32(0),
+            reason: RootReason::NonComdat,
+        }];
+        DenseEventGc::new(&ir)
+            .collect(GcInput {
+                section_count: 2,
+                events: &discarded_events,
+                groups: &[],
+                group_members: &[],
+                relocations: &ir.relocations,
+                symbols: &database,
+            })
+            .unwrap();
+
+        let live_events = [GcEvent::RootSection {
+            section: SectionId::from_u32(1),
+            reason: RootReason::NonComdat,
+        }];
+        let error = DenseEventGc::new(&ir)
+            .collect(GcInput {
+                section_count: 2,
+                events: &live_events,
+                groups: &[],
+                group_members: &[],
+                relocations: &ir.relocations,
+                symbols: &database,
+            })
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("Invalid COFF relocation symbol 17"));
     }
 }

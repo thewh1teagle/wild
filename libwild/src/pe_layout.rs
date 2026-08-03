@@ -210,11 +210,11 @@ mod tests {
         let ir = PeIr {
             sources: SourceFiles::new(vec![b"abcd"]),
             names: vec![NameRecord {
-                source: SourceRange {
+                source: Some(SourceRange {
                     file: FileId::from_u32(0),
                     start: 0,
                     len: 0,
-                },
+                }),
                 hash: 0,
             }]
             .into_boxed_slice(),
@@ -227,6 +227,7 @@ mod tests {
             .into_boxed_slice(),
             sections: vec![SectionRecord {
                 object: ObjectId::from_u32(0),
+                raw_index: 1,
                 name: NameId::from_u32(0),
                 data: Some(SourceRange {
                     file: FileId::from_u32(0),
@@ -237,6 +238,8 @@ mod tests {
                 alignment: 1,
                 characteristics: 0,
                 contents: SectionContents::Data,
+                comdat_selection: 0,
+                associative_section: OptionalSectionId::NONE,
             }]
             .into_boxed_slice(),
             symbols: Box::new([]),

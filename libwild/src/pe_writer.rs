@@ -3943,14 +3943,11 @@ fn copy_and_relocate_contribution(
         return Ok(());
     };
     let input = &objects[object_index];
-    let source = input
-        .file()
-        .section_by_index(section_index)
-        .context("relocation source has an invalid COFF section")?;
+    let source = indexed_coff_section(input, section_index)?;
     let placement = &layout.placements[&contribution.spec.id];
     let Some(file_offset) = placement.file_offset else {
         ensure!(
-            source.relocations().next().is_none(),
+            input.index().relocations(source).is_empty(),
             "relocation in uninitialized section"
         );
         return Ok(());
@@ -3964,15 +3961,24 @@ fn copy_and_relocate_contribution(
             usize::try_from(placement.size).context("PE contribution size too large")?,
         )?
     };
-    let source_data = source.data().context("invalid COFF section contents")?;
+    let source_range = source
+        .data_range
+        .context("initialized COFF section has no indexed source range")?;
+    let source_start = source_range.start as usize;
+    let source_end = source_start
+        .checked_add(source_range.len as usize)
+        .context("COFF source range overflow")?;
+    let source_data = input
+        .bytes()
+        .get(source_start..source_end)
+        .context("invalid indexed COFF section source range")?;
     ensure!(
         source_data.len() == contribution.len(),
         "COFF source and output contribution sizes differ"
     );
     contribution.copy_from_slice(source_data);
     count_pe_bytes_copied(source_data.len());
-    for (offset, relocation) in source.relocations() {
-        count_pe_relocation_decode();
+    for relocation in input.index().relocations(source) {
         let mut prepared = prepare_relocation(
             objects,
             object_index,
@@ -3984,8 +3990,7 @@ fn copy_and_relocate_contribution(
             absolute_symbols,
             image_base,
             placement,
-            offset,
-            &relocation,
+            relocation,
         )?;
         prepared.at = prepared
             .at
@@ -3994,6 +3999,27 @@ fn copy_and_relocate_contribution(
         prepared.apply(contribution)?;
     }
     Ok(())
+}
+
+#[inline]
+fn indexed_coff_section<'object>(
+    input: &'object crate::coff::CoffObject<'_>,
+    section: object::SectionIndex,
+) -> Result<&'object crate::coff::CoffSectionRecord> {
+    let ordinal = section
+        .0
+        .checked_sub(1)
+        .context("invalid zero COFF section index")?;
+    let record = input
+        .index()
+        .sections()
+        .get(ordinal)
+        .context("COFF section is absent from the eager index")?;
+    ensure!(
+        record.index() == section,
+        "eager COFF section index/order mismatch"
+    );
+    Ok(record)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4009,8 +4035,7 @@ fn prepare_relocation(
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     placement: &linker_utils::pe_sections::ContributionPlacement,
-    offset: u64,
-    relocation: &object::Relocation,
+    relocation: &crate::coff::CoffRelocationRecord,
 ) -> Result<PreparedRelocation> {
     use linker_utils::coff::Amd64RelocationInputs;
     use linker_utils::coff::Amd64RelocationKind;
@@ -4021,83 +4046,57 @@ fn prepare_relocation(
     let source_file = placement
         .file_offset
         .ok_or_else(|| error!("relocation in uninitialized section"))?;
-    let (target, target_section, target_section_index, absolute_value) = match relocation.target() {
-        RelocationTarget::Symbol(index) => {
-            let symbol = input
-                .file()
-                .symbol_by_index(index)
-                .context("invalid relocation symbol")?;
-            let name = symbol.name_bytes()?;
-            if symbol.is_global()
-                && let Some(address) = definitions.get(name)
-            {
-                if let Some(value) = absolute_symbols.get(name) {
-                    (0, 0, 0, Some(*value))
-                } else {
-                    let (target, section, index) = target_location(layout, image_base, *address)?;
-                    (target, section, index, None)
-                }
-            } else if let Some(section) = symbol.section_index() {
-                let ((target_object, target_section_index), id) =
-                        redirected_location(locations, redirects, (object_index, section))?
-                            .ok_or_else(|| {
-                                error!(
-                                    "relocation targets discarded section {object_index}:{section:?} via symbol `{}`",
-                                    String::from_utf8_lossy(name)
-                                )
-                            })?;
-                let target_section = objects[target_object]
-                    .file()
-                    .section_by_index(target_section_index)
-                    .context("COMDAT redirect targets an invalid section")?;
-                ensure!(
-                    symbol.address() <= target_section.size(),
-                    "symbol offset exceeds selected COMDAT section"
-                );
-                let target_placement = &layout.placements[&id];
-                let target = target_placement
-                    .rva
-                    .checked_add(
-                        u32::try_from(symbol.address())
-                            .context("COFF symbol offset exceeds u32")?,
-                    )
-                    .context("COFF symbol RVA overflow")?;
-                (
-                    target,
-                    layout.sections[target_placement.output_section].rva,
-                    u16::try_from(target_placement.output_section + 1)
-                        .context("PE section index exceeds u16")?,
-                    None,
-                )
-            } else {
-                let address = *definitions.get(name).ok_or_else(|| {
-                    error!("undefined symbol `{}`", String::from_utf8_lossy(name))
-                })?;
-                let (target, section, index) = target_location(layout, image_base, address)?;
-                (target, section, index, None)
-            }
+    let symbol = input.index().symbol(relocation.symbol());
+    let shape = symbol.shape(input)?;
+    let name = symbol.name(input)?;
+    let (target, target_section, target_section_index, absolute_value) = if shape.is_global
+        && let Some(address) = definitions.get(name)
+    {
+        if let Some(value) = absolute_symbols.get(name) {
+            (0, 0, 0, Some(*value))
+        } else {
+            let (target, section, index) = target_location(layout, image_base, *address)?;
+            (target, section, index, None)
         }
-        RelocationTarget::Section(section) => {
-            let (_, id) = redirected_location(locations, redirects, (object_index, section))?
-                .ok_or_else(|| {
-                    error!("relocation targets discarded section {object_index}:{section:?}")
-                })?;
-            let target_placement = &layout.placements[&id];
-            (
-                target_placement.rva,
-                layout.sections[target_placement.output_section].rva,
-                u16::try_from(target_placement.output_section + 1)
-                    .context("PE section index exceeds u16")?,
-                None,
+    } else if let Some(section) = shape.section {
+        let ((target_object, target_section_index), id) = redirected_location(
+            locations,
+            redirects,
+            (object_index, section),
+        )?
+        .ok_or_else(|| {
+            error!(
+                "relocation targets discarded section {object_index}:{section:?} via symbol `{}`",
+                String::from_utf8_lossy(name)
             )
-        }
-        _ => return Err(error!("unsupported COFF relocation target")),
+        })?;
+        let target_section = indexed_coff_section(&objects[target_object], target_section_index)?;
+        ensure!(
+            shape.address <= target_section.size,
+            "symbol offset exceeds selected COMDAT section"
+        );
+        let target_placement = &layout.placements[&id];
+        let target = target_placement
+            .rva
+            .checked_add(u32::try_from(shape.address).context("COFF symbol offset exceeds u32")?)
+            .context("COFF symbol RVA overflow")?;
+        (
+            target,
+            layout.sections[target_placement.output_section].rva,
+            u16::try_from(target_placement.output_section + 1)
+                .context("PE section index exceeds u16")?,
+            None,
+        )
+    } else {
+        let address = *definitions
+            .get(name)
+            .ok_or_else(|| error!("undefined symbol `{}`", String::from_utf8_lossy(name)))?;
+        let (target, section, index) = target_location(layout, image_base, address)?;
+        (target, section, index, None)
     };
-    let typ = match relocation.flags() {
-        object::RelocationFlags::Coff { typ } => typ,
-        flags => return Err(error!("expected COFF relocation flags, got {flags:?}")),
-    };
-    let kind = Amd64RelocationKind::from_type(typ).context("unsupported AMD64 COFF relocation")?;
+    let kind = Amd64RelocationKind::from_type(object::pe::RelocationType(relocation.typ))
+        .context("unsupported AMD64 COFF relocation")?;
+    let offset = u64::from(relocation.offset);
     let at = usize::try_from(u64::from(source_file) + offset)
         .context("relocation file offset too large")?;
     let place = placement
