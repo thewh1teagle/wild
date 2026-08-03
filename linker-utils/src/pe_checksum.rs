@@ -3,9 +3,10 @@
 //! The certificate-table data-directory address is a file offset, unlike the
 //! RVA used by every other PE data-directory entry.
 
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use std::ops::Range;
-
-use anyhow::{Context, Result, ensure};
 
 const DOS_PE_POINTER_OFFSET: usize = 0x3c;
 const COFF_HEADER_SIZE: usize = 20;

@@ -5,9 +5,9 @@
 //! it is new enough for Control Flow Guard and EH-continuation metadata, while
 //! avoiding newer fields that the linker does not yet populate.
 
+use anyhow::Result;
+use anyhow::ensure;
 use std::collections::BTreeSet;
-
-use anyhow::{Result, ensure};
 
 /// Size emitted in the directory's `Size` field.
 pub const IMAGE_LOAD_CONFIG_DIRECTORY64_COMPAT_SIZE: u32 = 280;

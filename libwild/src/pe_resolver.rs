@@ -1,11 +1,17 @@
 //! COFF archive extraction used by the PE writer.
 
-use crate::error::{Context, Result};
-use crate::{ensure, error};
-use linker_utils::coff_archives::{CoffArchive, CoffArchiveMemberKind};
-use linker_utils::coff_symbols::{ArchiveDemand, ArchiveDemandKind};
-use object::{Object, ObjectSymbol};
-use std::collections::{BTreeSet, HashSet};
+use crate::ensure;
+use crate::error;
+use crate::error::Context;
+use crate::error::Result;
+use linker_utils::coff_archives::CoffArchive;
+use linker_utils::coff_archives::CoffArchiveMemberKind;
+use linker_utils::coff_symbols::ArchiveDemand;
+use linker_utils::coff_symbols::ArchiveDemandKind;
+use object::Object;
+use object::ObjectSymbol;
+use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 type SymbolState = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 

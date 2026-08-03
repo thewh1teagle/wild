@@ -4,10 +4,9 @@
 //! the compact metadata found in COFF records and turns it into typed values
 //! that a linker can use without repeatedly interpreting magic numbers.
 
+use object::pe;
 use std::error::Error;
 use std::fmt;
-
-use object::pe;
 
 const SECTION_NUMBER_UNDEFINED: i32 = 0;
 const SECTION_NUMBER_ABSOLUTE: i32 = -1;

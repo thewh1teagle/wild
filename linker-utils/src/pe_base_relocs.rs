@@ -3,8 +3,11 @@
 //! PE groups base relocations into 4 KiB pages. Each 16-bit entry contains a
 //! four-bit relocation type and a 12-bit offset from the block's page RVA.
 
-use anyhow::{Result, bail, ensure};
-use std::collections::{BTreeMap, BTreeSet};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const PAGE_SIZE: u32 = 0x1000;
 const BLOCK_HEADER_SIZE: usize = 8;

@@ -1,9 +1,15 @@
 //! Construction of the PE import directory and AMD64 import thunks.
 
 use crate::ensure;
-use crate::error::{Context, Result};
-use linker_utils::coff_imports::{ImportLibrary, ImportLibraryMember, ImportTarget, ImportType};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::error::Context;
+use crate::error::Result;
+use linker_utils::coff_imports::ImportLibrary;
+use linker_utils::coff_imports::ImportLibraryMember;
+use linker_utils::coff_imports::ImportTarget;
+use linker_utils::coff_imports::ImportType;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 const ORDINAL_FLAG64: u64 = 1 << 63;
 

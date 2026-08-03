@@ -5,16 +5,22 @@
 //! remain opaque until selected, so legacy members that are irrelevant to a
 //! link do not make an otherwise usable MSVC library fail eagerly.
 
+use crate::coff_imports::ShortImportObject;
+use crate::coff_symbols::ArchiveDemand;
+use crate::coff_symbols::ArchiveDemandKind;
+use object::Architecture;
+use object::FileKind;
+use object::LittleEndian as LE;
+use object::Object as _;
+use object::ObjectSymbol as _;
+use object::pe;
+use object::read::archive::ArchiveFile;
+use object::read::archive::ArchiveKind;
+use object::read::coff::CoffHeader;
+use object::read::coff::Symbol as _;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-
-use object::read::archive::{ArchiveFile, ArchiveKind};
-use object::read::coff::{CoffHeader, Symbol as _};
-use object::{Architecture, FileKind, LittleEndian as LE, Object as _, ObjectSymbol as _, pe};
-
-use crate::coff_imports::ShortImportObject;
-use crate::coff_symbols::{ArchiveDemand, ArchiveDemandKind};
 
 /// The broad category of an archive parsing failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

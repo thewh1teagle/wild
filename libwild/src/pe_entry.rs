@@ -1,9 +1,13 @@
 //! MSVC-compatible default PE entry-point selection.
 
-use crate::args::coff::{CoffArgs, Subsystem};
-use crate::error::{Context, Result};
-use crate::{bail, error};
-use object::{Object, ObjectSymbol};
+use crate::args::coff::CoffArgs;
+use crate::args::coff::Subsystem;
+use crate::bail;
+use crate::error;
+use crate::error::Context;
+use crate::error::Result;
+use object::Object;
+use object::ObjectSymbol;
 use std::collections::BTreeSet;
 
 const USER_ENTRIES: [(&[u8], &str, EntryFamily); 4] = [
@@ -126,8 +130,8 @@ fn subsystem_name(subsystem: &Subsystem) -> &'static str {
 mod tests {
     use super::*;
 
-    fn choose(subsystem: Option<Subsystem>, definitions: &[&[u8]]) -> Result<&'static str> {
-        select_executable(subsystem.as_ref(), |name| definitions.contains(&name))
+    fn choose(subsystem: Option<&Subsystem>, definitions: &[&[u8]]) -> Result<&'static str> {
+        select_executable(subsystem, |name| definitions.contains(&name))
     }
 
     #[test]
@@ -141,11 +145,11 @@ mod tests {
     #[test]
     fn subsystem_restricts_the_entry_family() {
         assert_eq!(
-            choose(Some(Subsystem::Console), &[b"main", b"WinMain"]).unwrap(),
+            choose(Some(&Subsystem::Console), &[b"main", b"WinMain"]).unwrap(),
             "mainCRTStartup"
         );
         assert_eq!(
-            choose(Some(Subsystem::Windows), &[b"main", b"WinMain"]).unwrap(),
+            choose(Some(&Subsystem::Windows), &[b"main", b"WinMain"]).unwrap(),
             "WinMainCRTStartup"
         );
     }
@@ -157,7 +161,7 @@ mod tests {
         assert!(ambiguous.contains("`main`"));
         assert!(ambiguous.contains("`wmain`"));
 
-        let missing = choose(Some(Subsystem::Windows), &[b"main"])
+        let missing = choose(Some(&Subsystem::Windows), &[b"main"])
             .unwrap_err()
             .to_string();
         assert!(missing.contains("`WinMain` or `wWinMain`"));
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn non_crt_subsystems_require_an_explicit_entry() {
-        let error = choose(Some(Subsystem::Native), &[b"main"])
+        let error = choose(Some(&Subsystem::Native), &[b"main"])
             .unwrap_err()
             .to_string();
         assert!(error.contains("/SUBSYSTEM:NATIVE"));

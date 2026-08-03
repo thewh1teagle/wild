@@ -7,7 +7,9 @@
 //! `.tls` contribution. Callback records from `.CRT$XL*` are resolved by the
 //! linker before being passed here.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 
 /// Size of `IMAGE_TLS_DIRECTORY64` in bytes.
 pub const IMAGE_TLS_DIRECTORY64_SIZE: u32 = 40;
