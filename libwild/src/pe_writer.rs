@@ -1428,9 +1428,6 @@ fn collect_contributions(
             }
             let name = merged_name(raw_name, args)?;
             let size = u32::try_from(section.size()).context("COFF section too large")?;
-            if size == 0 {
-                continue;
-            }
             let kind = if matches!(
                 class.contents,
                 linker_utils::coff_symbols::SectionContents::UninitializedData
@@ -3215,6 +3212,66 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn zero_sized_local_comdat_relocation_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0; 13], 1);
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 13,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+
+        let prefix = object.add_subsection(object::write::StandardSection::ReadOnlyData, b"a");
+        object.append_section_data(prefix, &[1, 2, 3], 1);
+        let empty = object.add_subsection(object::write::StandardSection::ReadOnlyData, b"z");
+        object.append_section_data(empty, &[], 8);
+        object.section_symbol(empty);
+        let target = object.add_symbol(Symbol {
+            name: b"empty-local".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(empty),
+            flags: object::SymbolFlags::None,
+        });
+        object.add_comdat(object::write::Comdat {
+            kind: object::ComdatKind::NoDuplicates,
+            symbol: target,
+            sections: vec![empty],
+        });
+
+        for (offset, typ) in [
+            (0, object::pe::IMAGE_REL_AMD64_REL32),
+            (4, object::pe::IMAGE_REL_AMD64_SECTION),
+            (8, object::pe::IMAGE_REL_AMD64_SECREL),
+        ] {
+            object
+                .add_relocation(
+                    text,
+                    Relocation {
+                        offset,
+                        symbol: target,
+                        addend: 0,
+                        flags: object::RelocationFlags::Coff { typ },
+                    },
+                )
+                .unwrap();
+        }
+        object.write().unwrap()
+    }
+
     fn guard_metadata_object() -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -3333,6 +3390,36 @@ mod tests {
             i64::try_from(text.address()).unwrap() + 4 + i64::from(displacement)
                 - i64::from(implicit_addend),
             i64::try_from(PeWriterConfig::default().image_base).unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_sized_local_comdat_has_a_real_section_boundary_location() {
+        let bytes = zero_sized_local_comdat_relocation_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"zero-sized-local.exe",
+            Some("entry"),
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+
+        let file = object::File::parse(image.bytes.as_slice()).unwrap();
+        let text = file.section_by_name(".text").unwrap();
+        assert_eq!(
+            &text.data().unwrap()[..12],
+            &[
+                0x08, 0x10, 0x00, 0x00, // REL32: `.rdata + 8`, including COFF's addend.
+                0x02, 0x00, // SECTION: the second output section, `.rdata`.
+                0x00, 0x00, // Padding between the two relocation fields.
+                0x08, 0x00, 0x00, 0x00, // SECREL: byte 8 within `.rdata`.
+            ]
         );
     }
 
