@@ -1,7 +1,6 @@
 # PE/COFF goals 1 and 2 session handoff
 
-Last updated: 2026-08-03 at the current Goal 2 checkpoint. This is the
-continuity document
+Last updated: 2026-08-03 after Goal 2 closeout. This is the continuity document
 for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
@@ -18,9 +17,8 @@ execute it on real Windows in GitHub Actions, compile a minimal Tauri app in deb
 release, then compile and run the real Vibe application in both profiles.
 
 The work is in the user's fork only. Do **not** open a PR. Goal 1 is complete at
-`547c72f309dc8dd73e5a43166e183491138395e7`. Goal 2 remains in progress; its
-current performance checkpoint is
-`8dd69ea6b4adba060782cafbba33bd57b44dee4d`. Exact correctness and interim
+`547c72f309dc8dd73e5a43166e183491138395e7`. Goal 2 is complete for benchmarked
+code `a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`. Exact correctness and bounded
 performance evidence is recorded in `quality-gate.md` and
 `pe-link-bench_001.md`.
 
@@ -35,18 +33,18 @@ Current headline results:
   Wild: it panics after the sidecar returns. A paired `lld-link` build reproduces it.
 - Wild output is deterministic across identical Wild links. Wild and `lld-link` output
   is semantically equivalent for the acceptance corpus but is **not byte identical**.
-- Goal 2 reduced the pinned Vibe release link from the original 617–652 ms
-  warm range to 138–180 ms across 1/2/4/8/10 threads. An independent 30-pair
-  confirmation has Wild faster than `lld-link` at 8 threads (138.2 vs
-  146.2 ms) and 10 threads (138.8 vs 156.3 ms). Lower-thread Vibe results still
-  favor lld.
+- The final pinned Vibe warm sweep measured Wild's best row at 100.356 ms and
+  lld's at 98.909 ms. The direct randomized best-configuration pair measured
+  Wild `/threads:10` at 99.576 ms versus lld `/threads:1` at 103.823 ms, a
+  4.247 ms (4.1%) tool-median difference; paired Wild-minus-lld deltas were
+  -4.084 ± 2.522 ms with 35/50 Wild wins. The sweep residual remains disclosed.
 - The Rust-std link-only reproduction favors Wild at every measured warm
-  1/4/8/10-thread point and advisory-cold 4/8/10. Advisory-cold one-thread
+  1/2/4/8/10-thread point and advisory-cold 2/4/8/10. Advisory-cold one-thread
   Rust std remains slower. Advisory cold is not a global cold-cache claim.
-- Goal 2 is not complete: best-vs-best Vibe remains about 138 versus 103 ms
-  warm and 244 versus 212 ms advisory-cold. The checkpoint used
-  `min_seconds=0` and no CPU affinity on heterogeneous cores, so it must also
-  be rerun with the documented five-second floor and homogeneous pinning.
+- Goal 2 is complete under that direct warm best-versus-best interpretation.
+  Advisory-cold direct tool medians favor lld by 2.801 ms, but paired deltas
+  favor Wild by 3.319 ms (MAD 20.399 ms; 14/24 wins). High-thread Wild RSS
+  remains higher, so the result is not a universal speed or memory claim.
 
 ## Repository and branch state
 
@@ -58,7 +56,7 @@ Current headline results:
 - Remote tracking: `origin/feature/pe-coff-performance`
 - Base `main` at the start/current local main: `8e106f2d`
 - Goal 1 feature range: `9e698d9c..547c72f3`.
-- Goal 2 feature range: `65185605..8dd69ea6`.
+- Goal 2 code feature range: `65185605..a68ba652`.
 - No PR has been opened and none should be opened without an explicit new request.
 - The fork's default branch is `main`. It was temporarily changed to
   `feature/pe-coff-v1` so GitHub could register and dispatch branch-only workflows,
@@ -90,8 +88,15 @@ Important milestone commits:
 - `1c7b0c26` and `2ea4ee1a`: add phase instrumentation used to select work.
 - `ff0b4f34..bc33fb6b`: integrate measured archive, resolution, COMDAT,
   relocation, layout, hashing, lookup, parallelism, and allocator wins.
-- `8dd69ea6`: caches selected-object symbol metadata and is the current
-  benchmarked Goal 2 checkpoint.
+- `8dd69ea6`: caches selected-object symbol metadata at the interim checkpoint.
+- `73ed705d`/`c26319f4`: incrementally lay out the relocation section and avoid
+  a redundant full relocation relayout.
+- `2bd5f06c`/`82a890d5`: speed resolver lookups and reuse selected-object
+  metadata from import resolution.
+- `d2ac1ff3`: flattens COMDAT reachability adjacency.
+- `3960ae2d`: adds direct thread-pair benchmark support.
+- `a68ba652`: overlaps build-ID hashing with output copying and is the exact
+  benchmarked Goal 2 closeout code.
 
 Use `git log --oneline --reverse main..feature/pe-coff-performance` for the
 complete detailed commit history. Many old `codex/*` and `perf/*` worktree
@@ -418,8 +423,8 @@ that this CLI defect belongs to Vibe/Tauri plugin state management, not Wild's P
 The original v1 is usable and accepted, but it is not “as good as Linux Wild” yet.
 Recommended order:
 
-1. Update `quality-gate.md` with paired run `30801348499` and commit/push that final
-   evidence. The fork default branch has already been restored to `main`.
+1. Preserve the exact-SHA Goal 1 and Goal 2 evidence in `quality-gate.md`; the
+   fork default branch has already been restored to `main`.
 2. Preserve the existing correctness gates. Add malformed-image/negative tests when
    touching loader directories; keep real-Windows execution authoritative.
 3. Preserve Goal 2's benchmark protocol and rerun it when changing archive,
@@ -451,10 +456,10 @@ turn “correct” into “byte-identical to lld.”
 ## Safe next-session checklist
 
 ```console
-cd /Users/yqbqwlny/Documents/wild
+cd /home/yakov/Documents/wild
 git status --short --branch
 git log -5 --oneline --decorate
-for id in 30809478091 30809478302 30809478008 30809478031; do
+for id in 30826452916 30826455326 30826457947 30826460336; do
   gh run view "$id" -R thewh1teagle/wild \
     --json status,conclusion,headSha,jobs,url
 done
@@ -462,17 +467,17 @@ done
 
 Then:
 
-- Confirm Goal 1 remains pinned at or after `547c72f3` and Goal 2 at or after
-  `8dd69ea6`; keep benchmark comparisons on the exact recorded binary/corpus.
+- Confirm Goal 1 remains pinned at or after `547c72f3`; attribute Goal 2
+  benchmark claims specifically to code `a68ba652` and its recorded binary.
 - Do not touch untracked `AGENTS.md`.
 - Read `vibe-debug-comparison-diagnostics/binary-comparison.txt` and the corresponding
   release file before making claims about byte identity.
-- Read the checkpoint Goal 2 JSON paths in `quality-gate.md` before making speed or
+- Read the closeout Goal 2 JSON paths in `quality-gate.md` before making speed or
   memory claims.
 - Run format/actionlint checks for any changed workflow or Markdown-adjacent config.
 - Commit only intended tracked files, push the feature branch, and do not open a PR.
 
-## Update 2026-08-03: Goal 1 closeout and Goal 2 checkpoint
+## Historical update 2026-08-03: Goal 1 closeout and Goal 2 checkpoint
 
 This section supersedes the paths, priorities, and "remaining work" above
 where they conflict.
@@ -493,7 +498,7 @@ where they conflict.
   and Tauri
   [30809478031](https://github.com/thewh1teagle/wild/actions/runs/30809478031);
   all passed.
-- Goal 2 reached checkpoint `8dd69ea6`. The 78.1 MB Vibe
+- Goal 2 had reached checkpoint `8dd69ea6`. The 78.1 MB Vibe
   reproduction improved from 617–652 ms warm at 1/2/4/8/10 threads to
   180/152/141/141/138 ms. A separate 30-pair confirmation proves wins over
   `lld-link` at the same 8 and 10-thread settings; it does not prove
@@ -507,9 +512,40 @@ where they conflict.
   High-thread Vibe RSS remains above lld and is an explicit tradeoff.
 - PDB, full CFG/security metadata, LTO, incremental linking and niche
   compatibility remain deferred unchanged as specified in `GOAL.md`.
-- Goal 2 remains open: best-vs-best Vibe is still about 33.5% behind warm and
+- Goal 2 remained open: best-vs-best Vibe was about 33.5% behind warm and
   14.8% behind advisory-cold. The checkpoint's `min_seconds=0`, unpinned runs
   are below the documented authority protocol. Continue optimizing, then rerun
   with homogeneous CPU affinity and the five-second accumulated-time floor.
 - Reading order for a new session: `GOAL.md` → `goal1-gaps.md` →
   `host-tooling.md` → this file → `quality-gate.md` → `feature-matrix.md`.
+
+## Update 2026-08-03: Goal 2 closeout
+
+This update supersedes the historical interim performance status above.
+
+- Goal 2 completed for exact benchmarked code
+  `a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`. The eventual documentation tip
+  is a later evidence-only commit and must not be substituted for that source
+  or binary identity.
+- The final protocol pinned homogeneous CPUs
+  `5,6,7,8,9,15,16,17,18,19`, accumulated at least five seconds per row, and
+  recorded randomized paired latency, MAD, RSS, output validation and Wild
+  determinism. Exact tool/corpus hashes and seven artifacts are in
+  `pe-link-bench_001.md`.
+- The standard warm sweep's independent best medians were Wild 100.356 ms and
+  lld 98.909 ms. The direct best-configuration pair measured Wild
+  `/threads:10` at 99.576 ms and lld `/threads:1` at 103.823 ms, a 4.247 ms
+  (4.1%) tool-median difference. Paired Wild-minus-lld deltas were
+  -4.084 ± 2.522 ms with 35/50 Wild wins. Completion is explicitly bounded to
+  that direct warm
+  authority; cold evidence is mixed and Wild's high-thread RSS is higher.
+- Accepted late work covers incremental relocation-section layout, avoided
+  relocation relayout, foldhash resolver/archive lookup, reuse of import-time
+  selected-object metadata, flat COMDAT adjacency, and overlap of build-ID
+  hashing with output copying. The broad payload-borrow prototype was rejected,
+  so it is not part of the accepted inventory.
+- Exact-SHA native Windows PE run 30826452916, runtime run 30826455326,
+  Tauri run 30826457947 and Vibe run 30826460336 all completed successfully;
+  the Vibe release and debug jobs both passed.
+- PDB, full CFG/security metadata, LTO, incremental linking and niche
+  compatibility remain separate deferred phases as specified in `GOAL.md`.

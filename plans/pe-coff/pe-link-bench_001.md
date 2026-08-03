@@ -124,9 +124,9 @@ The Rust-std corpus is useful for smoke tests and latency. Use a pinned Vibe
 release reproduction, captured from its final executable link, for the
 application-scale result and for conclusions about thread scaling.
 
-## Goal 2 interim checkpoint
+## Historical Goal 2 interim checkpoint
 
-Goal 2's current performance checkpoint is
+The superseded interim performance checkpoint was
 `8dd69ea6b4adba060782cafbba33bd57b44dee4d` (2026-08-03). All numbers below
 come from the JSON files named in this section, not from terminal summaries.
 The benchmarked Wild executable is SHA-256
@@ -226,12 +226,12 @@ The source artifacts are `/tmp/wild-goal2-ruststd-round6.json` and
 all measured thread counts and an advisory-cold win at 4/8/10, not at one
 thread.
 
-### Integrated and rejected work at this checkpoint
+### Integrated and rejected work at the interim checkpoint
 
 Accepted changes include indexed and parallel archive preparation; compact and
 contiguous archive metadata; linear definition deduplication; demand snapshot
 reuse; selected-import, relocation-layout, COMDAT-graph, and selected-symbol
-metadata reuse; borrowed layout/payload inputs; optimized SHA-256; faster map
+metadata reuse; optimized SHA-256; faster map
 and set lookups; parallel relocation application; and mimalloc v2. The exact
 integrated sequence is `65185605..8dd69ea6`.
 
@@ -252,7 +252,7 @@ five-sample one-thread median from 653.6 to 655.0 ms
 measured wins. Optional PDB, CFG/security, LTO, incremental-link, and niche
 compatibility work remains deferred exactly as specified in `GOAL.md`.
 
-### Why Goal 2 remains open
+### Why Goal 2 remained open at that checkpoint
 
 The 8/10-thread Vibe confirmations compare identical `/threads:N` settings and
 prove those narrow wins. The goal's “beat `lld-link`” target is best-vs-best:
@@ -260,5 +260,150 @@ in the complete warm sweep Wild's best median was 138.0 ms at ten threads,
 while lld's was 103.3 ms at one; in the complete advisory-cold sweep Wild's
 best was 243.8 ms at eight, while lld's was 212.3 ms at two. Wild therefore
 remained about 33.5% behind warm and 14.8% behind advisory-cold best-vs-best.
-Further optimization plus a pinned, five-second-floor rerun is required before
-Goal 2 can be marked complete.
+Further optimization plus a pinned, five-second-floor rerun was required before
+Goal 2 could be marked complete.
+
+## Goal 2 authoritative closeout
+
+Goal 2 is complete for benchmarked code commit
+`a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`. A later documentation commit does
+not change the identity of the measured code. Every closeout artifact reports
+`status: pass`; validates AMD64 PE headers, entry point, subsystem and section
+count; and checks two-run Wild byte determinism.
+
+The authority host was Linux 6.17.0 aarch64 with 20 logical CPUs. The pinned
+runs used CPUs `5,6,7,8,9,15,16,17,18,19`, at least 15 samples and five
+accumulated seconds per linker/configuration, three warmups, randomized paired
+execution order, five RSS samples, and excluded compilation. The all-core
+supplement deliberately used no affinity. The measured Wild binary was
+7,450,840 bytes, SHA-256
+`24ec6b7f582d6ce3e31fd0f68114aec9ddf00d535f4015f28a99114ccaae8c27`;
+its embedded version names the repository base and is not the source-revision
+authority. The source revision is the full code SHA above. Ubuntu LLD 18.1.3
+was 5,121,920 bytes, SHA-256
+`f8835e48488195c65fb3dcb946053284ddf6b1369922893785209a9073c4e57b`.
+
+The Vibe corpus remained 51 files and 78,092,087 bytes, manifest SHA-256
+`cce61253001efa22280721ab91b53aa83ae4fff7406c07448af9f50ac1ab51d6`,
+with response-file SHA-256
+`adc5675be472359390b99e36318a93b0839c05126606b315a3416d2089d7de1e`.
+Elapsed columns below are median ± MAD milliseconds and RSS is median MiB.
+
+### Pinned Vibe warm sweep and supplement
+
+| Threads | Wild ms ± MAD | Wild RSS | lld ms ± MAD | lld RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 143.839 ± 1.273 | 147.9 | 98.909 ± 2.688 | 138.8 |
+| 2 | 122.829 ± 2.298 | 174.3 | 111.981 ± 2.119 | 138.9 |
+| 3 | 111.284 ± 1.265 | 195.7 | 120.829 ± 2.403 | 138.7 |
+| 4 | 103.869 ± 1.365 | 212.0 | 118.298 ± 3.921 | 138.7 |
+| 5 | 104.190 ± 1.285 | 230.1 | 123.960 ± 3.339 | 138.5 |
+| 6 | 109.098 ± 2.451 | 223.3 | 127.977 ± 5.509 | 138.3 |
+| 7 | 108.383 ± 3.838 | 231.9 | 128.582 ± 5.878 | 138.2 |
+| 8 | 101.161 ± 2.438 | 233.9 | 130.892 ± 4.518 | 138.1 |
+| 9 | 101.992 ± 2.771 | 240.2 | 127.985 ± 5.317 | 138.0 |
+| 10 | 100.356 ± 1.825 | 237.8 | 133.490 ± 6.206 | 138.3 |
+
+Wild scaled 1.433x from one to ten threads; lld's ten-thread row was 0.741x
+its one-thread result. The independent sweep's best medians leave Wild
+1.447 ms behind lld. The direct randomized comparison of those exact best
+configurations measured Wild `/threads:10` at **99.576 ± 1.178 ms** and
+250.8 MiB versus lld `/threads:1` at **103.823 ± 0.966 ms** and 138.8 MiB:
+a 4.247 ms (4.1%) difference between tool medians. The paired Wild-minus-lld
+delta median was -4.084 ms with 2.522 ms MAD, and Wild won 35/50 blocks. This
+direct best-versus-best comparison is the
+bounded Goal 2 closeout authority; the independent sweep residual is retained
+as a sensitivity result, and no claim is made that Wild wins every thread
+count.
+
+### Advisory cold-input-cache Vibe results
+
+| Threads | Wild ms ± MAD | Wild RSS | lld ms ± MAD | lld RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 308.830 ± 29.638 | 144.6 | 208.002 ± 15.907 | 138.2 |
+| 2 | 264.443 ± 15.227 | 173.8 | 227.364 ± 22.235 | 138.4 |
+| 4 | 207.099 ± 7.912 | 211.7 | 247.394 ± 13.674 | 138.2 |
+| 8 | 215.805 ± 24.957 | 240.1 | 245.726 ± 22.602 | 137.7 |
+| 10 | 201.344 ± 11.053 | 247.8 | 239.989 ± 16.103 | 137.8 |
+
+The sweep's independent best medians favor Wild by 6.658 ms. The direct 10:1
+pair measured Wild 204.166 ± 8.673 ms and lld 201.365 ± 8.745 ms, so the tool
+medians favored lld by 2.801 ms. Blockwise paired deltas instead favored Wild:
+median -3.319 ms, MAD 20.399 ms, and 14/24 Wild wins. The disagreement and
+large dispersion make this mixed evidence. “Cold” here means advisory `POSIX_FADV_DONTNEED` for inputs and
+linker executables, not a global or machine-cold cache; it is not the warm
+completion criterion.
+
+### All-core and Rust-std bounds
+
+The unpinned all-core Vibe warm supplement was:
+
+| Threads | Wild ms ± MAD | Wild RSS | lld ms ± MAD | lld RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 145.479 ± 2.205 | 147.8 | 105.176 ± 0.780 | 138.7 |
+| 2 | 121.585 ± 3.772 | 174.2 | 119.645 ± 5.228 | 138.8 |
+| 4 | 113.262 ± 2.609 | 206.9 | 124.595 ± 4.493 | 138.6 |
+| 8 | 109.178 ± 3.329 | 238.9 | 151.754 ± 12.584 | 138.1 |
+| 10 | 110.205 ± 4.995 | 244.1 | 166.877 ± 11.294 | 137.9 |
+| 20 | 113.330 ± 9.019 | 287.3 | 238.755 ± 20.882 | 137.4 |
+
+It confirms the high-thread direction but is not the affinity-controlled
+authority.
+
+The Rust-std corpus contained 50 files and 32,868,792 bytes, manifest SHA-256
+`65336c4df9cb15676775453780e0f5135491b15ec2e4ff90efd8cdd92c88d617`,
+response-file SHA-256
+`5576b5bea227f80ff3a8270cfa263510e952f8e2fd68962c2b14c4ef7eb6e207`.
+
+| Mode | Threads | Wild ms ± MAD | Wild RSS | lld ms ± MAD | lld RSS |
+|---|---:|---:|---:|---:|---:|
+| Warm | 1 | 9.575 ± 0.299 | 36.1 | 23.552 ± 0.506 | 67.1 |
+| Warm | 2 | 9.271 ± 0.154 | 42.2 | 33.369 ± 0.665 | 67.1 |
+| Warm | 4 | 8.904 ± 0.146 | 51.9 | 42.298 ± 1.317 | 66.8 |
+| Warm | 8 | 9.111 ± 0.250 | 68.0 | 35.873 ± 0.917 | 66.6 |
+| Warm | 10 | 9.251 ± 0.199 | 72.3 | 34.955 ± 0.615 | 66.6 |
+| Advisory cold | 1 | 60.317 ± 4.600 | 35.7 | 51.005 ± 0.833 | 66.9 |
+| Advisory cold | 2 | 48.073 ± 1.461 | 41.8 | 60.623 ± 1.198 | 67.0 |
+| Advisory cold | 4 | 50.966 ± 3.258 | 51.7 | 72.874 ± 3.830 | 66.7 |
+| Advisory cold | 8 | 36.748 ± 1.999 | 65.5 | 65.870 ± 5.897 | 66.3 |
+| Advisory cold | 10 | 36.864 ± 2.010 | 71.6 | 65.043 ± 4.814 | 66.3 |
+
+Wild won every warm row and advisory-cold 2/4/8/10, but not advisory-cold one
+thread.
+
+The source artifacts are:
+
+- `/tmp/wild-goal2-authoritative-vibe-warm-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-vibe-warm-supplement-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-vibe-direct-warm-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-vibe-cold-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-vibe-direct-cold-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-vibe-all-core-warm-a68ba652.json`
+- `/tmp/wild-goal2-authoritative-ruststd-warm-cold-a68ba652.json`
+
+### Integrated and rejected work at closeout
+
+The integrated range is `65185605..a68ba652`. Accepted work includes indexed
+and parallel archive preparation; compact contiguous archive metadata and
+linear definition deduplication; demand snapshots; selected-import,
+relocation-layout, COMDAT-graph and selected-symbol metadata reuse; mimalloc
+v2; optimized SHA-256; faster foldhash lookups; parallel relocation
+application; incremental relocation-section layout and avoided full relayout;
+reuse of selected-object metadata from import resolution; flat COMDAT
+reachability adjacency; and overlap of build-ID hashing with output copying.
+`3960ae2d` added direct thread-pair measurement support but is harness work,
+not a linker speedup.
+
+The interim record's payload-borrow description was too broad: the `284ae85c`
+prototype was not integrated. The accepted
+layout work is specifically relocation-layout analysis reuse plus incremental
+relocation-section layout (`73ed705d`/`c26319f4`). Whole-stage layout rewrites,
+alternate lazy-archive variants, aggressive COMDAT/layout parallel prototypes,
+zero-copy COMDAT keys, and import-record reuse were rejected when neutral,
+regressive or noisy. The old bounded resolver-set experiment is subsumed and
+strengthened by the integrated foldhash/incremental resolver bookkeeping in
+`2bd5f06c`.
+
+Goal 2 is complete only in the documented warm, direct best-versus-best sense.
+The final record preserves the sweep sensitivity, cold disagreement and higher
+Wild RSS rather than generalizing beyond the evidence.

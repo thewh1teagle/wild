@@ -134,15 +134,15 @@ Vibe/Tauri, not Wild. Byte identity is not a goal; loader-visible semantic
 equivalence is. Those historical sizes predate real `/OPT:REF`; the Goal 2
 link-only size/time/RSS evidence below supersedes them for performance claims.
 
-## Goal 2 interim performance checkpoint
+## Historical Goal 2 interim performance checkpoint
 
-Goal 2's current checkpoint is
+Goal 2's superseded interim checkpoint was
 `8dd69ea6b4adba060782cafbba33bd57b44dee4d` (2026-08-03). The Goal 1 native
 Windows runs above remain the loader/runtime acceptance baseline; Goal 2 did
 not change its deferred feature scope. The performance branch preserved the
 focused unit, xwin reference/candidate, formatting, clippy, reproducibility,
 and benchmark-harness self-test gates while optimizing the measured hot paths.
-It is not a Goal 2 closeout.
+It was not a Goal 2 closeout.
 
 The checkpoint benchmark artifacts are:
 
@@ -187,8 +187,63 @@ files and linker executables. Shared libraries and the global page cache were
 not evicted; these results are advisory and are not evidence of a true
 machine-cold cache.
 
-Goal 2 remains open under a best-vs-best interpretation. In the complete Vibe
+Goal 2 remained open under a best-vs-best interpretation. In the complete Vibe
 sweeps, Wild's best warm median was about 138 ms versus lld's 103 ms, and its
 best advisory-cold median was about 244 ms versus lld's 212 ms. Completion
 requires closing that gap and confirming it with CPU affinity and the
 documented five-second sampling floor.
+
+## Goal 2 authoritative closeout
+
+Goal 2 is complete for benchmarked code SHA
+`a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`; the documentation commit that
+records this evidence is intentionally distinct. The seven authoritative JSON
+artifacts and their exact tables are listed in `pe-link-bench_001.md`. All
+report `status: pass`, valid AMD64 output and deterministic Wild output.
+
+The exact-SHA local closeout audit passed 258 `libwild` and 154
+`linker-utils` unit tests (one ignored), 347 integration tests (1,232 ignored),
+and the 2/2 xwin candidate suite, plus formatting, clippy, actionlint, Taplo,
+six-case reproducibility, ten benchmark self-tests, `pe-perf`, Python checks and
+allocator verification. Its independently rebuilt workspace-release Wild hash
+was reported as `4726d40f…fe2f72`; the immutable benchmarked binary remains the
+separate fully recorded `24ec6b7f…e8c27` artifact below.
+
+The affinity-controlled protocol used CPUs
+`5,6,7,8,9,15,16,17,18,19`, at least 15 samples and five accumulated seconds
+per row, three warmups, randomized execution order and five RSS samples.
+Compilation was excluded. The code-revision authority is `a68ba652`, not the
+binary's embedded base-version string. Wild binary SHA-256 was
+`24ec6b7f582d6ce3e31fd0f68114aec9ddf00d535f4015f28a99114ccaae8c27`
+(7,450,840 bytes); Ubuntu LLD 18.1.3 SHA-256 was
+`f8835e48488195c65fb3dcb946053284ddf6b1369922893785209a9073c4e57b`
+(5,121,920 bytes). Vibe corpus/response hashes were
+`cce61253001efa22280721ab91b53aa83ae4fff7406c07448af9f50ac1ab51d6`
+and `adc5675be472359390b99e36318a93b0839c05126606b315a3416d2089d7de1e`;
+Rust-std hashes were
+`65336c4df9cb15676775453780e0f5135491b15ec2e4ff90efd8cdd92c88d617`
+and `5576b5bea227f80ff3a8270cfa263510e952f8e2fd68962c2b14c4ef7eb6e207`.
+
+The standard warm Vibe sweep's best medians were Wild 100.356 ms at ten
+threads and lld 98.909 ms at one, a 1.447 ms sweep residual. The direct
+randomized comparison of those configurations measured Wild
+99.576 ± 1.178 ms versus lld 103.823 ± 0.966 ms, a 4.247 ms (4.1%) difference
+between tool medians. Blockwise, the paired Wild-minus-lld delta median was
+-4.084 ± 2.522 ms (median ± MAD), with Wild winning 35/50 pairs.
+That direct warm best-versus-best result is the bounded completion authority.
+Advisory-cold evidence is explicitly mixed: the sweep best favored Wild by
+6.658 ms. In the noisy direct 10:1 result, tool medians favored lld by 2.801 ms,
+but paired deltas favored Wild: median -3.319 ms, MAD 20.399 ms, with 14/24
+Wild wins. It is not a machine-cold claim. The all-core and Rust-std supplements bound, but do not
+widen, the completion statement.
+
+Exact-SHA native Windows acceptance also passed:
+
+- [PE run 30826452916](https://github.com/thewh1teagle/wild/actions/runs/30826452916),
+  head `a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`: success.
+- [Runtime run 30826455326](https://github.com/thewh1teagle/wild/actions/runs/30826455326),
+  same head: success.
+- [Tauri run 30826457947](https://github.com/thewh1teagle/wild/actions/runs/30826457947),
+  same head: success.
+- [Vibe run 30826460336](https://github.com/thewh1teagle/wild/actions/runs/30826460336),
+  same head: success for both release and debug jobs.

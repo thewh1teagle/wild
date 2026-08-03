@@ -1,8 +1,8 @@
 # PE/COFF feature matrix
 
 Snapshot of completed Goal 1 at commit `547c72f309dc8dd73e5a43166e183491138395e7`
-and the in-progress Goal 2 checkpoint at
-`8dd69ea6b4adba060782cafbba33bd57b44dee4d` (2026-08-03; Goal 1 audited in
+and completed Goal 2 benchmarked code at
+`a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0` (2026-08-03; Goal 1 audited in
 [`goal1-gaps.md`](goal1-gaps.md)). This describes demonstrated behavior, not
 intended future behavior. See
 [`GOAL.md`](../../GOAL.md), [`quality-gate.md`](quality-gate.md), and
@@ -91,8 +91,8 @@ intended future behavior. See
 | Wild deterministic output | **Supported + verified** | Each of six freestanding fixtures links twice with Wild and produces byte-identical output. | Extend determinism gates to larger cached/non-cached links and multiple hosts. |
 | `lld-link` semantic parity | **Supported + verified** | Six normalized differential fixtures pass, and paired debug/release Vibe builds have matching CLI/GUI behavior on Windows. | Keep bounded equivalences explicit and expand the corpus. |
 | Wild versus `lld-link` byte identity | **Not implemented** | Byte identity is not a goal and is disproven: all differential fixtures differ; Vibe differs from offset `0x2`. Legal section/layout choices also differ. | Compare loader-visible semantics and behavior, not producer bytes. |
-| PE linker parallelism | **Performance result** | Indexed archive preparation and relocation application use measured parallel paths. In the interim Vibe warm sweep, Wild scaled from 179.9 ms at one thread to 138.0 ms at ten (1.30x); `lld-link` slowed from 103.3 to 148.0 ms (0.70x). | This unpinned, `min_seconds=0` checkpoint is not the final authority run; preserve deterministic ordering and remeasure under the documented protocol. |
-| Current link speed | **Performance gap** | At `8dd69ea6`, a 30-pair Vibe confirmation measured Wild faster at the same 8/10-thread settings, but best-vs-best warm still favors lld (about 103 ms at one thread versus Wild's 138 ms at ten). Rust-std warm links favored Wild at measured 1/4/8/10-thread points. | Goal 2 remains open. Rerun pinned with the five-second floor and close the best-vs-best Vibe gap before claiming completion. |
+| PE linker parallelism | **Performance result** | In the pinned final Vibe warm sweep Wild scaled from 143.839 ms at one thread to 100.356 ms at ten (1.433x); `lld-link` moved from 98.909 to 133.490 ms (0.741x). | Preserve deterministic ordering and remeasure before generalizing to other hosts or corpora. |
+| Current link speed | **Performance result** | At `a68ba652`, the independent sweep left Wild 1.447 ms behind best-versus-best. In the direct randomized Wild-10/lld-1 authority pair, tool medians were 99.576 versus 103.823 ms (4.247 ms apart); paired Wild-minus-lld deltas were -4.084 ± 2.522 ms with 35/50 wins. Rust-std favored Wild in every warm row. | Goal 2 is complete for this bounded warm direct comparison; cold evidence is mixed and no universal claim is made. |
 | Focused CI and local verification | **Supported + verified** | macOS M4 runs unit, xwin, structural, differential and budget checks; focused Actions run the real Windows loader for core, runtime, Tauri and Vibe tiers. | Preserve fast focused gates and add negative/fuzz/performance jobs separately. |
 
 ## Prioritized next milestones
@@ -104,12 +104,12 @@ with evidence in [`goal1-gaps.md`](goal1-gaps.md).
 option compatibility, real `/OPT:REF`, delay imports, stability/fuzz hardening,
 and manifest embedding all pass local and native Windows acceptance gates.
 
-**Goal 2 is in progress** at checkpoint
-`8dd69ea6b4adba060782cafbba33bd57b44dee4d`: the link-only harness records
-warm/advisory-cold latency, RSS and thread scaling, and Wild has narrow
-same-`/threads` wins at Vibe 8/10 plus the bounded Rust-std wins above. The
-best-vs-best Vibe target is not met, and the checkpoint was unpinned with
-`min_seconds=0`; an authoritative rerun and further optimization remain.
+**Goal 2 is complete** for benchmarked code
+`a68ba65237ea98c29f166f7ee10fb8dfbbb1a5e0`: the affinity-controlled,
+five-second-floor direct warm best-versus-best comparison had tool medians
+4.247 ms apart and a -4.084 ms paired delta median (35/50 Wild wins). The
+independent sweep, advisory-cold disagreement, all-core
+supplement and higher high-thread RSS remain explicit bounds on that claim.
 
 **Deferred final phases (each separate):** PDB emission with debugger
 validation and real `/MAP`; full CFG/`/GUARD:EHCONT`/`/CETCOMPAT` security
