@@ -6,6 +6,7 @@ use anyhow::ensure;
 use object::pe;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::Index;
 
 const MAX_COFF_ALIGNMENT: u32 = 8192;
 const CONTENT_MASK: u32 = pe::IMAGE_SCN_CNT_CODE.0
@@ -63,6 +64,74 @@ pub struct ContributionPlacement {
     pub size: u32,
 }
 
+/// Dense reverse map keyed by caller-assigned contribution IDs.
+///
+/// Gaps remain empty, while lookups avoid the tree walk formerly required for every placement.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContributionPlacements {
+    entries: Vec<Option<ContributionPlacement>>,
+}
+
+impl ContributionPlacements {
+    pub fn insert(
+        &mut self,
+        id: ContributionId,
+        placement: ContributionPlacement,
+    ) -> Result<Option<ContributionPlacement>> {
+        let index = id.0 as usize;
+        if index >= self.entries.len() {
+            let additional = index
+                .checked_add(1)
+                .and_then(|length| length.checked_sub(self.entries.len()))
+                .ok_or_else(|| anyhow::anyhow!("contribution ID range overflow"))?;
+            self.entries
+                .try_reserve(additional)
+                .map_err(|_| anyhow::anyhow!("contribution ID range is too large"))?;
+            self.entries.resize_with(index + 1, || None);
+        }
+        Ok(self.entries[index].replace(placement))
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get(&self, id: &ContributionId) -> Option<&ContributionPlacement> {
+        self.entries.get(id.0 as usize)?.as_ref()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn contains_key(&self, id: &ContributionId) -> bool {
+        self.get(id).is_some()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &ContributionPlacement> {
+        self.entries.iter().filter_map(Option::as_ref)
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut ContributionPlacement> {
+        self.entries.iter_mut().filter_map(Option::as_mut)
+    }
+}
+
+impl Index<&ContributionId> for ContributionPlacements {
+    type Output = ContributionPlacement;
+
+    #[inline]
+    fn index(&self, id: &ContributionId) -> &Self::Output {
+        self.get(id)
+            .unwrap_or_else(|| panic!("no placement for contribution {}", id.0))
+    }
+}
+
+impl Index<ContributionId> for ContributionPlacements {
+    type Output = ContributionPlacement;
+
+    #[inline]
+    fn index(&self, id: ContributionId) -> &Self::Output {
+        &self[&id]
+    }
+}
+
 /// One output PE section after subsection grouping and layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputSection {
@@ -84,7 +153,7 @@ pub struct OutputSection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SectionLayout {
     pub sections: Vec<OutputSection>,
-    pub placements: BTreeMap<ContributionId, ContributionPlacement>,
+    pub placements: ContributionPlacements,
     /// File-aligned end of all headers and section data.
     pub file_size: u32,
     /// Section-aligned exclusive end of the mapped image.
@@ -206,7 +275,7 @@ pub fn layout_sections_borrowed<'a>(
         "first section file offset",
     )?;
     let mut sections = Vec::with_capacity(groups.len());
-    let mut placements = BTreeMap::new();
+    let mut placements = ContributionPlacements::default();
 
     for mut group in groups {
         group.contributions.sort_unstable_by(|left, right| {
@@ -253,15 +322,21 @@ pub fn layout_sections_borrowed<'a>(
                 }
                 ContributionKind::Bss => None,
             };
-            placements.insert(
-                contribution.id,
-                ContributionPlacement {
-                    output_section: section_index,
-                    offset,
-                    rva,
-                    file_offset,
-                    size: contribution.size,
-                },
+            ensure!(
+                placements
+                    .insert(
+                        contribution.id,
+                        ContributionPlacement {
+                            output_section: section_index,
+                            offset,
+                            rva,
+                            file_offset,
+                            size: contribution.size,
+                        },
+                    )?
+                    .is_none(),
+                "duplicate contribution id {}",
+                contribution.id.0
             );
             placed_ids.push(contribution.id);
             virtual_cursor = end;
@@ -493,15 +568,22 @@ pub fn try_insert_relocation_section(
             contributions: vec![contribution.id],
         },
     );
-    layout.placements.insert(
-        contribution.id,
-        ContributionPlacement {
-            output_section,
-            offset: 0,
-            rva: first_shifted_rva,
-            file_offset: Some(relocation_file_offset),
-            size: contribution.size,
-        },
+    ensure!(
+        layout
+            .placements
+            .insert(
+                contribution.id,
+                ContributionPlacement {
+                    output_section,
+                    offset: 0,
+                    rva: first_shifted_rva,
+                    file_offset: Some(relocation_file_offset),
+                    size: contribution.size,
+                },
+            )?
+            .is_none(),
+        "duplicate contribution id {}",
+        contribution.id.0
     );
     layout.file_size = file_size;
     layout.size_of_image = size_of_image;

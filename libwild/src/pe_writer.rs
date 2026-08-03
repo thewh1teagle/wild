@@ -215,6 +215,8 @@ enum Source {
 #[derive(Debug)]
 struct Contribution {
     source: Source,
+    /// Dense identity for real selected-object sections. Synthetic contributions have none.
+    dense_section: Option<pe_ir::SectionId>,
     spec: SectionContribution,
     /// Owned bytes exist only for linker-synthesized sections. Real input sections remain
     /// source-backed until their final output slice is copied and relocated.
@@ -2233,6 +2235,24 @@ fn build_image_with_delay_loads(
     drop(image_copy_phase);
     drop(assemble_image_phase);
 
+    let mut dense_targets_phase =
+        crate::pe_timing_guard!("PE relocations: Build dense section targets");
+    dense_targets_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, contributions.len());
+    let dense_targets = dense
+        .map(|dense| {
+            dense_section_targets(
+                dense,
+                &contributions,
+                &layout,
+                &comdat_redirects,
+                dense_gc.as_ref(),
+            )
+        })
+        .transpose()?;
+    drop(dense_targets_phase);
+
     let mut relocations_phase = crate::pe_timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
     relocations_phase
         .0
@@ -2251,6 +2271,7 @@ fn build_image_with_delay_loads(
         &locations,
         &comdat_redirects,
         dense_gc.as_ref(),
+        dense_targets.as_deref(),
         &definitions,
         &absolute_symbols,
         config.image_base,
@@ -2677,10 +2698,7 @@ fn collect_contributions_with_roots_metadata(
     } else {
         None
     };
-    let dense_gc_view = metadata
-        .dense
-        .zip(dense_gc.as_ref())
-        .map(|(dense, gc)| (&dense.ir, gc));
+    let dense_view = metadata.dense.map(|dense| (&dense.ir, dense_gc.as_ref()));
     let mut contributions_phase = crate::pe_timing_guard!(PE_DETAIL_CONTRIBUTIONS);
     contributions_phase
         .0
@@ -2694,7 +2712,7 @@ fn collect_contributions_with_roots_metadata(
                 input,
                 &comdats,
                 args,
-                dense_gc_view,
+                dense_view,
                 &mut output,
             )?;
         }
@@ -2707,7 +2725,7 @@ fn collect_contributions_with_roots_metadata(
             .par_iter()
             .enumerate()
             .map(|(object_index, input)| {
-                materialize_object_contributions(object_index, input, &comdats, args, dense_gc_view)
+                materialize_object_contributions(object_index, input, &comdats, args, dense_view)
             })
             .collect::<Vec<_>>();
         let object_contributions = object_results
@@ -2763,7 +2781,7 @@ fn materialize_object_contributions(
     input: &crate::coff::CoffObject<'_>,
     comdats: &ComdatResolution,
     args: &crate::args::coff::CoffArgs,
-    dense_gc: Option<(&pe_ir::PeIr<'_>, &pe_gc::GcOutput)>,
+    dense_view: Option<(&pe_ir::PeIr<'_>, Option<&pe_gc::GcOutput>)>,
 ) -> Result<Vec<Contribution>> {
     let mut output = Vec::new();
     materialize_object_contributions_into(
@@ -2771,7 +2789,7 @@ fn materialize_object_contributions(
         input,
         comdats,
         args,
-        dense_gc,
+        dense_view,
         &mut output,
     )?;
     Ok(output)
@@ -2782,7 +2800,7 @@ fn materialize_object_contributions_into(
     input: &crate::coff::CoffObject<'_>,
     comdats: &ComdatResolution,
     args: &crate::args::coff::CoffArgs,
-    dense_gc: Option<(&pe_ir::PeIr<'_>, &pe_gc::GcOutput)>,
+    dense_view: Option<(&pe_ir::PeIr<'_>, Option<&pe_gc::GcOutput>)>,
     output: &mut Vec<Contribution>,
 ) -> Result<()> {
     for section in input.file().sections() {
@@ -2809,7 +2827,7 @@ fn materialize_object_contributions_into(
         if comdats.discarded.contains(&(object_index, section.index())) {
             continue;
         }
-        if let Some((ir, gc)) = dense_gc {
+        let dense_section = if let Some((ir, gc)) = dense_view {
             let dense = ir
                 .section_by_raw(
                     pe_ir::ObjectId::from_u32(
@@ -2819,10 +2837,13 @@ fn materialize_object_contributions_into(
                         .context("raw COFF section index exceeds u32")?,
                 )
                 .context("COFF contribution has no dense section")?;
-            if !gc.is_live(dense) {
+            if gc.is_some_and(|gc| !gc.is_live(dense)) {
                 continue;
             }
-        }
+            Some(dense)
+        } else {
+            None
+        };
         let name = merged_name(raw_name, args)?;
         let size = u32::try_from(section.size()).context("COFF section too large")?;
         let kind = if matches!(
@@ -2847,6 +2868,7 @@ fn materialize_object_contributions_into(
                 object: object_index,
                 section: section.index(),
             },
+            dense_section,
             spec: SectionContribution {
                 // This ID is provisional in parallel object-local vectors. Empty-output-group
                 // filtering below assigns compact, globally ordered IDs before any downstream
@@ -3967,6 +3989,7 @@ fn add_common_symbols(
     }
     contributions.push(Contribution {
         source: Source::Synthetic,
+        dense_section: None,
         spec: SectionContribution {
             id,
             name: b".bss$common".to_vec(),
@@ -3993,6 +4016,7 @@ fn add_synthetic(
     let size = u32::try_from(size).context("synthetic PE section too large")?;
     contributions.push(Contribution {
         source: Source::Synthetic,
+        dense_section: None,
         spec: SectionContribution {
             id,
             name: name.to_vec(),
@@ -4323,54 +4347,88 @@ fn find_local_symbol(
 
 fn dense_section_targets(
     dense: &DenseProductionState<'_>,
+    contributions: &[Contribution],
     layout: &SectionLayout,
-    locations: &LocationMap,
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
 ) -> Result<Vec<Option<DenseSectionTarget>>> {
-    let mut output = Vec::with_capacity(dense.ir.sections.len());
-    for (index, record) in dense.ir.sections.iter().enumerate() {
-        let section = pe_ir::SectionId::from_u32(
-            u32::try_from(index).context("dense section index exceeds u32")?,
-        );
-        let selected = if let Some(gc) = dense_gc {
-            gc.canonical(section)
-                .and_then(|section| dense.ir.sections.get(section.index()))
-        } else {
-            let key = (
-                record.object.index(),
-                object::SectionIndex(record.raw_index as usize),
-            );
-            redirected_location(locations, redirects, key)?.and_then(|((object, raw), _)| {
-                dense
-                    .ir
-                    .section_by_raw(
-                        pe_ir::ObjectId::from_u32(object as u32),
-                        u32::try_from(raw.0).ok()?,
-                    )
-                    .and_then(|section| dense.ir.sections.get(section.index()))
-            })
-        };
-        let Some(selected) = selected else {
-            output.push(None);
+    let mut output = vec![None; dense.ir.sections.len()];
+    for contribution in contributions {
+        let Some(section) = contribution.dense_section else {
             continue;
         };
-        let key = (
-            selected.object.index(),
-            object::SectionIndex(selected.raw_index as usize),
-        );
-        let Some(id) = locations.get(&key) else {
-            output.push(None);
-            continue;
-        };
-        let placement = &layout.placements[id];
-        output.push(Some(DenseSectionTarget {
+        let record = dense
+            .ir
+            .sections
+            .get(section.index())
+            .context("contribution has an invalid dense section")?;
+        let placement = &layout.placements[contribution.spec.id];
+        let target = DenseSectionTarget {
             rva: placement.rva,
             output_section_rva: layout.sections[placement.output_section].rva,
             output_section_index: u16::try_from(placement.output_section + 1)
                 .context("PE section index exceeds u16")?,
-            size: selected.size,
-        }));
+            size: record.size,
+        };
+        let slot = output
+            .get_mut(section.index())
+            .context("contribution dense section is outside target table")?;
+        ensure!(slot.is_none(), "duplicate live dense section contribution");
+        *slot = Some(target);
+    }
+
+    if let Some(gc) = dense_gc {
+        for index in 0..output.len() {
+            let section = pe_ir::SectionId::from_u32(index as u32);
+            let canonical = gc
+                .canonical(section)
+                .context("dense GC has no canonical section target")?;
+            if canonical != section {
+                output[index] = output.get(canonical.index()).copied().flatten();
+            }
+        }
+    } else if !redirects.is_empty() {
+        let mut canonical = (0..output.len())
+            .map(|index| pe_ir::SectionId::from_u32(index as u32))
+            .collect::<Vec<_>>();
+        for (&(from_object, from_raw), &(to_object, to_raw)) in redirects {
+            let from = dense
+                .ir
+                .section_by_raw(
+                    pe_ir::ObjectId::from_u32(from_object as u32),
+                    u32::try_from(from_raw.0).context("redirect source section exceeds u32")?,
+                )
+                .context("COMDAT redirect source has no dense section")?;
+            let to = dense
+                .ir
+                .section_by_raw(
+                    pe_ir::ObjectId::from_u32(to_object as u32),
+                    u32::try_from(to_raw.0).context("redirect target section exceeds u32")?,
+                )
+                .context("COMDAT redirect target has no dense section")?;
+            canonical[from.index()] = to;
+        }
+        for start in 0..canonical.len() {
+            let mut section = canonical[start];
+            for _ in 0..=redirects.len() {
+                let next = canonical[section.index()];
+                if next == section {
+                    canonical[start] = section;
+                    break;
+                }
+                section = next;
+            }
+            ensure!(
+                canonical[section.index()] == section,
+                "cycle in dense COMDAT redirects"
+            );
+        }
+        for index in 0..output.len() {
+            let selected = canonical[index];
+            if selected.index() != index {
+                output[index] = output.get(selected.index()).copied().flatten();
+            }
+        }
     }
     Ok(output)
 }
@@ -4383,15 +4441,13 @@ fn copy_and_apply_relocations(
     locations: &LocationMap,
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
+    dense_targets: Option<&[Option<DenseSectionTarget>]>,
     definitions: &HashMap<Vec<u8>, u64>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     image: &mut [u8],
 ) -> Result<()> {
     validate_object_output_ranges(contributions, layout, image.len())?;
-    let dense_targets = dense
-        .map(|dense| dense_section_targets(dense, layout, locations, redirects, dense_gc))
-        .transpose()?;
     let parallel_image = pe_layout::DisjointOutput::new(image);
     let copy = |contribution: &Contribution| match dense {
         Some(dense) => copy_and_relocate_dense_contribution(
@@ -4401,7 +4457,7 @@ fn copy_and_apply_relocations(
             locations,
             redirects,
             dense_gc,
-            dense_targets.as_deref(),
+            dense_targets,
             definitions,
             absolute_symbols,
             image_base,
@@ -4628,22 +4684,11 @@ fn copy_and_relocate_dense_contribution(
     image_base: u64,
     parallel_image: pe_layout::DisjointOutput<'_>,
 ) -> Result<()> {
-    let Source::Object {
-        object,
-        section: raw_section,
-    } = contribution.source
-    else {
+    let Source::Object { .. } = contribution.source else {
         return Ok(());
     };
-    let object = pe_ir::ObjectId::from_u32(
-        u32::try_from(object).context("PE object index exceeds dense ID range")?,
-    );
-    let section = dense
-        .ir
-        .section_by_raw(
-            object,
-            u32::try_from(raw_section.0).context("raw COFF section index exceeds u32")?,
-        )
+    let section = contribution
+        .dense_section
         .context("real contribution has no dense PE section")?;
     let record = &dense.ir.sections[section.index()];
     let relocations = dense
@@ -5689,6 +5734,7 @@ mod tests {
     fn synthetic_test_contribution(id: u32, name: &[u8], size: u32) -> Contribution {
         Contribution {
             source: Source::Synthetic,
+            dense_section: None,
             spec: SectionContribution {
                 id: ContributionId(id),
                 name: name.to_vec(),
@@ -5708,6 +5754,7 @@ mod tests {
     ) -> Contribution {
         Contribution {
             source: Source::Object { object, section },
+            dense_section: None,
             spec: SectionContribution {
                 id: ContributionId(id),
                 name: b".text".to_vec(),
@@ -5812,6 +5859,7 @@ mod tests {
                     object: 0,
                     section: section_index,
                 },
+                dense_section: None,
                 spec: SectionContribution {
                     id: ContributionId(index as u32),
                     name: b".rdata".to_vec(),
@@ -8665,7 +8713,7 @@ mod tests {
     fn diagnoses_missing_tls_runtime_symbols() {
         let layout = SectionLayout {
             sections: Vec::new(),
-            placements: BTreeMap::new(),
+            placements: linker_utils::pe_sections::ContributionPlacements::default(),
             file_size: 0,
             size_of_image: 0x1000,
         };
@@ -8697,7 +8745,7 @@ mod tests {
                 raw_size: 8,
                 contributions: Vec::new(),
             }],
-            placements: BTreeMap::new(),
+            placements: linker_utils::pe_sections::ContributionPlacements::default(),
             file_size: 8,
             size_of_image: 0x2000,
         };
@@ -9168,7 +9216,7 @@ mod tests {
                 raw_size: 0x200,
                 contributions: Vec::new(),
             }],
-            placements: BTreeMap::new(),
+            placements: linker_utils::pe_sections::ContributionPlacements::default(),
             file_size: 0x600,
             size_of_image: 0x4000,
         };
@@ -9203,7 +9251,7 @@ mod tests {
                 raw_size: 0x200,
                 contributions: Vec::new(),
             }],
-            placements: BTreeMap::new(),
+            placements: linker_utils::pe_sections::ContributionPlacements::default(),
             file_size: 0x600,
             size_of_image: 0x4000,
         };
