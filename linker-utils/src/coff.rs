@@ -320,6 +320,63 @@ mod tests {
     }
 
     #[test]
+    fn applies_every_relocation_kind_with_its_native_field_width() {
+        let mut low_base_inputs = inputs();
+        low_base_inputs.image_base = ImageBase(0x400000);
+        let cases: &[(Amd64RelocationKind, &[u8], &[u8], Amd64RelocationInputs)] = &[
+            (Amd64RelocationKind::Absolute, &[], &[], inputs()),
+            (
+                Amd64RelocationKind::Address64,
+                &(-0x20_i64).to_le_bytes(),
+                &0x1_4000_2000_u64.to_le_bytes(),
+                inputs(),
+            ),
+            (
+                Amd64RelocationKind::Address32,
+                &(-0x20_i32).to_le_bytes(),
+                &0x0040_2000_u32.to_le_bytes(),
+                low_base_inputs,
+            ),
+            (
+                Amd64RelocationKind::Address32NoBase,
+                &(-0x20_i32).to_le_bytes(),
+                &0x2000_u32.to_le_bytes(),
+                inputs(),
+            ),
+            (
+                Amd64RelocationKind::Section,
+                &(-1_i16).to_le_bytes(),
+                &2_u16.to_le_bytes(),
+                inputs(),
+            ),
+            (
+                Amd64RelocationKind::SectionRelative,
+                &(-0x10_i32).to_le_bytes(),
+                &0x10_u32.to_le_bytes(),
+                inputs(),
+            ),
+        ];
+
+        for (kind, initial, expected, inputs) in cases {
+            let mut field = initial.to_vec();
+            field.push(0xa5);
+            apply_amd64_relocation(*kind, &mut field, *inputs).unwrap();
+            assert_eq!(&field[..initial.len()], *expected, "{kind:?}");
+            assert_eq!(field[initial.len()], 0xa5, "{kind:?}");
+        }
+
+        for extra_offset in 0..=5 {
+            let kind = Amd64RelocationKind::Relative { extra_offset };
+            let mut field = (-4_i32).to_le_bytes().to_vec();
+            field.push(0xa5);
+            apply_amd64_relocation(kind, &mut field, inputs()).unwrap();
+            let expected = (0x2020_i32 - 4 - (0x1010 + 4 + i32::from(extra_offset))).to_le_bytes();
+            assert_eq!(&field[..4], expected, "{kind:?}");
+            assert_eq!(field[4], 0xa5, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn rejects_short_fields_without_modifying_them() {
         let mut field = [1, 2, 3];
         let before = field;
@@ -384,6 +441,58 @@ mod tests {
             .to_string()
             .contains("REL32")
         );
+    }
+
+    #[test]
+    fn overflow_errors_name_the_relocation_and_leave_the_field_unchanged() {
+        let cases = [
+            (
+                Amd64RelocationKind::Address64,
+                ImageBase(u64::MAX),
+                vec![1; 8],
+                "ADDR64",
+            ),
+            (
+                Amd64RelocationKind::Address32,
+                ImageBase(0x1_4000_0000),
+                vec![0; 4],
+                "ADDR32",
+            ),
+            (
+                Amd64RelocationKind::Address32NoBase,
+                ImageBase(0),
+                i32::MAX.to_le_bytes().to_vec(),
+                "ADDR32NB",
+            ),
+        ];
+        for (kind, image_base, mut field, diagnostic) in cases {
+            let before = field.clone();
+            let mut relocation_inputs = inputs();
+            relocation_inputs.image_base = image_base;
+            if kind == Amd64RelocationKind::Address32NoBase {
+                relocation_inputs.target = Rva(u32::MAX);
+            }
+            let error = apply_amd64_relocation(kind, &mut field, relocation_inputs).unwrap_err();
+            assert!(
+                error.to_string().contains(diagnostic),
+                "{kind:?}: {error:#}"
+            );
+            assert_eq!(field, before, "{kind:?}");
+        }
+
+        let mut inputs = inputs();
+        inputs.target = Rva(u32::MAX);
+        inputs.place = Rva(0);
+        let mut field = [0_u8; 4];
+        let before = field;
+        let error = apply_amd64_relocation(
+            Amd64RelocationKind::Relative { extra_offset: 0 },
+            &mut field,
+            inputs,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("REL32"));
+        assert_eq!(field, before);
     }
 
     #[test]
