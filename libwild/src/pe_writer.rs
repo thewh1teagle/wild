@@ -24,6 +24,7 @@ use linker_utils::pe_sections::SectionLayout;
 use linker_utils::pe_sections::SectionLayoutOptions;
 use linker_utils::pe_sections::directory_range_for_section;
 use linker_utils::pe_sections::layout_sections_borrowed;
+use linker_utils::pe_sections::try_insert_relocation_section;
 use object::Object;
 use object::ObjectComdat;
 use object::ObjectSection;
@@ -3174,13 +3175,15 @@ fn converge_relocation_layout(
     config: PeWriterConfig,
     mut relocation_rvas: impl FnMut(&SectionLayout) -> Result<Vec<u32>>,
 ) -> Result<(SectionLayout, Option<ContributionId>, bool, usize)> {
+    let mut initial_rvas = relocation_rvas(&layout)?;
     let initial =
-        build_amd64_base_relocation_table(relocation_rvas(&layout)?, layout.size_of_image)
+        build_amd64_base_relocation_table(initial_rvas.iter().copied(), layout.size_of_image)
             .context("failed to build PE base relocation table")?;
     if initial.is_empty() {
         return Ok((layout, None, false, 0));
     }
 
+    let initial_layout_options = section_layout_options(layout.sections.len(), config)?;
     let reloc_id = add_synthetic(
         contributions,
         b".reloc",
@@ -3190,6 +3193,44 @@ fn converge_relocation_layout(
     .expect("non-empty relocation data creates a contribution");
     let mut expected_size = initial.len();
     let mut relayouts = 0;
+
+    let relocation_spec = &contributions
+        .iter()
+        .find(|contribution| contribution.spec.id == reloc_id)
+        .expect("synthetic relocation contribution remains present")
+        .spec;
+    if let Some(insertion) =
+        try_insert_relocation_section(&mut layout, relocation_spec, initial_layout_options)?
+    {
+        for rva in &mut initial_rvas {
+            if *rva >= insertion.first_shifted_rva {
+                *rva = rva
+                    .checked_add(insertion.rva_delta)
+                    .context("relocation RVA overflow")?;
+            }
+        }
+        let data = build_amd64_base_relocation_table(initial_rvas, layout.size_of_image)
+            .context("failed to build PE base relocation table")?;
+        if data.len() == expected_size {
+            let contribution = contributions
+                .iter_mut()
+                .find(|contribution| contribution.spec.id == reloc_id)
+                .expect("synthetic relocation contribution remains present");
+            contribution.data = data;
+            return Ok((layout, Some(reloc_id), true, 0));
+        }
+
+        // This cannot happen when the helper's page-alignment predicates hold,
+        // but retain the bounded full-layout convergence as a defensive path.
+        expected_size = data.len();
+        let contribution = contributions
+            .iter_mut()
+            .find(|contribution| contribution.spec.id == reloc_id)
+            .expect("synthetic relocation contribution remains present");
+        contribution.spec.size =
+            u32::try_from(expected_size).context("base relocation table too large")?;
+        contribution.data.resize(expected_size, 0);
+    }
 
     loop {
         let relayout_phase = crate::timing_guard!(PE_DETAIL_LAYOUT_RELAYOUT);
@@ -3234,18 +3275,26 @@ fn make_layout(contributions: &[Contribution], config: PeWriterConfig) -> Result
         .map(|c| c.spec.name.split(|b| *b == b'$').next().unwrap())
         .collect::<HashSet<_>>()
         .len();
-    ensure!(u16::try_from(section_count).is_ok(), "too many PE sections");
-    let headers = 0x80 + 4 + 20 + 240 + u32::try_from(section_count).unwrap() * 40;
+    let options = section_layout_options(section_count, config)?;
     let layout = layout_sections_borrowed(
         contributions.iter().map(|contribution| &contribution.spec),
-        SectionLayoutOptions {
-            headers_size: headers,
-            section_alignment: config.section_alignment,
-            file_alignment: config.file_alignment,
-        },
+        options,
     )
     .context("failed to lay out PE sections")?;
     Ok(layout)
+}
+
+fn section_layout_options(
+    section_count: usize,
+    config: PeWriterConfig,
+) -> Result<SectionLayoutOptions> {
+    ensure!(u16::try_from(section_count).is_ok(), "too many PE sections");
+    let headers = 0x80 + 4 + 20 + 240 + u32::try_from(section_count).unwrap() * 40;
+    Ok(SectionLayoutOptions {
+        headers_size: headers,
+        section_alignment: config.section_alignment,
+        file_alignment: config.file_alignment,
+    })
 }
 
 fn source_locations(
@@ -4423,7 +4472,7 @@ mod tests {
     }
 
     #[test]
-    fn relocation_layout_needs_one_pass_when_pages_shift_whole() {
+    fn relocation_layout_inserts_reloc_without_a_full_relayout() {
         let config = PeWriterConfig::default();
         let mut contributions = vec![
             synthetic_test_contribution(0, b".text", 8),
@@ -4447,7 +4496,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(relayouts, 1);
+        assert_eq!(relayouts, 0);
         assert_eq!(reloc_id, Some(ContributionId(2)));
         assert!(has_relocations);
         let data = &contributions[2].data;
