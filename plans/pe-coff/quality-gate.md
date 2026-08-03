@@ -17,13 +17,14 @@ cargo +1.95.0 test -p linker-utils -p libwild \
 actionlint .github/workflows/pe-coff.yml .github/workflows/pe-runtime.yml \
   .github/workflows/pe-tauri.yml .github/workflows/pe-vibe.yml
 taplo check .typos.toml Cargo.toml wild/Cargo.toml libwild/Cargo.toml \
-  linker-utils/Cargo.toml
+  linker-utils/Cargo.toml fuzz/Cargo.toml
 uv run plans/pe-coff/pe-repro_001.py --self-test
 uv run plans/pe-coff/pe-repro_001.py --wild target/debug/wild
 uv run plans/pe-coff/pe-perf_001.py --wild-budget-seconds 30
 ```
 
-The Rust unit run executes 223 `libwild` tests and 137 `linker-utils` tests;
+The Goal 1 Rust unit run executes 244 `libwild` tests and 144 `linker-utils`
+tests;
 one opt-in local xwin archive probe remains ignored. The reproducibility matrix
 links all six freestanding fixtures with `lld-link` and twice with Wild, checks
 the bounded PE-layout equivalences documented in `pe-repro_001.md`, and passes
@@ -32,7 +33,8 @@ all semantic and byte-determinism checks. The performance probe passes its
 times of 0.98 seconds for Wild and 0.18 seconds for `lld-link`. This is a
 correctness gate, not evidence that the experimental PE linker is faster.
 
-The full xwin-backed candidate command also passes at `a242d132`:
+The full xwin-backed candidate command also passes at
+`547c72f309dc8dd73e5a43166e183491138395e7`:
 
 ```console
 cargo +1.95.0 build -p wild-linker --no-default-features --features pe
@@ -42,10 +44,25 @@ WILD_PE_LINKER_FULL=/absolute/path/to/link.exe \
 ```
 
 `link.exe` above is a symlink to the freshly built `target/debug/wild`; the test
-links identical C, C++, DLL, Rust-std, and TLS inputs with `lld-link` and Wild.
-macOS validates their PE structure; execution is covered by Windows below.
+links identical C, C++, DLL, Rust-std, TLS, ordinal, forwarder, delay-import
+and manifest inputs with `lld-link` and Wild. Non-Windows hosts validate PE
+structure; execution is covered by Windows below.
 
 ## Real Windows x86-64 verification
+
+Goal 1 closeout at exact commit
+`547c72f309dc8dd73e5a43166e183491138395e7` passed all four authoritative
+workflows:
+
+- [Runtime run 30809478091](https://github.com/thewh1teagle/wild/actions/runs/30809478091): full C/C++/DLL/Rust/TLS corpus plus ordinal-only imports,
+  forwarded exports, delay loading with unwind metadata, embedded GUI manifests
+  and malformed-image checks.
+- [PE run 30809478302](https://github.com/thewh1teagle/wild/actions/runs/30809478302): macOS structure and native Windows execution jobs.
+- [Tauri run 30809478031](https://github.com/thewh1teagle/wild/actions/runs/30809478031): debug and release application acceptance.
+- [Vibe run 30809478008](https://github.com/thewh1teagle/wild/actions/runs/30809478008): paired Wild/`lld-link` debug and release builds, PE checks,
+  sidecars and native GUI behavior.
+
+The earlier evidence below remains useful historical coverage.
 
 - Focused freestanding/TLS workflow: run
   [30787127729](https://github.com/thewh1teagle/wild/actions/runs/30787127729),
@@ -77,21 +94,22 @@ macOS validates their PE structure; execution is covered by Windows below.
 ## Local Linux aarch64 verification (current host, 2026-08-03)
 
 The same local gates were re-verified on an Ubuntu aarch64 machine at commit
-`f2392c1a` after the setup documented in `host-tooling.md` (LLVM 18.1.3, the
+`547c72f309dc8dd73e5a43166e183491138395e7` after the setup documented in
+`host-tooling.md` (LLVM 18.1.3, the
 same major version as the macOS evidence):
 
 - fmt, clippy (`pe` feature), actionlint, and taplo gates pass.
 - `cargo +1.95.0 test -p linker-utils -p libwild --no-default-features
-  --features pe`: 223 + 137 tests pass (1 opt-in xwin probe ignored), matching
-  the macOS counts. Requires `clang-format` installed.
+  --features pe`: 244 + 144 tests pass (1 opt-in xwin probe ignored). Requires
+  `clang-format` installed.
 - `pe-repro_001.py --wild target/debug/wild`: all six fixtures are
   byte-deterministic across Wild links and semantically equivalent to
   `lld-link`.
 - `pe-perf_001.py --wild-budget-seconds 30`: pass; Wild/lld complete
   compile+link ratio ≈ 3.3× on this 20-core host (correctness budget only).
-- Known gap: `wild/tests/windows_pe_runtime.rs` is cfg-gated to Windows/macOS
-  and compiles to a no-op skip on Linux even though this host satisfies its
-  capability probe. See `host-tooling.md` and `goal1-gaps.md`.
+- The full `windows_pe_runtime.rs` reference/candidate corpus runs on Linux
+  with xwin and passes both tests; native execution remains authoritative in
+  the workflows above.
 
 ## Paired Vibe Wild-versus-lld-link control
 
@@ -113,5 +131,5 @@ Windows job builds the same pinned Vibe revision
 
 Identical behavior from the lld control confirms the CLI defect belongs to
 Vibe/Tauri, not Wild. Byte identity is not a goal; loader-visible semantic
-equivalence is. The size gap is consistent with `/OPT:REF`/`ICF` being no-ops
-in Wild (see `goal1-gaps.md`).
+equivalence is. Those historical sizes predate real `/OPT:REF`; Goal 2 will
+capture new link-only size/time/RSS baselines before making performance claims.

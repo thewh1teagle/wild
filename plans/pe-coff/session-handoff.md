@@ -1,6 +1,7 @@
 # PE/COFF v1 session handoff
 
-Last updated: 2026-08-03. This is the continuity document for a new agent session.
+Last updated: 2026-08-03 after Goal 1 closeout. This is the continuity document
+for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
 current-state summary.
@@ -15,9 +16,9 @@ usable x86-64 Windows PE/COFF linker**, validate it locally from an Apple-silico
 execute it on real Windows in GitHub Actions, compile a minimal Tauri app in debug and
 release, then compile and run the real Vibe application in both profiles.
 
-The work is in the user's fork only. Do **not** open a PR. The core goal is complete by
-the evidence at commit `b5dd7b19`; the stronger paired Wild-versus-`lld-link` Vibe
-control also passed at `52aeac2d`.
+The work is in the user's fork only. Do **not** open a PR. Goal 1 is complete at
+`547c72f309dc8dd73e5a43166e183491138395e7`; the exact native closeout evidence
+is recorded in `quality-gate.md`. Goal 2 starts next on a new branch.
 
 Current headline results:
 
@@ -40,12 +41,10 @@ Current headline results:
 - Fork/`origin`: `https://github.com/thewh1teagle/wild`
 - Upstream: `https://github.com/wild-linker/wild.git`
 - Branch: `feature/pe-coff-v1`
-- Current branch tip when this document was created: `52aeac2d`
+- Goal 1 closeout tip: `547c72f309dc8dd73e5a43166e183491138395e7`
 - Remote tracking: `origin/feature/pe-coff-v1`
 - Base `main` at the start/current local main: `8e106f2d`
-- Feature range: `9e698d9c..52aeac2d`
-- Approximate branch size at `52aeac2d`: 75 changed files, 28,785 insertions, 8
-  deletions relative to `main` (before this handoff file).
+- Goal 1 feature range: `9e698d9c..547c72f3`.
 - No PR has been opened and none should be opened without an explicit new request.
 - The fork's default branch is `main`. It was temporarily changed to
   `feature/pe-coff-v1` so GitHub could register and dispatch branch-only workflows,
@@ -71,6 +70,9 @@ Important milestone commits:
   inspection, CLI comparison, and GUI comparison.
 - `52aeac2d`: guarantees fresh paired links by explicitly deleting the exact cached
   `vibe.exe` after Cargo's package-scoped clean proved insufficient.
+- `547c72f3`: closes Goal 1 with option compatibility, real `/OPT:REF`, delay
+  imports and unwind records, stability/fuzz coverage, ordinal/forwarder and
+  malformed-image fixtures, and manifest embedding.
 
 Use `git log --oneline --reverse main..feature/pe-coff-v1` for the complete detailed
 commit history. Many old `codex/*` worktree branches still exist; they are historical
@@ -114,9 +116,9 @@ Explicitly out of v1:
 - Complete `link.exe` or `lld-link` option parity, every Windows SDK/CRT version, PDB
   tooling parity, and the production/performance maturity of Linux Wild.
 
-Some `linker-utils` modules contain useful validated builders (for example delay
-imports) beyond what the current end-to-end corpus exercises. Do not infer that the
-existence of a helper equals full driver/writer support.
+Format helpers are claimed end-to-end only where the feature matrix records an
+integrated driver/writer path and acceptance evidence. Delay imports now meet that
+bar; other standalone helpers do not gain support status merely by existing.
 
 ## Implementation architecture
 
@@ -436,15 +438,16 @@ turn “correct” into “byte-identical to lld.”
 cd /Users/yqbqwlny/Documents/wild
 git status --short --branch
 git log -5 --oneline --decorate
-gh run view 30801348499 -R thewh1teagle/wild \
-  --json status,conclusion,headSha,jobs,url
-gh run download 30801348499 -R thewh1teagle/wild \
-  --dir /tmp/wild-vibe-30801348499
+for id in 30809478091 30809478302 30809478008 30809478031; do
+  gh run view "$id" -R thewh1teagle/wild \
+    --json status,conclusion,headSha,jobs,url
+done
 ```
 
 Then:
 
-- Confirm the branch is still `feature/pe-coff-v1` at or after `52aeac2d`.
+- Confirm Goal 1 remains pinned at or after `547c72f3`; start Goal 2 on a new
+  performance branch from that baseline.
 - Do not touch untracked `AGENTS.md`.
 - Read `vibe-debug-comparison-diagnostics/binary-comparison.txt` and the corresponding
   release file before making claims about byte identity.
@@ -453,7 +456,7 @@ Then:
 - Run format/actionlint checks for any changed workflow or Markdown-adjacent config.
 - Commit only intended tracked files, push the feature branch, and do not open a PR.
 
-## Update 2026-08-03 (later session): new host, new goal structure
+## Update 2026-08-03: Goal 1 closeout and next branch
 
 This section supersedes the paths, priorities, and "remaining work" above
 where they conflict.
@@ -461,23 +464,22 @@ where they conflict.
 - Development moved from the macOS M4 to a Linux aarch64 workstation at
   `/home/yakov/Documents/wild` (20 cores, 121 GB RAM). Setup, quirks
   (clang-cl/lld-link wrapper scripts, rustup override, clang-format), and full
-  gate verification are in `host-tooling.md`. All local quality gates pass on
-  this host at `f2392c1a`; only the xwin-backed
-  `wild/tests/windows_pe_runtime.rs` remains cfg-gated to Windows/macOS.
-- `quality-gate.md` now records the paired Vibe control run `30801348499`
-  (the item 1 recommended above) and the Linux host verification.
-- `GOAL.md` was restructured into two sequential goals plus deferred phases:
-  Goal 1 = production-usable and stable release-mode linking on the current
-  branch (option compatibility sweep, real `/OPT:REF`, delay imports,
-  stability/fuzz hardening, manifest embedding — in that order); Goal 2 =
-  performance/parallelism on a new branch, profile-first; deferred to
-  separate final phases: PDB, full CFG/security metadata, LTO, incremental
-  linking, niche compatibility.
-- A four-subagent codebase audit produced `goal1-gaps.md` with file:line
-  evidence for each gap. Headline corrections to intuition: `/OPT:REF`/`ICF`
-  are pure no-ops (explains the Wild-versus-lld size gap); unknown options
-  are fatal so stock CMake/MSBuild builds cannot link yet; delay imports have
-  a finished, tested format layer awaiting only driver/resolver/writer
-  plumbing; PDB and full CFG are large and deliberately deferred.
+  gate verification are in `host-tooling.md`. All local quality gates and the
+  full xwin reference/candidate corpus pass at Goal 1 closeout.
+- Goal 1 completed at `547c72f309dc8dd73e5a43166e183491138395e7`.
+  The option sweep, real `/OPT:REF`, delay imports with unwind metadata,
+  stability/fuzz/negative-loader coverage, and embedded manifests are all
+  implemented and re-audited.
+- Exact native evidence on that SHA is runtime
+  [30809478091](https://github.com/thewh1teagle/wild/actions/runs/30809478091),
+  PE [30809478302](https://github.com/thewh1teagle/wild/actions/runs/30809478302),
+  Vibe [30809478008](https://github.com/thewh1teagle/wild/actions/runs/30809478008),
+  and Tauri
+  [30809478031](https://github.com/thewh1teagle/wild/actions/runs/30809478031);
+  all passed.
+- Goal 2 is next on a new branch. Profile link-only cold/warm time, peak RSS
+  and thread scaling against `lld-link` before changing hot stages. PDB, full
+  CFG/security metadata, LTO, incremental linking and niche compatibility
+  remain deferred as specified in `GOAL.md`.
 - Reading order for a new session: `GOAL.md` → `goal1-gaps.md` →
   `host-tooling.md` → this file → `quality-gate.md` → `feature-matrix.md`.

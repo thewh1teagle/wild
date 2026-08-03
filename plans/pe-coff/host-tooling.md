@@ -24,6 +24,7 @@ Verified working hosts so far:
 | `uv` | runs the `plans/pe-coff/*.py` gates | |
 | `actionlint` | workflow lint gate | |
 | `taplo` | TOML lint gate | |
+| `cargo-fuzz` | bounded and sustained COFF/archive parser fuzzing | install with `cargo install cargo-fuzz --locked` |
 | `gh` (authenticated) | dispatching and downloading the `pe-*.yml` Actions runs | account needs access to `thewh1teagle/wild` |
 
 ## Install per host
@@ -36,6 +37,7 @@ rustup toolchain install nightly 1.94.0 1.95.0 --component clippy,rustfmt
 rustup target add x86_64-pc-windows-msvc
 rustup target add x86_64-pc-windows-msvc --toolchain 1.95.0
 cargo install xwin taplo-cli --locked
+cargo install cargo-fuzz --locked
 xwin --accept-license splat --output ~/.xwin
 go install github.com/rhysd/actionlint/cmd/actionlint@latest   # or download release binary
 curl -LsSf https://astral.sh/uv/install.sh | sh                # if uv missing
@@ -77,6 +79,7 @@ rustup toolchain install nightly 1.94.0 1.95.0 --component clippy,rustfmt
 rustup target add x86_64-pc-windows-msvc
 rustup target add x86_64-pc-windows-msvc --toolchain 1.95.0
 cargo install xwin --locked
+cargo install cargo-fuzz --locked
 xwin --accept-license splat --output ~/.xwin
 ```
 
@@ -121,8 +124,11 @@ After the installs and fixes above, this host passes every local gate from
 - `cargo +nightly fmt --all -- --check` — pass.
 - `cargo +1.94.0 clippy` with the `pe` feature — pass.
 - `cargo +1.95.0 test -p linker-utils -p libwild --no-default-features
-  --features pe` — 223 + 137 tests pass (1 opt-in xwin probe ignored), matching
-  the recorded macOS counts. Requires `clang-format` installed.
+  --features pe` — 244 + 144 tests pass (1 opt-in xwin probe ignored).
+  Requires `clang-format` installed.
+- `cargo +nightly fuzz run coff_parsers -- -runs=10000` — bounded parser
+  smoke passes; generated corpus/artifact files remain ignored or outside the
+  checked-in seed directory.
 - `actionlint` and `taplo` gates — pass.
 - `uv run plans/pe-coff/pe-repro_001.py --wild target/debug/wild` — all six
   fixtures byte-deterministic across Wild links and semantically equivalent to
@@ -132,16 +138,11 @@ After the installs and fixes above, this host passes every local gate from
   machine (versus ≈ 5.5× recorded on the M4). Still a correctness budget, not a
   speed claim.
 
-Known gap: the full xwin-backed integration suite in
-`wild/tests/windows_pe_runtime.rs` is compiled only for `windows` and macOS
-hosts; on Linux a placeholder test at the end of the file prints "skipped" and
-passes vacuously. The capability check itself (clang-cl, lld-link,
-llvm-readobj, rustc, complete `~/.xwin` with `crt/` and `sdk/`) fully resolves
-on this host, so extending the module's `cfg` to include Linux is a small,
-worthwhile change (the macOS-only `/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`
-compile flag may need to apply on Linux too, for the same clang-versus-xwin-STL
-skew reason). Until that lands, native-Windows CI plus the Python differential
-gates remain the authority, exactly as on macOS.
+The full xwin-backed integration suite in `wild/tests/windows_pe_runtime.rs`
+now runs on Linux. At Goal 1 closeout it passes the complete lld/Wild corpus
+and malformed-image checks locally. Native-Windows CI remains authoritative
+for execution, while Linux covers compilation, loader-visible structure,
+delay-unwind inspection and semantic comparison.
 
 ## Host caveats
 
