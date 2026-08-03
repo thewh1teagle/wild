@@ -1,10 +1,152 @@
-# PE/COFF goals 1 and 2 session handoff
+# PE/COFF goals 1 through 3 session handoff
 
-Last updated: 2026-08-03 after Goal 2 closeout. This is the continuity document
+Last updated: 2026-08-03 at the stopped Goal 3 native-Windows checkpoint. This is the continuity document
 for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
 current-state summary.
+
+## Update 2026-08-03: native Windows Goal 3 checkpoint
+
+This is the current resume point and supersedes older host, branch, and priority
+instructions below where they conflict. The user stopped the optimization session
+before authoritative Goal 3 baselines or linker-code changes were made.
+
+### Current repository state
+
+- Native workspace: `C:\Users\user1\Documents\wild` on Windows 11 x86-64.
+- Branch: `feature/pe-coff-windows-performance`.
+- Current tip before this handoff update: `209f8e67`.
+- The branch is based on completed Goal 2 tip `fa49995a`; linker code is still the
+  Goal 2 code. Goal 3 has changed only plans, benchmark, and corpus tooling so far.
+- Do not open a PR. The user requested that this checkpoint be committed and pushed
+  to `origin/feature/pe-coff-windows-performance`.
+- Goal 3 is **not complete**. No authoritative Goal 3 baseline or optimization claim
+  exists yet.
+
+Goal 3 commits before this handoff:
+
+- `e36f431f`: defines the native Windows performance goal.
+- `db91b464`: adds the native Windows benchmark harness.
+- `a9686abb`: adds selective Rust final-binary `/reproduce` capture.
+- `6fbaf8bd`: adds safe short-path archive expansion and replay tooling.
+- `209f8e67`: fixes native Wild version metadata probing.
+
+Read [`windows-native-performance.md`](windows-native-performance.md) for the protocol
+and [`tools/README.md`](tools/README.md) for capture/replay usage. The completion bar
+in `GOAL.md` is a Wild/lld geometric-mean win of at least 20% across Rust std,
+ripgrep, rust-analyzer, and uv, individual Wild wins on uv and rust-analyzer, no
+unaccepted primary-corpus regression above 3%, and green correctness, determinism,
+native execution, and bounded-memory evidence.
+
+### Windows host and installed tools
+
+- AMD Ryzen 5 4500U, 6 physical/logical cores, approximately 16 GB RAM.
+- Windows 11 (`10.0.26200` as recorded by the harness); Balanced is the only exposed
+  power scheme.
+- Visual Studio 2022 17.14, MSVC 14.44, Windows SDK 10.0.26100.
+- LLVM 22.1.8 in `C:\Program Files\LLVM\bin`.
+- Rust 1.95.0, 1.94.0, and nightly; NASM 3.02; WPR/WPA/xperf; `uv` installed.
+- Nothing else was identified as required. Ask before installing additional tools.
+
+### Completed native harness and corpus tooling
+
+`plans/pe-coff/pe-link-bench_001.py` now uses native Win32 process creation: it starts
+the linker suspended, applies affinity before resume, and records wall/user/kernel
+time plus peak working set. Windows warm-cache runs, randomized pairing, 1--6 thread
+sweeps, validation, determinism, JSON output, Program Files LLVM discovery, and
+Wild/lld metadata probing are implemented. Windows cold-cache requests are refused
+because the harness cannot make a defensible global cold-cache claim.
+
+Verification completed at this checkpoint:
+
+- 20 Windows harness self-tests pass.
+- Ruff lint and formatting checks pass.
+- Capture/replay tooling tests preserve response-file bytes exactly, including LF and
+  quoting; path-length, traversal, destination, and response-count guards pass.
+- A live fixture replays with both lld and Wild and executes with the expected output.
+- `cargo +1.95.0 test -p linker-utils -p libwild --no-default-features --features pe`
+  ran 258 tests: 251 passed. The seven failures were checkout-policy issues from
+  system `core.autocrlf=true` and Unix path assumptions, not PE logic. The focused
+  COFF argument set passed 39/39. Use a clean LF worktree for a final full gate.
+
+The Windows release linker used for smoke work is
+`target\release\wild.exe`, 7,937,536 bytes, SHA-256
+`AC678E13CF035F6D857C77C4FD4A884D08F3170B73ACE9B9B7D4B918B4054122`.
+Record the exact source commit separately because its embedded version reports the
+older base revision with `-modified`.
+
+### Corpus checkpoint
+
+Ripgrep is ready:
+
+- Release 15.2.0, source commit
+  `e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`.
+- Archive:
+  `C:\Users\user1\Documents\wild-pe-corpora\captures\ripgrep-15.2.0\e89fff89ac9a\ripgrep-rg-release-a4c4460be04a2af7\link-repro.tar`.
+- Size 92,064,256 bytes; SHA-256
+  `2BA9666315A5BE7F15A875BCD7056FFF930AE78279CBE82830738919EE48B93C`.
+- Preferred retained short replay root:
+  `C:\wr3\r-2ba9666315a5be7f\link-repro`.
+- Both linkers replay successfully and Wild's output runs as ripgrep 15.2.0.
+
+Rust-analyzer capture finished immediately before the stop request, but extraction
+and replay validation did not finish:
+
+- Release tag `2026-08-03`, source commit
+  `b54a82b321c9617c5cf0b07ac0f12c08f7bc5902`.
+- Archive:
+  `C:\wc\captures\captures\rust-analyzer-2026-08-03\b54a82b321c9\rust-analyzer-rust-analyzer-release-f56a8e08b5edd2d7\link-repro.tar`.
+- Size 421,525,504 bytes; SHA-256
+  `576BBCCEE34A48A06B9D7699A290EC9E15ED833D203A94A138D33DE1DECD553A`.
+- Next session must expand it under a short fresh root with
+  `Expand-LldRepro.ps1`, replay both linkers, run the produced executable, and retain
+  the replay JSON before treating it as ready.
+
+uv is incomplete:
+
+- Release 0.12.1, source commit
+  `329541a503de8a4d9bb021814f9c0875efe033c8`.
+- Source checkout:
+  `C:\Users\user1\Documents\wild-pe-corpora\sources\uv-0.12.1`.
+- Its final fat-LTO rustc process was deliberately terminated at the user's request.
+  No complete archive was produced. Re-run the selective final-binary capture; the
+  existing Cargo target cache should make the retry cheaper.
+
+Several fixture archives exist under
+`C:\Users\user1\Documents\wild-pe-corpora\captures\wild-corpus-fixture`, but a
+single immutable representative Rust-std primary corpus still needs to be selected,
+validated, and recorded. Do not silently average multiple fixture attempts.
+
+### Measurements so far are smoke-only
+
+- A tiny hello corpus under load measured Wild around 53--57 ms and lld around
+  94--100 ms across the 1--6 thread smoke; it is not authoritative.
+- A one-sample ripgrep replay under simultaneous compilation measured Wild
+  1058.467 ms versus lld 1166.440 ms, with peak RSS 77.8 MiB versus 100.8 MiB.
+  The JSON is `C:\wc\rg-15.2.0\harness-smoke.json`. It proves harness operation,
+  not a performance claim.
+- Preliminary `/time` observations were also taken while compiles were active and
+  were inconsistent. Do not use them to choose or justify an optimization.
+
+### Exact next-session order
+
+1. Confirm there are no background Cargo/rustc jobs and the machine is otherwise
+   quiet. At this checkpoint all capture subagents were stopped and no
+   `cargo.exe`, `rustc.exe`, or `rustup.exe` remained.
+2. Expand and fully validate rust-analyzer, retry uv capture, and select the immutable
+   Rust-std corpus. Keep all replay roots short.
+3. Build and hash Wild from the exact pre-optimization source, then run sequential
+   warm 1--6 thread sweeps for all four primary corpora using at least 15 samples,
+   five accumulated seconds per row, warmups, randomized pairs, CPU affinity, RSS,
+   output validation, and Wild determinism.
+4. Record that immutable baseline before changing linker code. Then collect `/time`
+   profiles outside measured runs and choose work only from repeatable hot phases.
+5. Iterate one optimization at a time. Require correctness gates plus matched
+   before/after primary-corpus measurements; revert neutral or regressive ideas.
+6. Finish with direct best-configuration pairs, geometric-mean calculation, individual
+   uv/rust-analyzer results, regression/memory accounting, native execution, and a
+   new Goal 3 evidence document. Do not mark Goal 3 complete below its `GOAL.md` bar.
 
 ## Executive summary
 
