@@ -1,9 +1,9 @@
 //! Deterministic, policy-light planning for AMD64 COFF archive extraction.
 //!
-//! The planner parses the archive once, validates every member, and records
-//! both public definitions and archive-relevant undefined symbols. Resolution
-//! then operates entirely on this metadata, so an integrating linker can load
-//! the selected member bytes without reimplementing archive semantics.
+//! The planner parses the archive container once and records both public
+//! definitions and archive-relevant undefined symbols. Unsupported members
+//! remain opaque until selected, so legacy members that are irrelevant to a
+//! link do not make an otherwise usable MSVC library fail eagerly.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -82,11 +82,19 @@ impl Error for CoffArchiveError {}
 
 pub type Result<T> = std::result::Result<T, CoffArchiveError>;
 
-/// The representation used by one validated archive member.
+/// The representation used by one archive member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoffArchiveMemberKind<'data> {
-    CoffObject { is_bigobj: bool },
+    CoffObject {
+        is_bigobj: bool,
+    },
     ShortImport(ShortImportObject<'data>),
+    /// A member whose payload is not a supported AMD64 COFF object.
+    ///
+    /// Archive symbol indices can still associate definitions with an opaque
+    /// member. Consumers must report [`CoffArchiveMember::opaque_error`] if
+    /// such a member is selected, including in whole-archive mode.
+    Opaque,
 }
 
 /// One validated member, in archive order.
@@ -96,6 +104,7 @@ pub struct CoffArchiveMember<'data> {
     name: &'data [u8],
     data: &'data [u8],
     kind: CoffArchiveMemberKind<'data>,
+    opaque_error: Option<CoffArchiveError>,
     definitions: Vec<Vec<u8>>,
     demands: Vec<OwnedArchiveDemand>,
     file_range: (u64, u64),
@@ -120,6 +129,12 @@ impl<'data> CoffArchiveMember<'data> {
     #[must_use]
     pub fn kind(&self) -> CoffArchiveMemberKind<'data> {
         self.kind
+    }
+
+    /// Returns the deferred error for an opaque member.
+    #[must_use]
+    pub fn opaque_error(&self) -> Option<&CoffArchiveError> {
+        self.opaque_error.as_ref()
     }
 
     #[must_use]
@@ -245,14 +260,31 @@ impl<'data> CoffArchive<'data> {
                     format!("cannot read data: {error}"),
                 )
             })?;
-            let (kind, definitions, demands) = parse_member(name, member_data)?;
+            let parsed = match parse_member(name, member_data) {
+                Ok((kind, definitions, demands)) => ParsedMember {
+                    kind,
+                    definitions,
+                    demands,
+                    opaque_error: None,
+                },
+                Err(error) if error.kind() == CoffArchiveErrorKind::UnsupportedMember => {
+                    ParsedMember {
+                        kind: CoffArchiveMemberKind::Opaque,
+                        definitions: Vec::new(),
+                        demands: Vec::new(),
+                        opaque_error: Some(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             members.push(CoffArchiveMember {
                 index: members.len(),
                 name,
                 data: member_data,
-                kind,
-                definitions,
-                demands,
+                kind: parsed.kind,
+                opaque_error: parsed.opaque_error,
+                definitions: parsed.definitions,
+                demands: parsed.demands,
                 file_range: raw_member.file_range(),
             });
         }
@@ -355,6 +387,13 @@ impl<'data> CoffArchive<'data> {
             unresolved,
         }
     }
+}
+
+struct ParsedMember<'data> {
+    kind: CoffArchiveMemberKind<'data>,
+    definitions: Vec<Vec<u8>>,
+    demands: Vec<OwnedArchiveDemand>,
+    opaque_error: Option<CoffArchiveError>,
 }
 
 fn parse_member<'data>(
@@ -763,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_thin_and_non_coff_members_with_typed_errors() {
+    fn rejects_thin_archives_and_defers_non_coff_member_errors() {
         let thin = b"!<thin>\n";
         let error = CoffArchive::parse(thin).unwrap_err();
         assert_eq!(error.kind(), CoffArchiveErrorKind::ThinArchive);
@@ -777,9 +816,125 @@ mod tests {
             }],
             false,
         );
-        let error = CoffArchive::parse(&archive).unwrap_err();
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        let member = &parsed.members()[0];
+        assert_eq!(member.kind(), CoffArchiveMemberKind::Opaque);
+        let error = member.opaque_error().unwrap();
         assert_eq!(error.kind(), CoffArchiveErrorKind::UnsupportedMember);
         assert_eq!(error.member_name(), Some(b"bad.txt".as_slice()));
+        assert!(parsed.plan(&[], &[], false).selected().is_empty());
+        assert_eq!(parsed.plan(&[], &[], true).selected().len(), 1);
+
+        let mut malformed_import = short_import("ExitProcess", "KERNEL32.dll");
+        malformed_import.pop();
+        let archive = test_archive(
+            TestArchiveKind::Coff,
+            &[TestMember {
+                name: "broken.obj",
+                data: malformed_import,
+                symbols: &["ExitProcess"],
+            }],
+            false,
+        );
+        assert_eq!(
+            CoffArchive::parse(&archive).unwrap_err().kind(),
+            CoffArchiveErrorKind::InvalidMember
+        );
+    }
+
+    #[test]
+    fn ignores_unselected_unknown_machine_member_in_msvc_archive() {
+        let mut legacy_alias = coff_object(&[], &["legacy"]);
+        legacy_alias[0..2].copy_from_slice(&pe::IMAGE_FILE_MACHINE_UNKNOWN.0.to_le_bytes());
+        let archive = test_archive(
+            TestArchiveKind::Coff,
+            &[
+                TestMember {
+                    name: r"sdknames\_argc.obj",
+                    data: legacy_alias,
+                    symbols: &["_argc"],
+                },
+                TestMember {
+                    name: "exit.obj",
+                    data: short_import("ExitProcess", "KERNEL32.dll"),
+                    symbols: &["ExitProcess", "__imp_ExitProcess"],
+                },
+            ],
+            true,
+        );
+
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        assert_eq!(parsed.members().len(), 2);
+        assert_eq!(parsed.members()[0].kind(), CoffArchiveMemberKind::Opaque);
+        assert_eq!(
+            parsed.members()[0].opaque_error().unwrap().kind(),
+            CoffArchiveErrorKind::UnsupportedMember
+        );
+
+        let import_plan = parsed.plan(
+            &[ArchiveDemand {
+                name: b"__imp_ExitProcess",
+                kind: ArchiveDemandKind::Strong,
+            }],
+            &[],
+            false,
+        );
+        assert_eq!(import_plan.selected().len(), 1);
+        assert_eq!(import_plan.selected()[0].member().name(), b"exit.obj");
+
+        let legacy_plan = parsed.plan(
+            &[ArchiveDemand {
+                name: b"_argc",
+                kind: ArchiveDemandKind::Strong,
+            }],
+            &[],
+            false,
+        );
+        assert_eq!(legacy_plan.selected().len(), 1);
+        let selected = legacy_plan.selected()[0].member();
+        assert_eq!(selected.kind(), CoffArchiveMemberKind::Opaque);
+        assert!(selected.opaque_error().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires the local xwin MSVC CRT"]
+    fn probes_local_xwin_msvcrt_archive() {
+        let xwin_root = std::env::var_os("XWIN_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".xwin"))
+            })
+            .expect("set XWIN_ROOT or HOME");
+        let path = xwin_root.join("crt/lib/x86_64/msvcrt.lib");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let parsed = CoffArchive::parse(&bytes).unwrap();
+        assert!(
+            parsed
+                .members()
+                .iter()
+                .any(|member| member.kind() == CoffArchiveMemberKind::Opaque),
+            "the probe fixture no longer contains legacy opaque members"
+        );
+        let plan = parsed.plan(
+            &[
+                ArchiveDemand {
+                    name: b"mainCRTStartup",
+                    kind: ArchiveDemandKind::Strong,
+                },
+                ArchiveDemand {
+                    name: b"printf",
+                    kind: ArchiveDemandKind::Strong,
+                },
+            ],
+            &[],
+            false,
+        );
+        assert!(
+            plan.selected()
+                .iter()
+                .any(|selected| contains_name(&selected.member().definitions, b"mainCRTStartup"))
+        );
     }
 
     fn coff_object(definitions: &[&str], undefined: &[&str]) -> Vec<u8> {
