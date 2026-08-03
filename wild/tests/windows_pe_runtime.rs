@@ -60,6 +60,14 @@ mod corpus {
             },
             run: run_rust_runtime,
         },
+        RuntimeCase {
+            expected: ExpectedProgram {
+                label: "compiler-generated static TLS and callback executable",
+                stdout: "",
+                exit_code: 65,
+            },
+            run: run_tls_runtime,
+        },
     ];
 
     #[test]
@@ -71,7 +79,7 @@ mod corpus {
         let reference_dir = temporary.path().join("reference");
         std::fs::create_dir(&reference_dir).expect("create reference output directory");
 
-        for case in CASES {
+        for case in CASES.iter().filter(|case| selected(case)) {
             (case.run)(
                 &toolchain,
                 OsStr::new("lld-link"),
@@ -83,10 +91,20 @@ mod corpus {
         if let Some(candidate) = std::env::var_os("WILD_PE_LINKER_FULL") {
             let candidate_dir = temporary.path().join("wild");
             std::fs::create_dir(&candidate_dir).expect("create Wild output directory");
-            for case in CASES {
+            for case in CASES.iter().filter(|case| selected(case)) {
                 (case.run)(&toolchain, &candidate, &candidate_dir, &case.expected);
             }
         }
+    }
+
+    fn selected(case: &RuntimeCase) -> bool {
+        let Ok(filter) = std::env::var("WILD_PE_RUNTIME_FILTER") else {
+            return true;
+        };
+        case.expected
+            .label
+            .to_ascii_lowercase()
+            .contains(&filter.to_ascii_lowercase())
     }
 
     struct Toolchain {
@@ -195,6 +213,30 @@ mod corpus {
         toolchain.compile(&source("c_runtime.c"), &object, false, false);
         let executable = directory.join("c_runtime.exe");
         link_executable(toolchain, linker, &[object], &executable, &[]);
+        verify_image_and_maybe_run(expected, &executable, directory);
+    }
+
+    fn run_tls_runtime(
+        toolchain: &Toolchain,
+        linker: &OsStr,
+        directory: &Path,
+        expected: &ExpectedProgram,
+    ) {
+        let object = directory.join("tls_runtime.obj");
+        toolchain.compile(&source("tls_runtime.c"), &object, false, false);
+        let executable = directory.join("tls_runtime.exe");
+        link_executable(toolchain, linker, &[object], &executable, &[]);
+        let inspection = inspect_image(&executable);
+        assert!(
+            inspection.contains("TLSDirectory") || inspection.contains("TLSTableRVA"),
+            "{} lacks a PE TLS directory:\n{inspection}",
+            executable.display()
+        );
+        assert!(
+            inspection.contains("Type: DIR64"),
+            "{} lacks TLS base relocations:\n{inspection}",
+            executable.display()
+        );
         verify_image_and_maybe_run(expected, &executable, directory);
     }
 
@@ -354,7 +396,13 @@ mod corpus {
 
     fn inspect_image(image: &Path) -> String {
         let inspection = Command::new("llvm-readobj")
-            .args(["--file-headers", "--coff-imports", "--coff-exports"])
+            .args([
+                "--file-headers",
+                "--coff-imports",
+                "--coff-exports",
+                "--coff-basereloc",
+                "--coff-tls-directory",
+            ])
             .arg(image)
             .output()
             .unwrap_or_else(|error| panic!("inspect {}: {error}", image.display()));
