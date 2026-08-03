@@ -36,6 +36,7 @@ use rayon::prelude::*;
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -83,7 +84,9 @@ const PE_DETAIL_ROOTS: &str = "PE detail: Prepare GC roots";
 const PE_DETAIL_SOURCE_LOCATIONS: &str = "PE detail: Build source-location map";
 const PE_DETAIL_TLS_DIRECTORY: &str = "PE detail: Build TLS directory";
 const PE_DETAIL_WRITE_HEADERS: &str = "PE detail: Write PE headers";
+const PE_CHECKSUM_OFFSET: usize = 0x80 + 4 + 20 + 64;
 const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
+const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
 const LINKER_ABSOLUTE_ZERO_SYMBOLS: &[&[u8]] = &[
     b"__guard_fids_count",
     b"__guard_fids_table",
@@ -180,6 +183,96 @@ struct Dir64Site {
 struct BuiltImage {
     bytes: Vec<u8>,
     exports: Vec<ResolvedExport>,
+    pending_repro_build_id: Option<PendingReproBuildId>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingReproBuildId {
+    payload: Range<usize>,
+}
+
+impl PendingReproBuildId {
+    fn new(image: &[u8], payload: Range<usize>) -> Result<Self> {
+        ensure!(
+            payload.start <= payload.end,
+            "invalid excluded REPRO build-id range"
+        );
+        ensure!(
+            payload.end <= image.len(),
+            "excluded REPRO build-id range lies outside the image"
+        );
+        ensure!(
+            payload.len() == linker_utils::pe_debug::REPRO_BUILD_ID_SIZE,
+            "invalid REPRO build-id payload size"
+        );
+        let checksum_end = PE_CHECKSUM_OFFSET
+            .checked_add(4)
+            .context("PE checksum range overflow")?;
+        ensure!(
+            checksum_end <= image.len(),
+            "PE checksum range lies outside the image"
+        );
+        ensure!(
+            checksum_end <= payload.start,
+            "PE checksum and REPRO build-id ranges overlap"
+        );
+        Ok(Self { payload })
+    }
+
+    fn compute(&self, image: &[u8]) -> Result<[u8; linker_utils::pe_debug::REPRO_BUILD_ID_SIZE]> {
+        linker_utils::pe_debug::stable_build_id(
+            image,
+            Some(PE_CHECKSUM_OFFSET),
+            std::slice::from_ref(&self.payload),
+        )
+        .context("failed to compute reproducible PE build id")
+    }
+
+    fn patch(&self, image: &mut [u8], build_id: &[u8; 32]) {
+        image[self.payload.clone()].copy_from_slice(build_id);
+    }
+}
+
+impl BuiltImage {
+    fn finalize_repro_build_id(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_repro_build_id.as_ref() else {
+            return Ok(());
+        };
+        let build_id_phase = crate::timing_guard!(PE_DETAIL_DEBUG_BUILD_ID);
+        let build_id = pending.compute(&self.bytes)?;
+        pending.patch(&mut self.bytes, &build_id);
+        drop(build_id_phase);
+        self.pending_repro_build_id = None;
+        Ok(())
+    }
+
+    fn copy_to(&mut self, output: &mut [u8]) -> Result<()> {
+        ensure!(
+            output.len() == self.bytes.len(),
+            "PE output buffer has an unexpected size"
+        );
+        let Some(pending) = self.pending_repro_build_id.as_ref() else {
+            output.copy_from_slice(&self.bytes);
+            return Ok(());
+        };
+        if rayon::current_num_threads() == 1 || self.bytes.len() < PARALLEL_REPRO_COPY_MIN_SIZE {
+            self.finalize_repro_build_id()?;
+            output.copy_from_slice(&self.bytes);
+            return Ok(());
+        }
+
+        let (build_id, ()) = rayon::join(
+            || {
+                let build_id_phase = crate::timing_guard!(PE_DETAIL_DEBUG_BUILD_ID);
+                let result = pending.compute(&self.bytes);
+                drop(build_id_phase);
+                result
+            },
+            || output.copy_from_slice(&self.bytes),
+        );
+        pending.patch(output, &build_id?);
+        Ok(())
+    }
 }
 
 pub(crate) fn link<F: FileSystem>(
@@ -269,7 +362,7 @@ pub(crate) fn link<F: FileSystem>(
             .and_then(|name| name.to_str())
             .context("PE output file name is not valid UTF-8")?
     };
-    let image = build_image_with_delay_loads(
+    let mut image = build_image_with_delay_loads(
         &objects,
         &symbol_metadata,
         &imports,
@@ -296,7 +389,7 @@ pub(crate) fn link<F: FileSystem>(
                 write_mode: args.common.file_write_mode,
             },
         )?;
-        output.bytes_mut().copy_from_slice(&image.bytes);
+        image.copy_to(output.bytes_mut())?;
         output.finish()?;
         if !image.exports.is_empty() {
             write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
@@ -1345,7 +1438,7 @@ fn build_image(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
     let symbol_metadata = SelectedObjectMetadata::new(objects);
-    build_image_with_delay_loads(
+    let mut image = build_image_with_delay_loads(
         objects,
         &symbol_metadata,
         imports,
@@ -1358,7 +1451,9 @@ fn build_image(
         runtime_resolution,
         &args.delay_load_dlls,
         &[],
-    )
+    )?;
+    image.finalize_repro_build_id()?;
+    Ok(image)
 }
 
 fn build_image_with_delay_loads(
@@ -1880,32 +1975,28 @@ fn build_image_with_delay_loads(
         load_config_directory,
     );
     drop(headers_phase);
-    let build_id_phase = crate::timing_guard!(PE_DETAIL_DEBUG_BUILD_ID);
-    if let Some(id) = debug_id {
+    let pending_repro_build_id = if let Some(id) = debug_id {
         let placement = &layout.placements[&id];
         let file_offset = placement.file_offset.unwrap();
         let start = usize::try_from(file_offset).context("debug file offset exceeds usize")?;
-        let payload_start = start + linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE;
-        let payload_end = payload_start + linker_utils::pe_debug::REPRO_BUILD_ID_SIZE;
-        let excluded_build_id = payload_start..payload_end;
-        let build_id = linker_utils::pe_debug::stable_build_id(
+        let payload_start = start
+            .checked_add(linker_utils::pe_debug::IMAGE_DEBUG_DIRECTORY_SIZE)
+            .context("REPRO build-id payload offset overflow")?;
+        let payload_end = payload_start
+            .checked_add(linker_utils::pe_debug::REPRO_BUILD_ID_SIZE)
+            .context("REPRO build-id payload range overflow")?;
+        Some(PendingReproBuildId::new(
             &image,
-            Some(0x80 + 4 + 20 + 64),
-            std::slice::from_ref(&excluded_build_id),
-        )
-        .context("failed to compute reproducible PE build id")?;
-        let encoded = linker_utils::pe_debug::encode_debug_directory(
-            &[linker_utils::pe_debug::DebugRecord::Repro { build_id }],
-            placement.rva,
-            file_offset,
-        )?;
-        image[start..start + encoded.bytes.len()].copy_from_slice(&encoded.bytes);
-    }
-    drop(build_id_phase);
+            payload_start..payload_end,
+        )?)
+    } else {
+        None
+    };
     drop(final_image_phase);
     Ok(BuiltImage {
         bytes: image,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
+        pending_repro_build_id,
     })
 }
 
@@ -4650,6 +4741,39 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].contribution <= pair[1].contribution)
         );
+    }
+
+    #[test]
+    fn parallel_repro_hash_and_copy_matches_in_place_finalization() {
+        let payload_start = 4096;
+        let payload = payload_start..payload_start + linker_utils::pe_debug::REPRO_BUILD_ID_SIZE;
+        let mut bytes = (0..PARALLEL_REPRO_COPY_MIN_SIZE + 4096)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        bytes[payload.clone()].fill(0);
+        let pending = PendingReproBuildId::new(&bytes, payload).unwrap();
+        let mut sequential = BuiltImage {
+            bytes: bytes.clone(),
+            exports: Vec::new(),
+            pending_repro_build_id: Some(pending.clone()),
+        };
+        sequential.finalize_repro_build_id().unwrap();
+
+        for threads in [1, 4] {
+            let mut candidate = BuiltImage {
+                bytes: bytes.clone(),
+                exports: Vec::new(),
+                pending_repro_build_id: Some(pending.clone()),
+            };
+            let mut output = vec![0; bytes.len()];
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| candidate.copy_to(&mut output))
+                .unwrap();
+            assert_eq!(output, sequential.bytes, "threads={threads}");
+        }
     }
 
     #[test]
