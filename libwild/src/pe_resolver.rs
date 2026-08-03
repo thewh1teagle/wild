@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use super::pe_ir::NameId;
 use super::pe_ir::{ArchiveId, ArchiveMemberId};
-use super::pe_symbol_db::OrderedNameInterner;
+use super::pe_symbol_db::{BindingStrength, OrderedNameInterner};
 
 #[cfg(test)]
 type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
@@ -44,17 +44,124 @@ const COMPATIBILITY_DELETION_SITES: &[&str] = &[
     "BTreeSet<Vec<u8>> import-definition snapshot",
 ];
 
-#[derive(Clone, Copy, Debug, Default)]
-struct DenseNameState {
-    defined: bool,
-    unresolved: bool,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(transparent)]
+pub(super) struct ResolverNameState(u8);
+
+impl ResolverNameState {
+    const DEFINED: u8 = 1 << 0;
+    const UNRESOLVED: u8 = 1 << 1;
+
+    pub(super) const fn is_defined(self) -> bool {
+        self.0 & Self::DEFINED != 0
+    }
+
+    pub(super) const fn is_unresolved(self) -> bool {
+        self.0 & Self::UNRESOLVED != 0
+    }
+
+    fn mark_unresolved(&mut self) {
+        if !self.is_defined() {
+            self.0 |= Self::UNRESOLVED;
+        }
+    }
+
+    fn mark_defined(&mut self) -> bool {
+        let changed = !self.is_defined();
+        self.0 = (self.0 | Self::DEFINED) & !Self::UNRESOLVED;
+        changed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolverWeakFallback {
+    pub(super) symbol: NameId,
+    pub(super) target: NameId,
+    pub(super) search: linker_utils::coff_symbols::WeakSearch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolverAlternateFallback {
+    pub(super) symbol: NameId,
+    pub(super) target: NameId,
+}
+
+/// Provider coordinates in resolver encounter order. Workstream 1 maps raw object-symbol indices
+/// to its dense SymbolIds while retaining this canonical NameId namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ResolverProviderOccurrence {
+    Object {
+        name: NameId,
+        object: u32,
+        raw_symbol: u32,
+        strength: BindingStrength,
+    },
+    Import {
+        name: NameId,
+        selected_import: u32,
+        archive: ArchiveId,
+        member: ArchiveMemberId,
+    },
+    Absolute {
+        name: NameId,
+        value: u64,
+        linker_defined: bool,
+    },
+}
+
+#[allow(dead_code)]
+impl ResolverProviderOccurrence {
+    pub(super) const fn name(self) -> NameId {
+        match self {
+            Self::Object { name, .. } | Self::Import { name, .. } | Self::Absolute { name, .. } => {
+                name
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) struct ResolverSeed<'data> {
+    pub(super) names: OrderedNameInterner<'data>,
+    pub(super) states: Box<[ResolverNameState]>,
+    pub(super) weak_fallbacks: Box<[ResolverWeakFallback]>,
+    pub(super) alternate_fallbacks: Box<[ResolverAlternateFallback]>,
+    pub(super) providers: Box<[ResolverProviderOccurrence]>,
+}
+
+#[allow(dead_code)]
+pub(super) struct ResolverSeedParts<'data> {
+    pub(super) names: OrderedNameInterner<'data>,
+    pub(super) states: Box<[ResolverNameState]>,
+    pub(super) weak_fallbacks: Box<[ResolverWeakFallback]>,
+    pub(super) alternate_fallbacks: Box<[ResolverAlternateFallback]>,
+    pub(super) providers: Box<[ResolverProviderOccurrence]>,
+}
+
+#[allow(dead_code)]
+impl<'data> ResolverSeed<'data> {
+    pub(super) fn state(&self, name: NameId) -> Option<ResolverNameState> {
+        self.states.get(name.index()).copied()
+    }
+
+    pub(super) fn into_parts(self) -> ResolverSeedParts<'data> {
+        ResolverSeedParts {
+            names: self.names,
+            states: self.states,
+            weak_fallbacks: self.weak_fallbacks,
+            alternate_fallbacks: self.alternate_fallbacks,
+            providers: self.providers,
+        }
+    }
 }
 
 struct IncrementalSymbolState<'data> {
     names: OrderedNameInterner<'data>,
-    states: Vec<DenseNameState>,
+    states: Vec<ResolverNameState>,
     weak_resolution: WeakExternalResolution,
-    weak_names: Vec<(NameId, NameId, linker_utils::coff_symbols::WeakSearch)>,
+    weak_names: Vec<ResolverWeakFallback>,
+    alternate_names: Vec<ResolverAlternateFallback>,
+    providers: Vec<ResolverProviderOccurrence>,
     globals: Vec<SelectedGlobalSymbol>,
     absorbed_objects: usize,
 }
@@ -82,6 +189,8 @@ pub(super) struct SelectedSymbolSnapshot {
 }
 
 pub(super) struct ResolverOutput<'data> {
+    #[allow(dead_code)]
+    pub(super) seed: ResolverSeed<'data>,
     pub(super) selected_imports: Vec<ShortImportObject<'data>>,
     pub(super) symbols: SelectedSymbolSnapshot,
     #[cfg(test)]
@@ -106,6 +215,8 @@ impl<'data> IncrementalSymbolState<'data> {
             states: Vec::new(),
             weak_resolution: WeakExternalResolution::default(),
             weak_names: Vec::new(),
+            alternate_names: Vec::new(),
+            providers: Vec::new(),
             globals: Vec::new(),
             absorbed_objects: 0,
         }
@@ -115,9 +226,7 @@ impl<'data> IncrementalSymbolState<'data> {
         for root in roots {
             let id = self.intern_owned(root);
             let state = &mut self.states[id.index()];
-            if !state.defined {
-                state.unresolved = true;
-            }
+            state.mark_unresolved();
         }
     }
 
@@ -130,17 +239,29 @@ impl<'data> IncrementalSymbolState<'data> {
         for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
             let symbol = self.intern_borrowed(record.symbol);
             let target = self.intern_borrowed(record.target);
-            self.weak_resolution
-                .apply(record, &format!("selected COFF object #{index}"))?;
-            if !self
+            let existing = self
                 .weak_names
                 .iter()
-                .any(|&(old_symbol, old_target, old_search)| {
-                    old_symbol == symbol && old_target == target && old_search == record.search
-                })
-            {
+                .position(|fallback| fallback.symbol == symbol);
+            self.weak_resolution
+                .apply(record, &format!("selected COFF object #{index}"))?;
+            let fallback = ResolverWeakFallback {
+                symbol,
+                target,
+                search: record.search,
+            };
+            if let Some(position) = existing {
+                let old = self.weak_names[position];
+                // Match WeakExternalResolution: a real fallback replaces an earlier incoming
+                // anti-dependency; all other accepted duplicates retain the first record.
+                if old.search == linker_utils::coff_symbols::WeakSearch::AntiDependency
+                    && record.search != linker_utils::coff_symbols::WeakSearch::AntiDependency
+                {
+                    self.weak_names[position] = fallback;
+                }
+            } else {
                 note_vec_push(&self.weak_names);
-                self.weak_names.push((symbol, target, record.search));
+                self.weak_names.push(fallback);
             }
         }
         for symbol in object.file().symbols() {
@@ -173,11 +294,25 @@ impl<'data> IncrementalSymbolState<'data> {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
-                let state = &mut self.states[name_id.index()];
-                if !state.defined {
-                    state.unresolved = true;
-                }
+                self.states[name_id.index()].mark_unresolved();
             } else if symbol.is_definition() || symbol.is_common() {
+                let object = u32::try_from(index).context("PE object index exceeds u32")?;
+                let raw_symbol =
+                    u32::try_from(symbol.index().0).context("raw COFF symbol index exceeds u32")?;
+                let strength = if symbol.is_common() {
+                    BindingStrength::Common
+                } else if symbol.is_weak() {
+                    BindingStrength::Weak
+                } else {
+                    BindingStrength::Strong
+                };
+                note_vec_push(&self.providers);
+                self.providers.push(ResolverProviderOccurrence::Object {
+                    name: name_id,
+                    object,
+                    raw_symbol,
+                    strength,
+                });
                 self.define_id(name_id);
             }
         }
@@ -202,27 +337,34 @@ impl<'data> IncrementalSymbolState<'data> {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
             }
             self.states
-                .resize(id.index() + 1, DenseNameState::default());
+                .resize(id.index() + 1, ResolverNameState::default());
         }
     }
 
     fn define_id(&mut self, id: NameId) -> bool {
-        let state = &mut self.states[id.index()];
-        let changed = !state.defined;
-        state.defined = true;
-        state.unresolved = false;
-        changed
+        self.states[id.index()].mark_defined()
     }
 
-    fn define_owned(&mut self, name: &[u8]) -> bool {
+    fn define_owned_with_id(&mut self, name: &[u8]) -> (NameId, bool) {
         let id = self.intern_owned(name);
-        self.define_id(id)
+        (id, self.define_id(id))
+    }
+
+    fn sync_alternates(&mut self, runtime: &RuntimeResolution) {
+        self.alternate_names.clear();
+        for (symbol, target) in runtime.alternate_names() {
+            let symbol = self.intern_owned(symbol.as_bytes());
+            let target = self.intern_owned(target.as_bytes());
+            note_vec_push(&self.alternate_names);
+            self.alternate_names
+                .push(ResolverAlternateFallback { symbol, target });
+        }
     }
 
     fn is_defined(&self, id: NameId) -> bool {
         self.states
             .get(id.index())
-            .is_some_and(|state| state.defined)
+            .is_some_and(|state| state.is_defined())
     }
 
     fn unresolved_in_byte_order(&self) -> Vec<NameId> {
@@ -230,7 +372,7 @@ impl<'data> IncrementalSymbolState<'data> {
             .states
             .iter()
             .enumerate()
-            .filter(|(_, state)| state.unresolved && !state.defined)
+            .filter(|(_, state)| state.is_unresolved() && !state.is_defined())
             .map(|(index, _)| NameId::from_u32(index as u32))
             .collect::<Vec<_>>();
         ids.sort_by(|&left, &right| {
@@ -407,7 +549,15 @@ impl<'data> ResolverSession<'data> {
     }
 
     pub(super) fn define_linker_symbol(&mut self, name: &[u8]) {
-        self.symbol_state.define_owned(name);
+        let (name, _) = self.symbol_state.define_owned_with_id(name);
+        note_vec_push(&self.symbol_state.providers);
+        self.symbol_state
+            .providers
+            .push(ResolverProviderOccurrence::Absolute {
+                name,
+                value: 0,
+                linker_defined: true,
+            });
     }
 
     #[cfg(test)]
@@ -417,14 +567,31 @@ impl<'data> ResolverSession<'data> {
 
     pub(super) fn finish(self) -> ResolverOutput<'data> {
         let _ = COMPATIBILITY_DELETION_SITES;
+        let IncrementalSymbolState {
+            names,
+            states,
+            weak_resolution,
+            weak_names,
+            alternate_names,
+            providers,
+            globals,
+            absorbed_objects: _object_scans,
+        } = self.symbol_state;
         ResolverOutput {
+            seed: ResolverSeed {
+                names,
+                states: states.into_boxed_slice(),
+                weak_fallbacks: weak_names.into_boxed_slice(),
+                alternate_fallbacks: alternate_names.into_boxed_slice(),
+                providers: providers.into_boxed_slice(),
+            },
             selected_imports: self.selected_imports,
             symbols: SelectedSymbolSnapshot {
-                globals: self.symbol_state.globals,
-                weak_resolution: self.symbol_state.weak_resolution,
+                globals,
+                weak_resolution,
             },
             #[cfg(test)]
-            object_scans: self.symbol_state.absorbed_objects,
+            object_scans: _object_scans,
         }
     }
 
@@ -455,6 +622,7 @@ impl<'data> ResolverSession<'data> {
                 runtime_resolution.apply(directive, &String::from_utf8_lossy(member.name()))?;
             }
         }
+        self.symbol_state.sync_alternates(runtime_resolution);
 
         loop {
             let mut changed = false;
@@ -490,6 +658,8 @@ impl<'data> ResolverSession<'data> {
             )?;
             self.scanned_objects = objects.len();
             if !changed {
+                // Alias members selected in the final extraction waves update runtime state.
+                self.symbol_state.sync_alternates(runtime_resolution);
                 let snapshot_phase =
                     crate::timing_guard!(super::PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS);
                 // Legacy import-writer snapshot clones one owned Vec payload per name. Internal
@@ -571,11 +741,13 @@ fn extract_pass<'data>(
                 symbol_state
                     .weak_names
                     .iter()
-                    .filter(|(symbol, _, search)| {
-                        *search == linker_utils::coff_symbols::WeakSearch::Library
-                            && !symbol_state.is_defined(*symbol)
+                    .filter(|fallback| {
+                        fallback.search == linker_utils::coff_symbols::WeakSearch::Library
+                            && !symbol_state.is_defined(fallback.symbol)
                     })
-                    .map(|&(symbol, _, _)| CanonicalArchiveDemand { name: symbol }),
+                    .map(|fallback| CanonicalArchiveDemand {
+                        name: fallback.symbol,
+                    }),
             );
             demands
         };
@@ -626,7 +798,26 @@ fn extract_pass<'data>(
                     // The PE import builder consumes selected import symbols from
                     // the original archive. Do not parse these as ordinary objects, but do
                     // retain their definitions for subsequent archive decisions.
+                    let selected_import = u32::try_from(selected_imports.len())
+                        .context("selected PE import count exceeds u32")?;
+                    let archive = ArchiveId::from_u32(
+                        u32::try_from(archive_index).context("PE archive index exceeds u32")?,
+                    );
+                    let archive_member = ArchiveMemberId::from_u32(
+                        u32::try_from(member.index())
+                            .context("PE archive member index exceeds u32")?,
+                    );
                     for definition in member.definitions() {
+                        let (name, _) = symbol_state.define_owned_with_id(definition);
+                        note_vec_push(&symbol_state.providers);
+                        symbol_state
+                            .providers
+                            .push(ResolverProviderOccurrence::Import {
+                                name,
+                                selected_import,
+                                archive,
+                                member: archive_member,
+                            });
                         if !import_definitions.contains(definition) {
                             // Legacy import-writer bridge; canonical state below retains NameId.
                             crate::perf::removal_counters::add_name_bytes_allocated(
@@ -635,7 +826,6 @@ fn extract_pass<'data>(
                             // Count the explicit Vec payload; BTree internals are out of scope.
                             crate::perf::removal_counters::increment_hot_phase_allocations();
                             import_definitions.insert(definition.to_vec());
-                            symbol_state.define_owned(definition);
                             changed = true;
                         }
                     }
@@ -780,7 +970,7 @@ fn fallback_demands<'data>(
     let weak_symbols = state
         .weak_names
         .iter()
-        .map(|&(symbol, _, _)| symbol)
+        .map(|fallback| fallback.symbol)
         .collect::<Vec<_>>();
     for symbol in weak_symbols {
         if state.is_defined(symbol) {
@@ -830,7 +1020,7 @@ fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> R
         .states
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.defined)
+        .filter(|(_, item)| item.is_defined())
         .map(|(index, _)| {
             state
                 .names
@@ -853,6 +1043,12 @@ mod tests {
     use object::pe;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    fn seed_name(seed: &ResolverSeed<'_>, name: &[u8]) -> NameId {
+        seed.names
+            .lookup_prehashed(name, crate::hash::hash_bytes(name))
+            .unwrap_or_else(|| panic!("seed does not contain {}", String::from_utf8_lossy(name)))
+    }
 
     #[test]
     fn resolver_snapshot_preserves_direct_and_archive_symbol_order() {
@@ -905,6 +1101,28 @@ mod tests {
             ]
         );
         assert_eq!(output.symbols.weak_resolution.records().count(), 0);
+        let provider_signature = output
+            .seed
+            .providers
+            .iter()
+            .map(|provider| match *provider {
+                ResolverProviderOccurrence::Object {
+                    name,
+                    object,
+                    raw_symbol,
+                    ..
+                } => (output.seed.names.bytes(name).unwrap(), object, raw_symbol),
+                _ => panic!("fixture only selects object providers"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_signature,
+            [
+                (b"direct".as_slice(), 0, 0),
+                (b"arc_sym".as_slice(), 1, 0),
+                (b"second".as_slice(), 1, 1),
+            ]
+        );
     }
 
     #[test]
@@ -965,6 +1183,98 @@ mod tests {
             .resolve(&mut objects, &[], &mut RuntimeResolution::new())
             .unwrap();
         assert!(objects.is_empty());
+    }
+
+    #[test]
+    fn resolver_seed_ids_survive_appended_default_library_wave() {
+        let root = coff_object(&[], &["target"]);
+        let unrelated = archive(&[("other.obj", coff_object(&["other"], &[]))]);
+        let provider = archive(&[("target.obj", coff_object(&["target"], &[]))]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+        let mut session = ResolverSession::new();
+        session.add_archive(&unrelated, false).unwrap();
+        session
+            .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+            .unwrap();
+        let target_before = session
+            .symbol_state
+            .names
+            .lookup_prehashed(b"target", crate::hash::hash_bytes(b"target"))
+            .unwrap();
+
+        session.add_archive(&provider, false).unwrap();
+        session
+            .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+            .unwrap();
+        let output = session.finish();
+        let target_after = seed_name(&output.seed, b"target");
+        assert_eq!(target_after, target_before);
+        assert!(output.seed.state(target_after).unwrap().is_defined());
+        assert!(!output.seed.state(target_after).unwrap().is_unresolved());
+        assert!(output.seed.providers.iter().any(|provider| {
+            matches!(
+                provider,
+                ResolverProviderOccurrence::Object {
+                    name,
+                    object: 1,
+                    raw_symbol: 0,
+                    ..
+                } if *name == target_after
+            )
+        }));
+
+        let original_count = output.seed.names.len();
+        let ResolverSeedParts {
+            mut names,
+            states,
+            weak_fallbacks,
+            alternate_fallbacks,
+            providers,
+        } = output.seed.into_parts();
+        let appended = names.intern_borrowed_prehashed(
+            b"workstream-one-local",
+            crate::hash::hash_bytes(b"workstream-one-local"),
+        );
+        assert_eq!(
+            names.lookup_prehashed(b"target", crate::hash::hash_bytes(b"target")),
+            Some(target_before)
+        );
+        assert_eq!(appended, NameId::from_u32(original_count as u32));
+        assert_eq!(states.len(), original_count);
+        assert!(weak_fallbacks.is_empty());
+        assert!(alternate_fallbacks.is_empty());
+        assert!(!providers.is_empty());
+    }
+
+    #[test]
+    fn resolver_seed_uses_name_ids_for_weak_and_alternate_fallbacks() {
+        let weak = weak_object(pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY.0);
+        let mut objects = vec![crate::coff::CoffObject::parse(&weak).unwrap()];
+        let mut runtime = RuntimeResolution::new();
+        runtime
+            .parse_and_apply("/alternatename:missing=alternate", "root.obj")
+            .unwrap();
+        let mut session = ResolverSession::new();
+        session.resolve(&mut objects, &[], &mut runtime).unwrap();
+        let output = session.finish();
+
+        let primary = seed_name(&output.seed, b"primary");
+        let fallback = seed_name(&output.seed, b"fallback");
+        assert_eq!(
+            output.seed.weak_fallbacks.as_ref(),
+            [ResolverWeakFallback {
+                symbol: primary,
+                target: fallback,
+                search: linker_utils::coff_symbols::WeakSearch::Library,
+            }]
+        );
+        assert_eq!(
+            output.seed.alternate_fallbacks.as_ref(),
+            [ResolverAlternateFallback {
+                symbol: seed_name(&output.seed, b"missing"),
+                target: seed_name(&output.seed, b"alternate"),
+            }]
+        );
     }
 
     #[test]
@@ -1059,6 +1369,30 @@ mod tests {
         assert_eq!(imports[0].symbol(), b"bar");
         assert_eq!(imports[1].symbol(), b"foo");
         assert!(imports.iter().all(|import| import.dll() == b"first.dll"));
+        let output = session.finish();
+        let import_signature = output
+            .seed
+            .providers
+            .iter()
+            .filter_map(|provider| match *provider {
+                ResolverProviderOccurrence::Import {
+                    name,
+                    selected_import,
+                    archive,
+                    member,
+                } => Some((
+                    output.seed.names.bytes(name).unwrap(),
+                    selected_import,
+                    archive.get(),
+                    member.get(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            import_signature,
+            [(b"bar".as_slice(), 0, 0, 1), (b"foo".as_slice(), 1, 0, 0),]
+        );
     }
 
     #[test]
