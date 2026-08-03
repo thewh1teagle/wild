@@ -1,6 +1,7 @@
 pub mod aarch64;
 pub mod bit_misc;
 pub mod coff;
+pub mod coff_archives;
 pub mod coff_imports;
 pub mod coff_symbols;
 pub mod elf;
