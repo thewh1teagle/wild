@@ -140,10 +140,13 @@ pub(crate) fn link<F: FileSystem>(
     }
 
     let mut inputs = Vec::new();
+    // The arena owns every opened input until linking finishes. Its stable allocations let the
+    // resolver retain borrowed COFF/archive views while later default-library waves are appended.
+    let input_storage = colosseum::sync::Arena::new();
     for request in requested {
-        open_input(fs, &request, args, &mut inputs, false)?;
+        open_input(fs, &request, args, &input_storage, &mut inputs, false)?;
     }
-    let selected = select_inputs_to_fixpoint(fs, args, &mut inputs)?;
+    let selected = select_inputs_to_fixpoint(fs, args, &input_storage, &mut inputs)?;
     let objects = selected.objects;
     let resources = selected.resources;
     let archive_bytes = selected.archive_bytes;
@@ -230,129 +233,120 @@ struct SelectedInputs<'data> {
     roots: Vec<Vec<u8>>,
     runtime_resolution: linker_utils::coff_runtime::RuntimeResolution,
     archive_definitions: BTreeSet<Vec<u8>>,
+    #[cfg(test)]
+    resolver_object_scans: usize,
 }
 
-/// Rebuilds borrowed COFF state after every newly discovered default library.
-///
-/// This deliberately keeps the `inputs` growth outside the scope holding `CoffObject` and
-/// archive borrows. Besides satisfying Rust's ownership rules, rebuilding is important for
-/// correctness: an archive member selected in one round can carry another `/DEFAULTLIB`,
-/// `/INCLUDE`, or `/EXPORT` that changes the next archive-extraction fixpoint.
+type OpenedInput<'data, F> = (PathBuf, &'data <F as FileSystem>::Input, bool);
+
 fn select_inputs_to_fixpoint<'data, F: FileSystem>(
     fs: &F,
     args: &crate::args::coff::CoffArgs,
-    inputs: &'data mut Vec<(PathBuf, F::Input, bool)>,
+    input_storage: &'data colosseum::sync::Arena<F::Input>,
+    inputs: &mut Vec<OpenedInput<'data, F>>,
 ) -> Result<SelectedInputs<'data>> {
+    crate::timing_phase!("Select PE inputs");
     let mut no_default_libraries = args.no_default_libraries;
     let mut excluded_default_libraries = args.excluded_default_libraries.clone();
+    let mut selection = select_opened_inputs::<F>(
+        args,
+        inputs,
+        no_default_libraries,
+        &excluded_default_libraries,
+    )?;
     loop {
-        let missing = {
-            let selection = select_opened_inputs::<F>(
+        let old_policy = (no_default_libraries, excluded_default_libraries.len());
+        no_default_libraries |= selection.directives.no_default_libraries;
+        for excluded in &selection.directives.excluded_default_libraries {
+            if !excluded_default_libraries
+                .iter()
+                .any(|existing| same_library_name(existing, excluded))
+            {
+                excluded_default_libraries.push(excluded.clone());
+            }
+        }
+        if old_policy != (no_default_libraries, excluded_default_libraries.len()) {
+            // Policy changes can remove previously active default libraries, so only this
+            // non-monotonic case invalidates the incremental resolver cache.
+            selection = select_opened_inputs::<F>(
                 args,
                 inputs,
                 no_default_libraries,
                 &excluded_default_libraries,
             )?;
-            let old_policy = (no_default_libraries, excluded_default_libraries.len());
-            no_default_libraries |= selection.directives.no_default_libraries;
-            for excluded in &selection.directives.excluded_default_libraries {
-                if !excluded_default_libraries
-                    .iter()
-                    .any(|existing| same_library_name(existing, excluded))
-                {
-                    excluded_default_libraries.push(excluded.clone());
-                }
-            }
-            if old_policy == (no_default_libraries, excluded_default_libraries.len()) {
-                let mut libraries = Vec::new();
-                if !no_default_libraries {
-                    libraries.extend(args.default_libraries.iter().cloned());
-                    libraries.extend(selection.directives.default_libraries.iter().cloned());
-                }
-                libraries.retain(|library| {
-                    !excluded_default_libraries
-                        .iter()
-                        .any(|excluded| same_library_name(excluded, library))
-                });
-                deduplicate_case_insensitive(&mut libraries);
-
-                let disallowed = args
-                    .disallowed_libraries
-                    .iter()
-                    .chain(selection.directives.disallowed_libraries.iter())
-                    .collect::<Vec<_>>();
-                for (path, _, is_default) in inputs.iter() {
-                    if *is_default
-                        && (no_default_libraries
-                            || excluded_default_libraries
-                                .iter()
-                                .any(|name| path_matches(path, name)))
-                    {
-                        continue;
-                    }
-                    if !disallowed.iter().any(|name| path_matches(path, name)) {
-                        continue;
-                    }
-                    return Err(error!(
-                        "COFF library `{}` is forbidden by /DISALLOWLIB",
-                        path.display()
-                    ));
-                }
-                if let Some(library) = libraries.iter().find(|library| {
-                    disallowed
-                        .iter()
-                        .any(|name| same_library_name(name, library))
-                }) {
-                    return Err(error!(
-                        "COFF library `{library}` is forbidden by /DISALLOWLIB"
-                    ));
-                }
-
-                Some(
-                    libraries
-                        .into_iter()
-                        .filter(|library| {
-                            !inputs
-                                .iter()
-                                .any(|(path, _, _)| path_matches(path, library))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                // Re-select before discovering more libraries so a newly observed
-                // /NODEFAULTLIB can deactivate an archive opened in an earlier round.
-                None
-            }
-        };
-        let Some(missing) = missing else {
             continue;
-        };
-        if missing.is_empty() {
-            break;
         }
 
-        // Every borrow into `inputs` ended with the discovery scope above. The next iteration
-        // reparses direct objects and deterministically re-extracts archive members.
+        let mut libraries = Vec::new();
+        if !no_default_libraries {
+            libraries.extend(args.default_libraries.iter().cloned());
+            libraries.extend(selection.directives.default_libraries.iter().cloned());
+        }
+        libraries.retain(|library| {
+            !excluded_default_libraries
+                .iter()
+                .any(|excluded| same_library_name(excluded, library))
+        });
+        deduplicate_case_insensitive(&mut libraries);
+
+        let disallowed = args
+            .disallowed_libraries
+            .iter()
+            .chain(selection.directives.disallowed_libraries.iter())
+            .collect::<Vec<_>>();
+        for (path, _, is_default) in inputs.iter() {
+            if *is_default
+                && (no_default_libraries
+                    || excluded_default_libraries
+                        .iter()
+                        .any(|name| path_matches(path, name)))
+            {
+                continue;
+            }
+            if disallowed.iter().any(|name| path_matches(path, name)) {
+                return Err(error!(
+                    "COFF library `{}` is forbidden by /DISALLOWLIB",
+                    path.display()
+                ));
+            }
+        }
+        if let Some(library) = libraries.iter().find(|library| {
+            disallowed
+                .iter()
+                .any(|name| same_library_name(name, library))
+        }) {
+            return Err(error!(
+                "COFF library `{library}` is forbidden by /DISALLOWLIB"
+            ));
+        }
+
+        let missing = libraries
+            .into_iter()
+            .filter(|library| {
+                !inputs
+                    .iter()
+                    .any(|(path, _, _)| path_matches(path, library))
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(selection.finish());
+        }
+
         let old_len = inputs.len();
         for library in missing {
-            open_input(fs, Path::new(&library), args, inputs, true)?;
+            open_input(fs, Path::new(&library), args, input_storage, inputs, true)?;
         }
         ensure!(
             inputs.len() != old_len,
             "default-library discovery made no progress"
         );
+        selection.extend::<F>(args, &inputs[old_len..])?;
     }
-    Ok(select_opened_inputs::<F>(
-        args,
-        inputs,
-        no_default_libraries,
-        &excluded_default_libraries,
-    )?
-    .finish())
 }
 
 struct OpenSelection<'data> {
     objects: Vec<crate::coff::CoffObject<'data>>,
+    direct_object_indices: Vec<usize>,
     resources: Vec<ResourceRecord>,
     archive_bytes: Vec<&'data [u8]>,
     entry_name: Option<String>,
@@ -360,10 +354,13 @@ struct OpenSelection<'data> {
     roots: Vec<Vec<u8>>,
     directives: crate::args::coff::CoffArgs,
     archive_definitions: BTreeSet<Vec<u8>>,
+    resolver: pe_resolver::ResolverSession<'data>,
 }
 
 impl<'data> OpenSelection<'data> {
     fn finish(self) -> SelectedInputs<'data> {
+        #[cfg(test)]
+        let resolver_object_scans = self.resolver.object_scan_count();
         SelectedInputs {
             objects: self.objects,
             resources: self.resources,
@@ -373,43 +370,78 @@ impl<'data> OpenSelection<'data> {
             roots: self.roots,
             runtime_resolution: self.directives.runtime_resolution,
             archive_definitions: self.archive_definitions,
+            #[cfg(test)]
+            resolver_object_scans,
         }
+    }
+
+    fn extend<F: FileSystem>(
+        &mut self,
+        args: &crate::args::coff::CoffArgs,
+        inputs: &[OpenedInput<'data, F>],
+    ) -> Result<()> {
+        add_opened_inputs::<F>(args, inputs, self)?;
+        resolve_open_selection(args, self)
     }
 }
 
 fn select_opened_inputs<'data, F: FileSystem>(
     args: &crate::args::coff::CoffArgs,
-    inputs: &'data [(PathBuf, F::Input, bool)],
+    inputs: &[OpenedInput<'data, F>],
     no_default_libraries: bool,
     excluded_default_libraries: &[String],
 ) -> Result<OpenSelection<'data>> {
-    let mut objects = Vec::new();
-    let mut resources = Vec::new();
-    let mut archive_bytes = Vec::new();
-    let mut archive_whole = Vec::new();
-    for (path, data, is_default) in inputs {
-        if *is_default
-            && (no_default_libraries
-                || excluded_default_libraries
+    let mut selection = OpenSelection {
+        objects: Vec::new(),
+        direct_object_indices: Vec::new(),
+        resources: Vec::new(),
+        archive_bytes: Vec::new(),
+        entry_name: None,
+        exports: Vec::new(),
+        roots: Vec::new(),
+        directives: Default::default(),
+        archive_definitions: BTreeSet::new(),
+        resolver: pe_resolver::ResolverSession::new(),
+    };
+    let active = inputs.iter().filter(|(path, _, is_default)| {
+        !*is_default
+            || (!no_default_libraries
+                && !excluded_default_libraries
                     .iter()
                     .any(|name| path_matches(path, name)))
-        {
-            continue;
-        }
+    });
+    let active = active.cloned().collect::<Vec<_>>();
+    add_opened_inputs::<F>(args, &active, &mut selection)?;
+    resolve_open_selection(args, &mut selection)?;
+    Ok(selection)
+}
+
+fn add_opened_inputs<'data, F: FileSystem>(
+    args: &crate::args::coff::CoffArgs,
+    inputs: &[OpenedInput<'data, F>],
+    selection: &mut OpenSelection<'data>,
+) -> Result<()> {
+    for (path, data, _is_default) in inputs {
         match object::FileKind::parse(data.bytes()) {
-            Ok(object::FileKind::Coff | object::FileKind::CoffBig) => objects.push(
-                crate::coff::CoffObject::parse(data.bytes())
-                    .with_context(|| format!("while reading `{}`", path.display()))?,
-            ),
-            Ok(object::FileKind::Archive) => {
-                archive_bytes.push(data.bytes());
-                archive_whole.push(
-                    args.whole_archive
-                        || args
-                            .whole_archive_libraries
-                            .iter()
-                            .any(|name| path_matches(path, name)),
+            Ok(object::FileKind::Coff | object::FileKind::CoffBig) => {
+                selection
+                    .direct_object_indices
+                    .push(selection.objects.len());
+                selection.objects.push(
+                    crate::coff::CoffObject::parse(data.bytes())
+                        .with_context(|| format!("while reading `{}`", path.display()))?,
                 );
+            }
+            Ok(object::FileKind::Archive) => {
+                let whole_archive = args.whole_archive
+                    || args
+                        .whole_archive_libraries
+                        .iter()
+                        .any(|name| path_matches(path, name));
+                selection.archive_bytes.push(data.bytes());
+                selection
+                    .resolver
+                    .add_archive(data.bytes(), whole_archive)?;
             }
             Ok(kind) => {
                 return Err(error!(
@@ -423,7 +455,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
                     || linker_utils::pe_resources::has_res_null_header(data.bytes()) =>
             {
-                resources.extend(
+                selection.resources.extend(
                     linker_utils::pe_resources::parse_res(data.bytes())
                         .with_context(|| format!("while reading resource `{}`", path.display()))?,
                 );
@@ -434,10 +466,23 @@ fn select_opened_inputs<'data, F: FileSystem>(
             }
         }
     }
+    Ok(())
+}
 
-    let entry_name = pe_entry::select(args, &objects)?;
+fn resolve_open_selection(
+    args: &crate::args::coff::CoffArgs,
+    selection: &mut OpenSelection<'_>,
+) -> Result<()> {
+    crate::verbose_timing_phase!("Resolve PE archives");
+    selection.entry_name = pe_entry::select_from_objects(
+        args,
+        selection
+            .direct_object_indices
+            .iter()
+            .map(|&index| &selection.objects[index]),
+    )?;
     loop {
-        let mut directives = directive_args(args, &objects)?;
+        let mut directives = directive_args(args, &selection.objects)?;
         let mut exports = args.exports.clone();
         for export in &directives.exports {
             if !exports.contains(export) {
@@ -456,7 +501,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
                 .include_roots()
                 .map(|symbol| symbol.as_bytes().to_vec()),
         );
-        if let Some(entry) = entry_name.as_deref() {
+        if let Some(entry) = selection.entry_name.as_deref() {
             roots.push(entry.as_bytes().to_vec());
         }
         roots.extend(
@@ -467,25 +512,18 @@ fn select_opened_inputs<'data, F: FileSystem>(
         roots.sort();
         roots.dedup();
 
-        let old_len = objects.len();
-        let archive_definitions = pe_resolver::extract(
-            &mut objects,
-            &archive_bytes,
-            &archive_whole,
+        let old_len = selection.objects.len();
+        let archive_definitions = selection.resolver.resolve(
+            &mut selection.objects,
             &roots,
             &mut directives.runtime_resolution,
         )?;
-        if objects.len() == old_len {
-            return Ok(OpenSelection {
-                objects,
-                resources,
-                archive_bytes,
-                entry_name,
-                exports,
-                roots,
-                directives,
-                archive_definitions,
-            });
+        if selection.objects.len() == old_len {
+            selection.exports = exports;
+            selection.roots = roots;
+            selection.directives = directives;
+            selection.archive_definitions = archive_definitions;
+            return Ok(());
         }
     }
 }
@@ -588,11 +626,12 @@ fn same_library_name(left: &str, right: &str) -> bool {
     canonical(left) == canonical(right)
 }
 
-fn open_input<F: FileSystem>(
+fn open_input<'data, F: FileSystem>(
     fs: &F,
     request: &Path,
     args: &crate::args::coff::CoffArgs,
-    inputs: &mut Vec<(PathBuf, F::Input, bool)>,
+    input_storage: &'data colosseum::sync::Arena<F::Input>,
+    inputs: &mut Vec<OpenedInput<'data, F>>,
     is_default: bool,
 ) -> Result<()> {
     let path = find_input(fs, request, args)?;
@@ -602,7 +641,7 @@ fn open_input<F: FileSystem>(
     let (data, _) = fs
         .open_input(&path, args.common.prepopulate_maps)
         .with_context(|| format!("Failed to open COFF input `{}`", path.display()))?;
-    inputs.push((path, data, is_default));
+    inputs.push((path, input_storage.alloc(data), is_default));
     Ok(())
 }
 
@@ -2670,12 +2709,14 @@ mod tests {
             ..Default::default()
         };
         let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
         let mut inputs = Vec::new();
-        open_input(&fs, &direct_path, &args, &mut inputs, false).unwrap();
-        let selected = select_inputs_to_fixpoint(&fs, &args, &mut inputs).unwrap();
+        open_input(&fs, &direct_path, &args, &input_storage, &mut inputs, false).unwrap();
+        let selected = select_inputs_to_fixpoint(&fs, &args, &input_storage, &mut inputs).unwrap();
 
         assert_eq!(selected.archive_bytes.len(), 2);
         assert_eq!(selected.objects.len(), 3);
+        assert_eq!(selected.resolver_object_scans, selected.objects.len());
         assert_eq!(
             selected.runtime_resolution.mismatch_value("RuntimeLibrary"),
             Some("MD")
@@ -2685,6 +2726,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn extracted_nodefaultlib_invalidates_cached_default_library_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let direct_path = directory.path().join("direct.obj");
+        let first_path = directory.path().join("first.lib");
+        let excluded_path = directory.path().join("excluded.lib");
+        std::fs::write(
+            &direct_path,
+            directive_object(
+                None,
+                Some(b"first"),
+                b" /DEFAULTLIB:first.lib /DEFAULTLIB:excluded.lib /INCLUDE:first",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &first_path,
+            single_member_archive(
+                b"first.obj",
+                &directive_object(Some(b"first"), None, b" /NODEFAULTLIB:excluded.lib"),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &excluded_path,
+            single_member_archive(
+                b"excluded.obj",
+                &directive_object(Some(b"excluded"), None, b""),
+            ),
+        )
+        .unwrap();
+
+        let args = crate::args::coff::CoffArgs {
+            no_entry: true,
+            is_dll: true,
+            lib_search_path: vec![directory.path().into()],
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
+        let mut inputs = Vec::new();
+        open_input(&fs, &direct_path, &args, &input_storage, &mut inputs, false).unwrap();
+        let selected = select_inputs_to_fixpoint(&fs, &args, &input_storage, &mut inputs).unwrap();
+
+        assert_eq!(
+            inputs.len(),
+            3,
+            "excluded library is opened before its directive"
+        );
+        assert_eq!(selected.archive_bytes.len(), 1);
+        assert_eq!(selected.objects.len(), 2);
+        assert!(selected.objects.iter().all(|object| {
+            object
+                .file()
+                .symbols()
+                .filter_map(|symbol| symbol.name_bytes().ok())
+                .all(|name| name != b"excluded")
+        }));
     }
 
     #[test]
@@ -2701,9 +2802,18 @@ mod tests {
             ..Default::default()
         };
         let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
         let mut inputs = Vec::new();
-        open_input(&fs, &resource_path, &args, &mut inputs, false).unwrap();
-        open_input(&fs, &object_path, &args, &mut inputs, false).unwrap();
+        open_input(
+            &fs,
+            &resource_path,
+            &args,
+            &input_storage,
+            &mut inputs,
+            false,
+        )
+        .unwrap();
+        open_input(&fs, &object_path, &args, &input_storage, &mut inputs, false).unwrap();
         let selected =
             select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]).unwrap();
 
@@ -2726,8 +2836,17 @@ mod tests {
             ..Default::default()
         };
         let fs = crate::fs::OsFileSystem;
+        let input_storage = colosseum::sync::Arena::new();
         let mut inputs = Vec::new();
-        open_input(&fs, &resource_path, &args, &mut inputs, false).unwrap();
+        open_input(
+            &fs,
+            &resource_path,
+            &args,
+            &input_storage,
+            &mut inputs,
+            false,
+        )
+        .unwrap();
         let error =
             match select_opened_inputs::<crate::fs::OsFileSystem>(&args, &inputs, false, &[]) {
                 Ok(_) => panic!("accepted malformed renamed resource"),

@@ -1,5 +1,6 @@
 //! COFF archive extraction used by the PE writer.
 
+#[cfg(test)]
 use crate::ensure;
 use crate::error;
 use crate::error::Context;
@@ -23,22 +24,26 @@ struct IncrementalSymbolState {
     defined: BTreeSet<Vec<u8>>,
     unresolved: BTreeSet<Vec<u8>>,
     weak_resolution: WeakExternalResolution,
+    absorbed_objects: usize,
 }
 
 impl IncrementalSymbolState {
-    fn new(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> Result<Self> {
-        let mut state = Self {
+    fn new() -> Self {
+        Self {
             defined: BTreeSet::new(),
-            unresolved: roots.iter().cloned().collect(),
+            unresolved: BTreeSet::new(),
             weak_resolution: WeakExternalResolution::default(),
-        };
-        for (index, object) in objects.iter().enumerate() {
-            state.absorb_object(object, index)?;
+            absorbed_objects: 0,
         }
-        Ok(state)
+    }
+
+    fn add_roots(&mut self, roots: &[Vec<u8>]) {
+        self.unresolved.extend(roots.iter().cloned());
+        self.unresolved.retain(|name| !self.defined.contains(name));
     }
 
     fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>, index: usize) -> Result<()> {
+        self.absorbed_objects += 1;
         for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
             self.weak_resolution
                 .apply(record, &format!("selected COFF object #{index}"))?;
@@ -65,10 +70,107 @@ impl IncrementalSymbolState {
     }
 }
 
+/// Incremental archive extraction state retained while default libraries are discovered.
+pub(super) struct ResolverSession<'data> {
+    archives: Vec<CoffArchive<'data>>,
+    whole_archive: Vec<bool>,
+    extracted: HashSet<(usize, usize)>,
+    import_definitions: BTreeSet<Vec<u8>>,
+    symbol_state: IncrementalSymbolState,
+    scanned_objects: usize,
+    selected_aliases: Vec<(usize, usize)>,
+}
+
+impl<'data> ResolverSession<'data> {
+    pub(super) fn new() -> Self {
+        Self {
+            archives: Vec::new(),
+            whole_archive: Vec::new(),
+            extracted: HashSet::new(),
+            import_definitions: BTreeSet::new(),
+            symbol_state: IncrementalSymbolState::new(),
+            scanned_objects: 0,
+            selected_aliases: Vec::new(),
+        }
+    }
+
+    pub(super) fn add_archive(&mut self, bytes: &'data [u8], whole_archive: bool) -> Result<()> {
+        self.archives
+            .push(CoffArchive::parse(bytes).context("invalid AMD64 COFF archive")?);
+        self.whole_archive.push(whole_archive);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn object_scan_count(&self) -> usize {
+        self.symbol_state.absorbed_objects
+    }
+
+    pub(super) fn resolve(
+        &mut self,
+        objects: &mut Vec<crate::coff::CoffObject<'data>>,
+        roots: &[Vec<u8>],
+        runtime_resolution: &mut RuntimeResolution,
+    ) -> Result<BTreeSet<Vec<u8>>> {
+        self.symbol_state.add_roots(roots);
+        for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
+            self.symbol_state.absorb_object(object, index)?;
+        }
+        self.scanned_objects = objects.len();
+
+        // Legacy alias members are not retained as ordinary objects. Reapply their directives
+        // because the caller rebuilds runtime directives whenever newly selected objects add
+        // another `.drectve` wave.
+        for &(archive_index, member_index) in &self.selected_aliases {
+            let member = &self.archives[archive_index].members()[member_index];
+            let aliases = parse_legacy_alias_object(member.data())?
+                .expect("selected legacy alias member remains a legacy alias");
+            for directive in aliases.directives()? {
+                runtime_resolution.apply(directive, &String::from_utf8_lossy(member.name()))?;
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            changed |= extract_pass(
+                &self.archives,
+                objects,
+                &self.whole_archive,
+                runtime_resolution,
+                &mut self.extracted,
+                &mut self.import_definitions,
+                &mut self.symbol_state,
+                &mut self.selected_aliases,
+                false,
+            )?;
+            self.scanned_objects = objects.len();
+            if changed {
+                continue;
+            }
+            changed |= extract_pass(
+                &self.archives,
+                objects,
+                &self.whole_archive,
+                runtime_resolution,
+                &mut self.extracted,
+                &mut self.import_definitions,
+                &mut self.symbol_state,
+                &mut self.selected_aliases,
+                true,
+            )?;
+            self.scanned_objects = objects.len();
+            if !changed {
+                return Ok(self.import_definitions.clone());
+            }
+        }
+    }
+}
+
 /// Extract regular COFF members from all archives until no archive can satisfy
 /// another unresolved external. Short import objects remain owned by the
 /// import-directory builder.
-pub(super) fn extract<'data>(
+#[cfg(test)]
+fn extract<'data>(
     objects: &mut Vec<crate::coff::CoffObject<'data>>,
     archive_bytes: &[&'data [u8]],
     whole_archive: &[bool],
@@ -79,48 +181,11 @@ pub(super) fn extract<'data>(
         archive_bytes.len() == whole_archive.len(),
         "internal archive policy mismatch"
     );
-    let archives = archive_bytes
-        .iter()
-        .map(|bytes| CoffArchive::parse(bytes).context("invalid AMD64 COFF archive"))
-        .collect::<Result<Vec<_>>>()?;
-    let mut extracted = HashSet::<(usize, usize)>::new();
-    let mut import_definitions = BTreeSet::<Vec<u8>>::new();
-    let mut symbol_state = IncrementalSymbolState::new(objects, roots)?;
-
-    loop {
-        let mut changed = false;
-
-        // First give ordinary strong demands a complete pass over every archive.
-        // Only after that reaches a global fixpoint may weak fallback targets pull
-        // members. This ensures a real definition (including a short import) of
-        // the primary name always wins over /alternatename.
-        changed |= extract_pass(
-            &archives,
-            objects,
-            whole_archive,
-            runtime_resolution,
-            &mut extracted,
-            &mut import_definitions,
-            &mut symbol_state,
-            false,
-        )?;
-        if changed {
-            continue;
-        }
-        changed |= extract_pass(
-            &archives,
-            objects,
-            whole_archive,
-            runtime_resolution,
-            &mut extracted,
-            &mut import_definitions,
-            &mut symbol_state,
-            true,
-        )?;
-        if !changed {
-            return Ok(import_definitions);
-        }
+    let mut session = ResolverSession::new();
+    for (&bytes, &whole_archive) in archive_bytes.iter().zip(whole_archive) {
+        session.add_archive(bytes, whole_archive)?;
     }
+    session.resolve(objects, roots, runtime_resolution)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -132,6 +197,7 @@ fn extract_pass<'data>(
     extracted: &mut HashSet<(usize, usize)>,
     import_definitions: &mut BTreeSet<Vec<u8>>,
     symbol_state: &mut IncrementalSymbolState,
+    selected_aliases: &mut Vec<(usize, usize)>,
     use_alternates: bool,
 ) -> Result<bool> {
     let mut changed = false;
@@ -222,6 +288,7 @@ fn extract_pass<'data>(
                             runtime_resolution
                                 .apply(directive, &String::from_utf8_lossy(member.name()))?;
                         }
+                        selected_aliases.push((archive_index, member.index()));
                         changed = true;
                     } else {
                         return Err(error!(
@@ -271,7 +338,11 @@ fn fallback_demands(
 
 #[cfg(test)]
 fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> Result<SymbolState> {
-    let state = IncrementalSymbolState::new(objects, roots)?;
+    let mut state = IncrementalSymbolState::new();
+    state.add_roots(roots);
+    for (index, object) in objects.iter().enumerate() {
+        state.absorb_object(object, index)?;
+    }
     Ok((state.defined, state.unresolved))
 }
 
