@@ -2085,7 +2085,6 @@ fn merged_name(input: &[u8], args: &crate::args::coff::CoffArgs) -> Result<Vec<u
         );
         name.clone_from(&merge.to);
     }
-    ensure!(name.len() <= 8, "PE section name `{name}` exceeds 8 bytes");
     if separator.is_none() {
         Ok(name.into_bytes())
     } else {
@@ -2897,7 +2896,12 @@ fn write_headers(
     let table = opt + 240;
     for (index, section) in layout.sections.iter().enumerate() {
         let at = table + index * 40;
-        image[at..at + section.name.len()].copy_from_slice(&section.name);
+        // PE image section headers have a fixed eight-byte name field and no
+        // standard string-table indirection. link.exe and lld-link therefore
+        // truncate long, mapped section names here. Keep the full logical name
+        // in the layout so long-name collisions remain distinct sections.
+        let header_name = &section.name[..section.name.len().min(8)];
+        image[at..at + header_name.len()].copy_from_slice(header_name);
         put_u32(image, at + 8, section.virtual_size);
         put_u32(image, at + 12, section.rva);
         put_u32(image, at + 16, section.raw_size);
@@ -3442,6 +3446,54 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn long_section_name_object() -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0xc3], 1);
+        let entry = object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        let eh_frame = object.add_section(
+            Vec::new(),
+            b".eh_frame".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(eh_frame, &[0; 8], 8);
+        object
+            .add_relocation(
+                eh_frame,
+                Relocation {
+                    offset: 0,
+                    symbol: entry,
+                    addend: 0,
+                    flags: object::RelocationFlags::Coff {
+                        typ: object::pe::IMAGE_REL_AMD64_ADDR64,
+                    },
+                },
+            )
+            .unwrap();
+        for (name, contents) in [
+            (b".a_very_long_section".as_slice(), b"first".as_slice()),
+            (b".a_very_long_section2".as_slice(), b"second".as_slice()),
+        ] {
+            let section =
+                object.add_section(Vec::new(), name.to_vec(), object::SectionKind::ReadOnlyData);
+            object.append_section_data(section, contents, 1);
+        }
+        object.write().unwrap()
+    }
+
     fn zero_sized_local_comdat_relocation_object() -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -3697,6 +3749,47 @@ mod tests {
         };
         assert_eq!(merged_name(b".foo$z", &args).unwrap(), b".data$z");
         assert_eq!(merged_name(b".foo$", &args).unwrap(), b".data$");
+    }
+
+    #[test]
+    fn long_section_names_survive_mapping_for_header_only_truncation() {
+        let args = crate::args::coff::CoffArgs::default();
+        assert_eq!(merged_name(b".eh_frame", &args).unwrap(), b".eh_frame");
+        assert_eq!(
+            merged_name(b".a_very_long_section$z", &args).unwrap(),
+            b".a_very_long_section$z"
+        );
+    }
+
+    #[test]
+    fn emits_lld_compatible_truncated_headers_for_long_sections() {
+        let bytes = long_section_name_object();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"long-sections.exe",
+            Some("entry"),
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+
+        let file = object::File::parse(image.bytes.as_slice()).unwrap();
+        let eh_frame = file.section_by_name(".eh_fram").unwrap();
+        assert_eq!(
+            u64::from_le_bytes(eh_frame.data().unwrap()[..8].try_into().unwrap()),
+            file.section_by_name(".text").unwrap().address()
+        );
+        assert_eq!(
+            file.sections()
+                .filter(|section| section.name().unwrap() == ".a_very_")
+                .count(),
+            2
+        );
     }
 
     #[test]
