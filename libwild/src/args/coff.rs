@@ -83,6 +83,18 @@ pub(crate) struct GuardOptions {
     pub(crate) no_long_jump: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GuardSymbolFlags {
+    /// The symbol is present in GFIDS but explicitly suppressed as a valid CFG target.
+    pub(crate) suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardSymbol {
+    pub(crate) symbol: String,
+    pub(crate) flags: GuardSymbolFlags,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestDependency {
     /// The link.exe manifest dependency payload, preserving symbol and assembly-name case.
@@ -138,6 +150,7 @@ pub struct CoffArgs {
     pub(crate) manifest_dependencies: Vec<ManifestDependency>,
     pub(crate) runtime_resolution: RuntimeResolution,
     pub(crate) guard: GuardOptions,
+    pub(crate) guard_symbols: Vec<GuardSymbol>,
     pub(crate) edit_and_continue: bool,
     pub(crate) disallowed_libraries: Vec<String>,
     pub(crate) merges: Vec<SectionMerge>,
@@ -201,6 +214,7 @@ impl Default for CoffArgs {
                 control_flow: OptSetting::Default,
                 no_long_jump: false,
             },
+            guard_symbols: Vec::new(),
             edit_and_continue: false,
             disallowed_libraries: Vec::new(),
             merges: Vec::new(),
@@ -385,6 +399,11 @@ where
                 &mut args.guard,
                 required_value("/GUARD", inline_value, &mut input)?,
             )?,
+            "guardsym" => args.guard_symbols.push(parse_guard_symbol(required_value(
+                "/GUARDSYM",
+                inline_value,
+                &mut input,
+            )?)?),
             "manifestdependency" => {
                 let value = required_value("/MANIFESTDEPENDENCY", inline_value, &mut input)?;
                 args.manifest_dependencies.push(ManifestDependency {
@@ -584,6 +603,36 @@ fn set_guard_control_flow(options: &mut GuardOptions, setting: OptSetting) -> Re
     }
     options.control_flow = setting;
     Ok(())
+}
+
+fn parse_guard_symbol(value: &str) -> Result<GuardSymbol> {
+    let mut fields = value.split(',');
+    let symbol = fields.next().unwrap_or_default();
+    if symbol.is_empty() {
+        bail!("/GUARDSYM expects a non-empty symbol name");
+    }
+
+    let mut flags = GuardSymbolFlags::default();
+    if let Some(raw_flags) = fields.next() {
+        if raw_flags.is_empty() {
+            bail!("/GUARDSYM flags must not be empty");
+        }
+        for flag in raw_flags.chars() {
+            match flag.to_ascii_lowercase() {
+                's' if !flags.suppressed => flags.suppressed = true,
+                's' => bail!("duplicate /GUARDSYM flag `{flag}`"),
+                _ => bail!("unsupported /GUARDSYM flag `{flag}`; supported flag is S"),
+            }
+        }
+    }
+    if fields.next().is_some() {
+        bail!("/GUARDSYM expects symbol[,flags]");
+    }
+
+    Ok(GuardSymbol {
+        symbol: symbol.to_owned(),
+        flags,
+    })
 }
 
 fn required_value<'a, I>(
@@ -1194,6 +1243,55 @@ mod tests {
         let mut disabled = CoffArgs::default();
         parse(&mut disabled, ["/GUARD:NO"].into_iter()).unwrap();
         assert_eq!(disabled.guard.control_flow, OptSetting::Disabled);
+    }
+
+    #[test]
+    fn parses_crt_guard_symbols_with_case_insensitive_flags() {
+        let mut args = CoffArgs::default();
+        parse_directives(
+            &mut args,
+            "/GUARDSYM:__C_specific_handler,S /guardsym:CaseSensitive,s /GuArDsYm:plain",
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.guard_symbols,
+            [
+                GuardSymbol {
+                    symbol: "__C_specific_handler".into(),
+                    flags: GuardSymbolFlags { suppressed: true },
+                },
+                GuardSymbol {
+                    symbol: "CaseSensitive".into(),
+                    flags: GuardSymbolFlags { suppressed: true },
+                },
+                GuardSymbol {
+                    symbol: "plain".into(),
+                    flags: GuardSymbolFlags::default(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn command_line_accepts_guard_symbol_and_rejects_bad_flags() {
+        let mut args = CoffArgs::default();
+        parse(&mut args, ["/guardsym:handler,S"].into_iter()).unwrap();
+        assert_eq!(args.guard_symbols[0].symbol, "handler");
+
+        for invalid in [
+            "/GUARDSYM:",
+            "/GUARDSYM:symbol,",
+            "/GUARDSYM:symbol,X",
+            "/GUARDSYM:symbol,SS",
+            "/GUARDSYM:symbol,S,extra",
+        ] {
+            let mut args = CoffArgs::default();
+            assert!(
+                parse(&mut args, [invalid].into_iter()).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
