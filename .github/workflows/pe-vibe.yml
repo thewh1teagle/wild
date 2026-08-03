@@ -242,14 +242,47 @@ jobs:
             }
           }
 
-          $headers = (& dumpbin.exe /headers $executable | Out-String)
-          if ($LASTEXITCODE -ne 0 -or $headers -notmatch '8664 machine \(x64\)') {
-            throw "Vibe $env:VIBE_PROFILE is not an x86-64 PE executable"
+          $resolvedExecutable = (Resolve-Path $executable).Path
+          $stream = [System.IO.File]::OpenRead($resolvedExecutable)
+          $reader = $null
+          try {
+            if ($stream.Length -lt 64) {
+              throw "Vibe $env:VIBE_PROFILE PE is only $($stream.Length) bytes"
+            }
+            $reader = [System.IO.BinaryReader]::new($stream)
+            $dosMagic = $reader.ReadUInt16()
+            if ($dosMagic -ne 0x5a4d) {
+              throw ('Vibe {0} has DOS magic 0x{1:x4}, expected 0x5a4d' -f `
+                $env:VIBE_PROFILE, $dosMagic)
+            }
+
+            $stream.Position = 0x3c
+            [uint32]$peOffset = $reader.ReadUInt32()
+            if ([uint64]$peOffset + 6 -gt [uint64]$stream.Length) {
+              throw ('Vibe {0} has out-of-bounds PE offset 0x{1:x8} for {2} bytes' -f `
+                $env:VIBE_PROFILE, $peOffset, $stream.Length)
+            }
+
+            $stream.Position = $peOffset
+            $peSignature = $reader.ReadUInt32()
+            $machine = $reader.ReadUInt16()
+            if ($peSignature -ne 0x00004550 -or $machine -ne 0x8664) {
+              throw ('Vibe {0} has PE signature 0x{1:x8} and machine 0x{2:x4}; expected PE\0\0 and AMD64 (0x8664)' -f `
+                $env:VIBE_PROFILE, $peSignature, $machine)
+            }
+            Write-Host ('Verified Vibe {0}: PE offset 0x{1:x8}, machine 0x{2:x4}, {3} bytes' -f `
+              $env:VIBE_PROFILE, $peOffset, $machine, $stream.Length)
+          } finally {
+            if ($null -ne $reader) {
+              $reader.Dispose()
+            } else {
+              $stream.Dispose()
+            }
           }
 
           $stdout = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stdout.txt"
           $stderr = Join-Path $env:RUNNER_TEMP "vibe-$env:VIBE_PROFILE.stderr.txt"
-          $process = Start-Process -FilePath (Resolve-Path $executable).Path `
+          $process = Start-Process -FilePath $resolvedExecutable `
             -ArgumentList '--help' -PassThru `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 
