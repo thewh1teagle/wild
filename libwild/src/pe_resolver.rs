@@ -15,7 +15,48 @@ use object::ObjectSymbol;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
+#[cfg(test)]
 type SymbolState = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
+
+struct IncrementalSymbolState {
+    defined: BTreeSet<Vec<u8>>,
+    unresolved: BTreeSet<Vec<u8>>,
+}
+
+impl IncrementalSymbolState {
+    fn new(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> Result<Self> {
+        let mut state = Self {
+            defined: BTreeSet::new(),
+            unresolved: roots.iter().cloned().collect(),
+        };
+        for object in objects {
+            state.absorb_object(object)?;
+        }
+        Ok(state)
+    }
+
+    fn absorb_object(&mut self, object: &crate::coff::CoffObject<'_>) -> Result<()> {
+        for symbol in object.file().symbols() {
+            let name = symbol.name_bytes().context("invalid COFF symbol name")?;
+            if name.is_empty() || !symbol.is_global() {
+                continue;
+            }
+            if symbol.is_undefined() && !symbol.is_common() {
+                self.unresolved.insert(name.to_vec());
+            } else if symbol.is_definition() || symbol.is_common() {
+                self.defined.insert(name.to_vec());
+            }
+        }
+        self.unresolved.retain(|name| !self.defined.contains(name));
+        Ok(())
+    }
+
+    fn define(&mut self, name: &[u8]) -> bool {
+        let changed = self.defined.insert(name.to_vec());
+        self.unresolved.remove(name);
+        changed
+    }
+}
 
 /// Extract regular COFF members from all archives until no archive can satisfy
 /// another unresolved external. Short import objects remain owned by the
@@ -37,6 +78,7 @@ pub(super) fn extract<'data>(
         .collect::<Result<Vec<_>>>()?;
     let mut extracted = HashSet::<(usize, usize)>::new();
     let mut import_definitions = BTreeSet::<Vec<u8>>::new();
+    let mut symbol_state = IncrementalSymbolState::new(objects, roots)?;
 
     loop {
         let mut changed = false;
@@ -49,10 +91,10 @@ pub(super) fn extract<'data>(
             &archives,
             objects,
             whole_archive,
-            roots,
             runtime_resolution,
             &mut extracted,
             &mut import_definitions,
+            &mut symbol_state,
             false,
         )?;
         if changed {
@@ -62,10 +104,10 @@ pub(super) fn extract<'data>(
             &archives,
             objects,
             whole_archive,
-            roots,
             runtime_resolution,
             &mut extracted,
             &mut import_definitions,
+            &mut symbol_state,
             true,
         )?;
         if !changed {
@@ -79,10 +121,10 @@ fn extract_pass<'data>(
     archives: &[CoffArchive<'data>],
     objects: &mut Vec<crate::coff::CoffObject<'data>>,
     whole_archive: &[bool],
-    roots: &[Vec<u8>],
     runtime_resolution: &mut RuntimeResolution,
     extracted: &mut HashSet<(usize, usize)>,
     import_definitions: &mut BTreeSet<Vec<u8>>,
+    symbol_state: &mut IncrementalSymbolState,
     use_alternates: bool,
 ) -> Result<bool> {
     let mut changed = false;
@@ -91,13 +133,14 @@ fn extract_pass<'data>(
         // earlier library must suppress a competing definition in a later one during this
         // same pass. Keep the outer loop because a later library may introduce a new demand
         // that can be satisfied by an earlier library on the next pass.
-        let (mut defined, mut unresolved) = symbol_state(objects, roots)?;
-        defined.extend(import_definitions.iter().cloned());
-        unresolved.retain(|name| !defined.contains(name));
         let unresolved = if use_alternates {
-            resolve_alternate_demands(unresolved, &defined, runtime_resolution)?
+            resolve_alternate_demands(
+                symbol_state.unresolved.clone(),
+                &symbol_state.defined,
+                runtime_resolution,
+            )?
         } else {
-            unresolved
+            symbol_state.unresolved.clone()
         };
         let demands = unresolved
             .iter()
@@ -106,7 +149,11 @@ fn extract_pass<'data>(
                 kind: ArchiveDemandKind::Strong,
             })
             .collect::<Vec<_>>();
-        let defined_refs = defined.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let defined_refs = symbol_state
+            .defined
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
         let plan = archive.plan(&demands, &defined_refs, whole_archive[archive_index]);
         for selected in plan.selected() {
             let member = selected.member();
@@ -115,14 +162,15 @@ fn extract_pass<'data>(
             }
             match member.kind() {
                 CoffArchiveMemberKind::CoffObject { .. } => {
-                    objects.push(crate::coff::CoffObject::parse(member.data()).with_context(
-                        || {
+                    let object =
+                        crate::coff::CoffObject::parse(member.data()).with_context(|| {
                             format!(
                                 "invalid COFF archive member `{}`",
                                 String::from_utf8_lossy(member.name())
                             )
-                        },
-                    )?);
+                        })?;
+                    symbol_state.absorb_object(&object)?;
+                    objects.push(object);
                     changed = true;
                 }
                 CoffArchiveMemberKind::ShortImport(_) => {
@@ -130,7 +178,10 @@ fn extract_pass<'data>(
                     // the original archive. Do not parse these as ordinary objects, but do
                     // retain their definitions for subsequent archive decisions.
                     for definition in member.definitions() {
-                        changed |= import_definitions.insert(definition.to_vec());
+                        if import_definitions.insert(definition.to_vec()) {
+                            symbol_state.define(definition);
+                            changed = true;
+                        }
                     }
                 }
                 CoffArchiveMemberKind::Opaque => {
@@ -177,24 +228,10 @@ fn resolve_alternate_demands(
         .collect()
 }
 
+#[cfg(test)]
 fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> Result<SymbolState> {
-    let mut defined = BTreeSet::new();
-    let mut unresolved = roots.iter().cloned().collect::<BTreeSet<_>>();
-    for object in objects {
-        for symbol in object.file().symbols() {
-            let name = symbol.name_bytes().context("invalid COFF symbol name")?;
-            if name.is_empty() || !symbol.is_global() {
-                continue;
-            }
-            if symbol.is_undefined() && !symbol.is_common() {
-                unresolved.insert(name.to_vec());
-            } else if symbol.is_definition() || symbol.is_common() {
-                defined.insert(name.to_vec());
-            }
-        }
-    }
-    unresolved.retain(|name| !defined.contains(name));
-    Ok((defined, unresolved))
+    let state = IncrementalSymbolState::new(objects, roots)?;
+    Ok((state.defined, state.unresolved))
 }
 
 #[cfg(test)]
