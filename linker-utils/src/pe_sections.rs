@@ -129,10 +129,23 @@ pub fn layout_sections(
     contributions: &[SectionContribution],
     options: SectionLayoutOptions,
 ) -> Result<SectionLayout> {
+    layout_sections_borrowed(contributions.iter(), options)
+}
+
+/// Borrowing variant of [`layout_sections`] for callers that embed section
+/// specifications in a larger contribution type.
+///
+/// Accepting an iterator of references avoids cloning names and specifications
+/// solely to construct a temporary contiguous slice. The returned layout owns
+/// all names and placement data that it retains.
+pub fn layout_sections_borrowed<'a>(
+    contributions: impl IntoIterator<Item = &'a SectionContribution>,
+    options: SectionLayoutOptions,
+) -> Result<SectionLayout> {
     validate_options(options)?;
     let mut ids = BTreeSet::new();
     let mut groups = BTreeMap::<Vec<u8>, Group<'_>>::new();
-    for (input_index, contribution) in contributions.iter().enumerate() {
+    for (input_index, contribution) in contributions.into_iter().enumerate() {
         ensure!(
             ids.insert(contribution.id),
             "duplicate contribution id {}",
@@ -502,6 +515,38 @@ mod tests {
         assert_eq!(layout.placements[&ContributionId(2)].offset, 4);
         assert_eq!(layout.placements[&ContributionId(3)].offset, 16);
         assert_eq!(layout.placements[&ContributionId(1)].offset, 18);
+    }
+
+    #[test]
+    fn borrowed_layout_accepts_embedded_contribution_specs() {
+        struct Embedded {
+            spec: SectionContribution,
+            unrelated_payload: Vec<u8>,
+        }
+
+        let inputs = [
+            Embedded {
+                spec: contribution(7, b".rdata$z", ContributionKind::Data, 3, 1),
+                unrelated_payload: vec![1, 2, 3],
+            },
+            Embedded {
+                spec: contribution(3, b".text$a", ContributionKind::Data, 5, 4),
+                unrelated_payload: vec![4, 5],
+            },
+        ];
+        let expected = layout_sections(
+            &inputs
+                .iter()
+                .map(|input| input.spec.clone())
+                .collect::<Vec<_>>(),
+            options(),
+        )
+        .unwrap();
+        let actual =
+            layout_sections_borrowed(inputs.iter().map(|input| &input.spec), options()).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(inputs[0].unrelated_payload, [1, 2, 3]);
     }
 
     #[test]
