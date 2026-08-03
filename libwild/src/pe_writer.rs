@@ -650,8 +650,14 @@ fn find_input<F: FileSystem>(
     requested: &Path,
     args: &crate::args::coff::CoffArgs,
 ) -> Result<PathBuf> {
+    let implicit_name = implicit_library_name(requested);
     if matches!(fs.file_type(requested), Ok(crate::fs::FileType::File)) {
         return Ok(requested.to_path_buf());
+    }
+    if let Some(implicit_name) = &implicit_name
+        && matches!(fs.file_type(implicit_name), Ok(crate::fs::FileType::File))
+    {
+        return Ok(implicit_name.clone());
     }
     let environment_paths = std::env::var_os("LIB")
         .map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
@@ -666,8 +672,24 @@ fn find_input<F: FileSystem>(
         if matches!(fs.file_type(&candidate), Ok(crate::fs::FileType::File)) {
             return Ok(candidate);
         }
+        if let Some(implicit_name) = &implicit_name {
+            let candidate = directory.join(implicit_name);
+            if matches!(fs.file_type(&candidate), Ok(crate::fs::FileType::File)) {
+                return Ok(candidate);
+            }
+        }
     }
     Err(error!("cannot find COFF input `{}`", requested.display()))
+}
+
+fn implicit_library_name(requested: &Path) -> Option<PathBuf> {
+    let text = requested.to_str()?;
+    if requested.extension().is_some() || text.contains('/') || text.contains('\\') {
+        return None;
+    }
+    let mut name = requested.to_path_buf();
+    name.set_extension("lib");
+    Some(name)
 }
 
 fn undefined_symbols(
@@ -2726,6 +2748,73 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bare_library_names_gain_lib_suffix_in_search_path_order() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_library = first.path().join("runtime.lib");
+        let second_library = second.path().join("runtime.lib");
+        std::fs::write(&first_library, b"first").unwrap();
+        std::fs::write(&second_library, b"second").unwrap();
+        let args = crate::args::coff::CoffArgs {
+            lib_search_path: vec![first.path().into(), second.path().into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            find_input(&crate::fs::OsFileSystem, Path::new("runtime"), &args).unwrap(),
+            first_library
+        );
+    }
+
+    #[test]
+    fn exact_extensionless_library_wins_before_implicit_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let exact = directory.path().join("runtime");
+        std::fs::write(&exact, b"exact").unwrap();
+        std::fs::write(directory.path().join("runtime.lib"), b"suffixed").unwrap();
+        let args = crate::args::coff::CoffArgs {
+            lib_search_path: vec![directory.path().into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            find_input(&crate::fs::OsFileSystem, Path::new("runtime"), &args).unwrap(),
+            exact
+        );
+    }
+
+    #[test]
+    fn explicit_extensions_and_paths_do_not_gain_lib_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("runtime.custom.lib"), b"library").unwrap();
+        std::fs::write(directory.path().join("nested.lib"), b"library").unwrap();
+        let args = crate::args::coff::CoffArgs {
+            lib_search_path: vec![directory.path().into()],
+            ..Default::default()
+        };
+
+        let extension_error =
+            find_input(&crate::fs::OsFileSystem, Path::new("runtime.custom"), &args)
+                .unwrap_err()
+                .to_string();
+        assert!(extension_error.contains("runtime.custom"));
+
+        let explicit_path = directory.path().join("nested");
+        let path_error = find_input(&crate::fs::OsFileSystem, &explicit_path, &args)
+            .unwrap_err()
+            .to_string();
+        assert!(path_error.contains(&explicit_path.display().to_string()));
+    }
+
+    #[test]
+    fn library_policy_names_remain_case_and_suffix_insensitive() {
+        assert!(same_library_name("MSVCRT", "msvcrt.lib"));
+        assert!(same_library_name("Runtime.LIB", "runtime"));
+        assert!(path_matches(Path::new("sdk/Foo.LIB"), "FOO"));
+        assert!(!same_library_name("foo.dll", "foo"));
     }
 
     #[test]
