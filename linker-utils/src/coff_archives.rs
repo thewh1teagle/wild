@@ -360,6 +360,25 @@ impl<'data> CoffArchive<'data> {
         })
     }
 
+    /// Reports whether this archive has a linker symbol index without parsing ordinary members.
+    pub fn has_symbol_index(data: &'data [u8]) -> Result<bool> {
+        let archive = ArchiveFile::parse(data).map_err(|error| {
+            CoffArchiveError::archive(
+                CoffArchiveErrorKind::InvalidArchive,
+                format!("invalid archive: {error}"),
+            )
+        })?;
+        archive
+            .symbols()
+            .map(|symbols| symbols.is_some())
+            .map_err(|error| {
+                CoffArchiveError::archive(
+                    CoffArchiveErrorKind::InvalidSymbolIndex,
+                    format!("invalid archive symbol index: {error}"),
+                )
+            })
+    }
+
     #[must_use]
     pub fn members(&self) -> &[CoffArchiveMember<'data>] {
         &self.members
