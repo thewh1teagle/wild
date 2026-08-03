@@ -1,0 +1,48 @@
+name: PE/COFF Tauri acceptance
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: pe-tauri-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  windows-tauri:
+    name: Tauri debug and release (Windows x86-64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            wild/tests/tauri-acceptance -> ../../../target/tauri-acceptance
+      - name: Build Wild
+        run: >-
+          cargo build --profile ci -p wild-linker
+          --no-default-features --features pe
+      - name: Select Wild as the MSVC linker and build Tauri
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/pe-linker | Out-Null
+          Copy-Item target/ci/wild.exe target/pe-linker/link.exe
+          wild/tests/tauri-acceptance/verify.ps1 `
+            -Linker (Resolve-Path target/pe-linker/link.exe).Path `
+            -TargetDirectory (Join-Path $PWD 'target/tauri-acceptance')

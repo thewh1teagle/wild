@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Wild PE Tauri Acceptance",
+  "version": "0.1.0",
+  "identifier": "org.wildlinker.pe-acceptance",
+  "build": {
+    "frontendDist": "dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Wild PE Tauri Acceptance",
+        "width": 320,
+        "height": 240,
+        "visible": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}
