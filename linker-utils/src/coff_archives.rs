@@ -439,6 +439,51 @@ impl<'data> CoffArchive<'data> {
         self.plan_impl(demands, whole_archive, &mut is_defined, false)
     }
 
+    /// Selects shallow archive members without materializing the unresolved-demand result.
+    ///
+    /// This is equivalent to [`Self::plan_shallow_with_defined_lookup`] for callers that only
+    /// consume the selected members. It first discards demands that this archive cannot satisfy,
+    /// then retains borrowed demand and definition names while planning. Large links commonly
+    /// have many archives but only a handful of relevant demands per archive, so avoiding an
+    /// owned copy of every global demand for every archive substantially reduces resolver work.
+    pub fn select_shallow_members_with_defined_lookup<'archive, 'name>(
+        &'archive self,
+        demands: &[ArchiveDemand<'name>],
+        whole_archive: bool,
+        mut is_defined: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<&'archive CoffArchiveMember<'data>> {
+        if whole_archive {
+            return self.members.iter().collect();
+        }
+
+        let candidates = demands
+            .iter()
+            .filter_map(|demand| {
+                self.definition_members
+                    .get(demand.name)
+                    .filter(|_| !is_defined(demand.name))
+                    .map(|entry| (demand.name, entry.first))
+            })
+            .collect::<Vec<_>>();
+        let mut local_definitions = HashSet::<&[u8]>::new();
+        let mut selected_indices = HashSet::new();
+        let mut selected = Vec::new();
+        loop {
+            let candidate = candidates.iter().find_map(|(name, member_index)| {
+                (!local_definitions.contains(name) && !selected_indices.contains(member_index))
+                    .then_some(*member_index)
+            });
+            let Some(member_index) = candidate else {
+                break;
+            };
+            selected_indices.insert(member_index);
+            let member = &self.members[member_index];
+            local_definitions.extend(member.definitions.iter().map(AsRef::as_ref));
+            selected.push(member);
+        }
+        selected
+    }
+
     fn plan_impl<'archive, 'name>(
         &'archive self,
         demands: &[ArchiveDemand<'name>],
@@ -1090,6 +1135,69 @@ mod tests {
         let full = parsed.plan(&[demand], &[], false);
         assert_eq!(full.selected().len(), 2);
         assert!(parsed.members()[1].demands.get().is_some());
+    }
+
+    #[test]
+    fn borrowed_shallow_selection_matches_shallow_plan() {
+        let archive = test_archive(
+            TestArchiveKind::Gnu,
+            &[
+                TestMember {
+                    name: "first.obj",
+                    data: coff_object(&["first", "alias"], &[]),
+                    symbols: &["first", "alias"],
+                },
+                TestMember {
+                    name: "second.obj",
+                    data: coff_object(&["second"], &[]),
+                    symbols: &["second"],
+                },
+            ],
+            false,
+        );
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        let demands = [
+            ArchiveDemand {
+                name: b"missing",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"alias",
+                kind: ArchiveDemandKind::Strong,
+            },
+            ArchiveDemand {
+                name: b"first",
+                kind: ArchiveDemandKind::WeakLibrary,
+            },
+            ArchiveDemand {
+                name: b"second",
+                kind: ArchiveDemandKind::Strong,
+            },
+        ];
+        let planned = parsed.plan_shallow_with_defined_lookup(&demands, false, |_| false);
+        let borrowed =
+            parsed.select_shallow_members_with_defined_lookup(&demands, false, |_| false);
+        assert_eq!(
+            borrowed
+                .iter()
+                .map(|member| member.index())
+                .collect::<Vec<_>>(),
+            planned
+                .selected()
+                .iter()
+                .map(|selected| selected.member().index())
+                .collect::<Vec<_>>()
+        );
+
+        let planned =
+            parsed.plan_shallow_with_defined_lookup(&demands, false, |name| name == b"second");
+        let borrowed = parsed
+            .select_shallow_members_with_defined_lookup(&demands, false, |name| name == b"second");
+        assert_eq!(borrowed.len(), planned.selected().len());
+        assert_eq!(borrowed[0].index(), planned.selected()[0].member().index());
+
+        let borrowed = parsed.select_shallow_members_with_defined_lookup(&[], true, |_| false);
+        assert_eq!(borrowed.len(), parsed.members().len());
     }
 
     #[test]

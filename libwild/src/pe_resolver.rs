@@ -21,10 +21,10 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 #[cfg(test)]
-type SymbolState = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
+type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 struct IncrementalSymbolState {
-    defined: BTreeSet<Vec<u8>>,
+    defined: HashSet<Vec<u8>>,
     unresolved: BTreeSet<Vec<u8>>,
     weak_resolution: WeakExternalResolution,
     absorbed_objects: usize,
@@ -33,7 +33,7 @@ struct IncrementalSymbolState {
 impl IncrementalSymbolState {
     fn new() -> Self {
         Self {
-            defined: BTreeSet::new(),
+            defined: HashSet::new(),
             unresolved: BTreeSet::new(),
             weak_resolution: WeakExternalResolution::default(),
             absorbed_objects: 0,
@@ -330,13 +330,12 @@ fn extract_pass<'data>(
             );
             demands
         };
-        let plan = archive.plan_shallow_with_defined_lookup(
+        let selected = archive.select_shallow_members_with_defined_lookup(
             &demands,
             whole_archive[archive_index],
             |name| symbol_state.defined.contains(name),
         );
-        for selected in plan.selected() {
-            let member = selected.member();
+        for member in selected {
             if !extracted.insert((archive_index, member.index())) {
                 continue;
             }
@@ -393,7 +392,7 @@ fn extract_pass<'data>(
 
 fn fallback_demands(
     unresolved: BTreeSet<Vec<u8>>,
-    defined: &BTreeSet<Vec<u8>>,
+    defined: &HashSet<Vec<u8>>,
     runtime_resolution: &RuntimeResolution,
     weak_resolution: &WeakExternalResolution,
 ) -> Result<BTreeSet<Vec<u8>>> {
