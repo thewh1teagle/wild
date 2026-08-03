@@ -272,6 +272,7 @@ impl<F: FileSystem> Linker<F> {
             Args::Elf(elf_args) => crate::elf::link_for_arch(self, elf_args),
             Args::MachO(macho_args) => crate::macho::link_for_arch(self, macho_args),
             Args::Wasm(wasm_args) => crate::wasm::link_for_arch(self, wasm_args),
+            Args::Coff(coff_args) => crate::pe_writer::link(self.file_system.as_ref(), coff_args),
         }
     }
 
