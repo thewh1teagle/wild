@@ -2807,9 +2807,15 @@ fn discarded_comdat_sections_with_metadata(
     use linker_utils::coff_symbols::select_comdat;
 
     let classify_phase = crate::timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
-    let section_groups = objects
-        .iter()
+    // Classifying one object's COMDAT topology neither reads nor mutates another object's
+    // state. Keep the indexed result slots in input order, then unwrap them serially so a
+    // malformed input still reports the first object-order error regardless of thread count.
+    let section_group_results = objects
+        .par_iter()
         .map(|input| cached_comdat_sections(input.file()))
+        .collect::<Vec<_>>();
+    let section_groups = section_group_results
+        .into_iter()
         .collect::<Result<Vec<_>>>()?;
     let analysis = CompactComdatAnalysis::new(objects, &section_groups)?;
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
@@ -3147,45 +3153,60 @@ fn unreferenced_comdat_sections(
     let mut edge_heads = vec![no_edge; comdats.analysis.groups.len()];
     let mut edge_targets = Vec::<ComdatGroupId>::new();
     let mut edge_next = Vec::<usize>::new();
-    for (object_index, object) in objects.iter().enumerate() {
-        for section in object.file().sections() {
-            let key = (object_index, section.index());
-            if comdats.discarded.contains(&key) {
-                continue;
-            }
-            let source_node = comdats
-                .analysis
-                .node(key)
-                .context("relocation source has an invalid COFF section")?;
-            let Some(source_group) = resolved_groups[source_node] else {
-                continue;
-            };
-            for (_, relocation) in section.relocations() {
-                let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+    // Relocation decoding and target resolution are object-local and read-only. Discover edges
+    // in parallel, but retain section/relocation order inside each object and merge object slots
+    // serially. Besides deterministic diagnostics, the ordered merge preserves the linked-list
+    // insertion order (and therefore the existing DFS visitation order) exactly.
+    let object_edge_results = objects
+        .par_iter()
+        .enumerate()
+        .map(|(object_index, object)| {
+            let mut edges = Vec::<(ComdatGroupId, ComdatGroupId)>::new();
+            for section in object.file().sections() {
+                let key = (object_index, section.index());
+                if comdats.discarded.contains(&key) {
+                    continue;
+                }
+                let source_node = comdats
+                    .analysis
+                    .node(key)
+                    .context("relocation source has an invalid COFF section")?;
+                let Some(source_group) = resolved_groups[source_node] else {
                     continue;
                 };
-                let symbol = object
-                    .file()
-                    .symbol_by_index(symbol_index)
-                    .context("invalid COFF relocation symbol")?;
-                let target = if let Some(section) = symbol.section_index() {
-                    let node = comdats
-                        .analysis
-                        .node((object_index, section))
-                        .context("relocation targets an invalid COFF section")?;
-                    resolved_groups[node]
-                } else if symbol.is_global() {
-                    resolve_definition(symbol.name_bytes()?)?
-                } else {
-                    None
-                };
-                if let Some(target) = target {
-                    let edge = edge_targets.len();
-                    edge_targets.push(target);
-                    edge_next.push(edge_heads[source_group]);
-                    edge_heads[source_group] = edge;
+                for (_, relocation) in section.relocations() {
+                    let RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+                        continue;
+                    };
+                    let symbol = object
+                        .file()
+                        .symbol_by_index(symbol_index)
+                        .context("invalid COFF relocation symbol")?;
+                    let target = if let Some(section) = symbol.section_index() {
+                        let node = comdats
+                            .analysis
+                            .node((object_index, section))
+                            .context("relocation targets an invalid COFF section")?;
+                        resolved_groups[node]
+                    } else if symbol.is_global() {
+                        resolve_definition(symbol.name_bytes()?)?
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        edges.push((source_group, target));
+                    }
                 }
             }
+            Ok(edges)
+        })
+        .collect::<Vec<Result<Vec<_>>>>();
+    for object_edges in object_edge_results {
+        for (source_group, target) in object_edges? {
+            let edge = edge_targets.len();
+            edge_targets.push(target);
+            edge_next.push(edge_heads[source_group]);
+            edge_heads[source_group] = edge;
         }
     }
     while let Some(group) = pending.pop() {
@@ -5905,6 +5926,81 @@ mod tests {
         assert!(contributions.iter().all(|contribution| {
             !matches!(contribution.source, Source::Object { object: 3, .. })
         }));
+    }
+
+    #[test]
+    fn parallel_comdat_classification_and_ref_edges_match_single_thread() {
+        let caller = relocation_object(b"caller", b"middle");
+        let middle = comdat_relocation_object(b"middle", b"target");
+        let winner = comdat_object(
+            b"target",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"winner",
+            0,
+            true,
+        );
+        let loser = comdat_object(
+            b"target",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"loser",
+            0,
+            false,
+        );
+        let dead = comdat_object(
+            b"dead",
+            object::SymbolScope::Linkage,
+            object::ComdatKind::Any,
+            b"dead",
+            0,
+            false,
+        );
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&middle).unwrap(),
+            crate::coff::CoffObject::parse(&winner).unwrap(),
+            crate::coff::CoffObject::parse(&loser).unwrap(),
+            crate::coff::CoffObject::parse(&dead).unwrap(),
+        ];
+        let args = crate::args::coff::CoffArgs {
+            optimization: crate::args::coff::OptimizationOptions {
+                ref_: crate::args::coff::OptSetting::Enabled,
+                icf: crate::args::coff::OptSetting::Default,
+            },
+            ..Default::default()
+        };
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let resolution = discarded_comdat_sections(&objects).unwrap();
+                    let (contributions, redirects) = collect_contributions_with_roots(
+                        &objects,
+                        &args,
+                        &[b"caller".to_vec()],
+                        &Default::default(),
+                    )
+                    .unwrap();
+                    let sources = contributions
+                        .iter()
+                        .map(|contribution| match contribution.source {
+                            Source::Object { object, section } => Some((object, section)),
+                            Source::Synthetic => None,
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        resolution.discarded,
+                        resolution.redirects,
+                        sources,
+                        redirects,
+                    )
+                })
+        };
+
+        assert_eq!(run(4), run(1));
     }
 
     #[test]
