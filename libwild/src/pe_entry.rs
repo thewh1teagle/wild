@@ -29,10 +29,18 @@ enum EntryFamily {
 /// intentional: archive contents must not accidentally decide whether a program is console or
 /// GUI, and the selected CRT startup symbol needs to become the demand that extracts the right
 /// archive member.
-pub(super) fn select(
+#[cfg(test)]
+fn select(args: &CoffArgs, objects: &[crate::coff::CoffObject<'_>]) -> Result<Option<String>> {
+    select_from_objects(args, objects.iter())
+}
+
+pub(super) fn select_from_objects<'data, 'objects>(
     args: &CoffArgs,
-    objects: &[crate::coff::CoffObject<'_>],
-) -> Result<Option<String>> {
+    objects: impl IntoIterator<Item = &'objects crate::coff::CoffObject<'data>>,
+) -> Result<Option<String>>
+where
+    'data: 'objects,
+{
     if args.no_entry {
         return Ok(None);
     }
@@ -50,7 +58,12 @@ pub(super) fn select(
     .map(|entry| Some(entry.to_owned()))
 }
 
-fn user_definitions(objects: &[crate::coff::CoffObject<'_>]) -> Result<BTreeSet<Vec<u8>>> {
+fn user_definitions<'data, 'objects>(
+    objects: impl IntoIterator<Item = &'objects crate::coff::CoffObject<'data>>,
+) -> Result<BTreeSet<Vec<u8>>>
+where
+    'data: 'objects,
+{
     let mut definitions = BTreeSet::new();
     for object in objects {
         for symbol in object.file().symbols() {
