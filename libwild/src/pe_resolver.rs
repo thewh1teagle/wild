@@ -69,6 +69,15 @@ pub(super) fn extract<'data>(
                         // The PE import builder consumes selected import symbols from
                         // the original archive. Do not parse these as ordinary objects.
                     }
+                    CoffArchiveMemberKind::Opaque => {
+                        return Err(error!(
+                            "unsupported selected COFF archive member `{}`: {}",
+                            String::from_utf8_lossy(member.name()),
+                            member
+                                .opaque_error()
+                                .expect("opaque archive members retain their parse error")
+                        ));
+                    }
                 }
             }
         }
