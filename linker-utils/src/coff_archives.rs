@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::sync::OnceLock;
 
 /// The broad category of an archive parsing failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +114,7 @@ pub struct CoffArchiveMember<'data> {
     kind: CoffArchiveMemberKind<'data>,
     opaque_error: Option<CoffArchiveError>,
     definitions: Vec<Vec<u8>>,
-    demands: Vec<OwnedArchiveDemand>,
+    demands: OnceLock<Result<Vec<OwnedArchiveDemand>>>,
     file_range: (u64, u64),
 }
 
@@ -147,6 +148,13 @@ impl<'data> CoffArchiveMember<'data> {
     #[must_use]
     pub fn definitions(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.definitions.iter().map(Vec::as_slice)
+    }
+
+    fn demands(&self) -> &[OwnedArchiveDemand] {
+        self.demands
+            .get_or_init(|| parse_member(self.name, self.data).map(|(_, _, demands)| demands))
+            .as_deref()
+            .unwrap_or_default()
     }
 }
 
@@ -252,6 +260,15 @@ impl<'data> CoffArchive<'data> {
             }
         }
 
+        let has_symbol_index = archive
+            .symbols()
+            .map_err(|error| {
+                CoffArchiveError::archive(
+                    CoffArchiveErrorKind::InvalidSymbolIndex,
+                    format!("invalid archive symbol index: {error}"),
+                )
+            })?
+            .is_some();
         let mut members = Vec::new();
         for raw_member in archive.members() {
             let raw_member = raw_member.map_err(|error| {
@@ -268,23 +285,17 @@ impl<'data> CoffArchive<'data> {
                     format!("cannot read data: {error}"),
                 )
             })?;
-            let parsed = match parse_member(name, member_data) {
-                Ok((kind, definitions, demands)) => ParsedMember {
-                    kind,
-                    definitions,
-                    demands,
-                    opaque_error: None,
-                },
-                Err(error) if error.kind() == CoffArchiveErrorKind::UnsupportedMember => {
-                    ParsedMember {
-                        kind: CoffArchiveMemberKind::Opaque,
-                        definitions: Vec::new(),
-                        demands: Vec::new(),
-                        opaque_error: Some(error),
-                    }
-                }
-                Err(error) => return Err(error),
+            let parsed = if has_symbol_index {
+                classify_member(name, member_data)
+            } else {
+                eagerly_parse_member(name, member_data)?
             };
+            let demands = OnceLock::new();
+            if let Some(parsed_demands) = parsed.demands {
+                demands
+                    .set(Ok(parsed_demands))
+                    .expect("new archive-member demand cell is empty");
+            }
             members.push(CoffArchiveMember {
                 index: members.len(),
                 name,
@@ -292,7 +303,7 @@ impl<'data> CoffArchive<'data> {
                 kind: parsed.kind,
                 opaque_error: parsed.opaque_error,
                 definitions: parsed.definitions,
-                demands: parsed.demands,
+                demands,
                 file_range: raw_member.file_range(),
             });
         }
@@ -354,6 +365,19 @@ impl<'data> CoffArchive<'data> {
         &self.members
     }
 
+    /// Returns whether the archive index associates `name` with a regular COFF object.
+    #[must_use]
+    pub fn has_object_definition(&self, name: &[u8]) -> bool {
+        self.definition_members.get(name).is_some_and(|members| {
+            members.iter().any(|&index| {
+                matches!(
+                    self.members[index].kind,
+                    CoffArchiveMemberKind::CoffObject { .. }
+                )
+            })
+        })
+    }
+
     /// Selects members to a fixpoint.
     ///
     /// `defined` contains definitions supplied by objects seen before this
@@ -383,13 +407,36 @@ impl<'data> CoffArchive<'data> {
         whole_archive: bool,
         mut is_defined: impl FnMut(&[u8]) -> bool,
     ) -> CoffArchivePlan<'archive, 'data> {
+        self.plan_impl(demands, whole_archive, &mut is_defined, true)
+    }
+
+    /// Select members for the caller's current demand set without decoding newly selected COFF
+    /// symbol tables. The caller must absorb selected objects and invoke this method again for
+    /// any demands they introduce. This is useful for linkers that already parse selected objects
+    /// into their own symbol database and avoids doing that work twice.
+    pub fn plan_shallow_with_defined_lookup<'archive, 'name>(
+        &'archive self,
+        demands: &[ArchiveDemand<'name>],
+        whole_archive: bool,
+        mut is_defined: impl FnMut(&[u8]) -> bool,
+    ) -> CoffArchivePlan<'archive, 'data> {
+        self.plan_impl(demands, whole_archive, &mut is_defined, false)
+    }
+
+    fn plan_impl<'archive, 'name>(
+        &'archive self,
+        demands: &[ArchiveDemand<'name>],
+        whole_archive: bool,
+        is_defined: &mut impl FnMut(&[u8]) -> bool,
+        expand_demands: bool,
+    ) -> CoffArchivePlan<'archive, 'data> {
         let mut definitions = HashSet::<Vec<u8>>::new();
         let mut unresolved = Vec::new();
         for demand in demands {
             add_demand_with_lookup(
                 &mut unresolved,
                 &definitions,
-                &mut is_defined,
+                is_defined,
                 demand.name,
                 demand.kind,
             );
@@ -404,7 +451,8 @@ impl<'data> CoffArchive<'data> {
                     member,
                     &mut definitions,
                     &mut unresolved,
-                    &mut is_defined,
+                    is_defined,
+                    expand_demands,
                 );
                 selected.push(SelectedArchiveMember {
                     member,
@@ -430,7 +478,8 @@ impl<'data> CoffArchive<'data> {
                     member,
                     &mut definitions,
                     &mut unresolved,
-                    &mut is_defined,
+                    is_defined,
+                    expand_demands,
                 );
                 selected.push(SelectedArchiveMember {
                     member,
@@ -449,8 +498,69 @@ impl<'data> CoffArchive<'data> {
 struct ParsedMember<'data> {
     kind: CoffArchiveMemberKind<'data>,
     definitions: Vec<Vec<u8>>,
-    demands: Vec<OwnedArchiveDemand>,
+    demands: Option<Vec<OwnedArchiveDemand>>,
     opaque_error: Option<CoffArchiveError>,
+}
+
+fn eagerly_parse_member<'data>(name: &[u8], data: &'data [u8]) -> Result<ParsedMember<'data>> {
+    match parse_member(name, data) {
+        Ok((kind, definitions, demands)) => Ok(ParsedMember {
+            kind,
+            definitions,
+            demands: Some(demands),
+            opaque_error: None,
+        }),
+        Err(error) if error.kind() == CoffArchiveErrorKind::UnsupportedMember => Ok(ParsedMember {
+            kind: CoffArchiveMemberKind::Opaque,
+            definitions: Vec::new(),
+            demands: Some(Vec::new()),
+            opaque_error: Some(error),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// Classify indexed members without walking their symbol tables. The archive linker index is
+/// sufficient for extraction; undefined symbols are decoded only if the member is selected.
+fn classify_member<'data>(name: &[u8], data: &'data [u8]) -> ParsedMember<'data> {
+    let kind = match FileKind::parse(data) {
+        Ok(FileKind::Coff) => Some(CoffArchiveMemberKind::CoffObject { is_bigobj: false }),
+        Ok(FileKind::CoffBig) => Some(CoffArchiveMemberKind::CoffObject { is_bigobj: true }),
+        Ok(FileKind::CoffImport) => match ShortImportObject::parse(data) {
+            Ok(import) => Some(CoffArchiveMemberKind::ShortImport(import)),
+            Err(error) => {
+                return ParsedMember {
+                    kind: CoffArchiveMemberKind::Opaque,
+                    definitions: Vec::new(),
+                    demands: Some(Vec::new()),
+                    opaque_error: Some(CoffArchiveError::member(
+                        CoffArchiveErrorKind::InvalidMember,
+                        name,
+                        error.to_string(),
+                    )),
+                };
+            }
+        },
+        _ => None,
+    };
+    match kind {
+        Some(kind) => ParsedMember {
+            kind,
+            definitions: Vec::new(),
+            demands: (!matches!(kind, CoffArchiveMemberKind::CoffObject { .. })).then(Vec::new),
+            opaque_error: None,
+        },
+        None => ParsedMember {
+            kind: CoffArchiveMemberKind::Opaque,
+            definitions: Vec::new(),
+            demands: Some(Vec::new()),
+            opaque_error: Some(CoffArchiveError::member(
+                CoffArchiveErrorKind::UnsupportedMember,
+                name,
+                "unrecognized or unsupported archive member format",
+            )),
+        },
+    }
 }
 
 fn parse_member<'data>(
@@ -587,12 +697,16 @@ fn absorb_member_with_lookup(
     definitions: &mut HashSet<Vec<u8>>,
     unresolved: &mut Vec<OwnedArchiveDemand>,
     is_defined: &mut impl FnMut(&[u8]) -> bool,
+    expand_demands: bool,
 ) {
     for definition in &member.definitions {
         definitions.insert(definition.clone());
     }
     unresolved.retain(|demand| !definitions.contains(demand.name()) && !is_defined(demand.name()));
-    for demand in &member.demands {
+    if !expand_demands {
+        return;
+    }
+    for demand in member.demands() {
         add_demand_with_lookup(
             unresolved,
             definitions,
@@ -902,10 +1016,90 @@ mod tests {
             }],
             false,
         );
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        let broken = &parsed.members()[0];
+        assert_eq!(broken.kind(), CoffArchiveMemberKind::Opaque);
         assert_eq!(
-            CoffArchive::parse(&archive).unwrap_err().kind(),
+            broken.opaque_error().unwrap().kind(),
             CoffArchiveErrorKind::InvalidMember
         );
+        assert_eq!(
+            parsed
+                .plan(
+                    &[ArchiveDemand {
+                        name: b"ExitProcess",
+                        kind: ArchiveDemandKind::Strong,
+                    }],
+                    &[],
+                    false,
+                )
+                .selected()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn indexed_members_decode_demands_only_when_full_planning_needs_them() {
+        let archive = test_archive(
+            TestArchiveKind::Gnu,
+            &[
+                TestMember {
+                    name: "bar.obj",
+                    data: coff_object(&["bar"], &[]),
+                    symbols: &["bar"],
+                },
+                TestMember {
+                    name: "foo.obj",
+                    data: coff_object(&["foo"], &["bar"]),
+                    symbols: &["foo"],
+                },
+            ],
+            false,
+        );
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        assert!(
+            parsed
+                .members()
+                .iter()
+                .all(|member| member.demands.get().is_none())
+        );
+        let demand = ArchiveDemand {
+            name: b"foo",
+            kind: ArchiveDemandKind::Strong,
+        };
+        let shallow = parsed.plan_shallow_with_defined_lookup(&[demand], false, |_| false);
+        assert_eq!(shallow.selected().len(), 1);
+        assert!(
+            parsed
+                .members()
+                .iter()
+                .all(|member| member.demands.get().is_none())
+        );
+
+        let full = parsed.plan(&[demand], &[], false);
+        assert_eq!(full.selected().len(), 2);
+        assert!(parsed.members()[1].demands.get().is_some());
+    }
+
+    #[test]
+    fn indexless_archives_keep_eager_symbol_fallback() {
+        let data = coff_object(&["foo"], &["bar"]);
+        let mut archive = object::archive::MAGIC.to_vec();
+        push_archive_record(&mut archive, b"foo.obj/", &data);
+        let parsed = CoffArchive::parse(&archive).unwrap();
+        assert!(parsed.members()[0].demands.get().is_some());
+        assert!(parsed.definition_members.contains_key(b"foo".as_slice()));
+        let plan = parsed.plan(
+            &[ArchiveDemand {
+                name: b"foo",
+                kind: ArchiveDemandKind::Strong,
+            }],
+            &[],
+            false,
+        );
+        assert_eq!(plan.selected().len(), 1);
+        assert_eq!(plan.unresolved()[0].name(), b"bar");
     }
 
     #[test]
