@@ -33,13 +33,13 @@ type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 /// Compatibility deletion sites after Workstream 1 publishes `PeIr` occurrences:
 ///
-/// - `SelectedGlobalSymbol::name` and `SelectedSymbolSnapshot` (legacy writer metadata),
+/// - the fixed-width `SelectedGlobalSymbol` snapshot (legacy COMDAT/layout metadata),
 /// - `WeakExternalResolution` raw-name records (replace with the SymbolDb fallback column), and
 /// - the returned `BTreeSet<Vec<u8>>` import-definition snapshot (legacy import writer input).
 ///
 /// None of these bridges participates in archive provider lookup or canonical ID assignment.
 const COMPATIBILITY_DELETION_SITES: &[&str] = &[
-    "SelectedGlobalSymbol::name",
+    "SelectedGlobalSymbol fixed metadata snapshot",
     "WeakExternalResolution raw-name records",
     "BTreeSet<Vec<u8>> import-definition snapshot",
 ];
@@ -51,6 +51,7 @@ pub(super) struct ResolverNameState(u8);
 impl ResolverNameState {
     const DEFINED: u8 = 1 << 0;
     const UNRESOLVED: u8 = 1 << 1;
+    const DEMANDED: u8 = 1 << 2;
 
     pub(super) const fn is_defined(self) -> bool {
         self.0 & Self::DEFINED != 0
@@ -60,7 +61,17 @@ impl ResolverNameState {
         self.0 & Self::UNRESOLVED != 0
     }
 
+    /// True once an input/root requested this name, even if archive extraction later defined it.
+    pub(super) const fn is_demanded(self) -> bool {
+        self.0 & Self::DEMANDED != 0
+    }
+
+    fn mark_demanded(&mut self) {
+        self.0 |= Self::DEMANDED;
+    }
+
     fn mark_unresolved(&mut self) {
+        self.mark_demanded();
         if !self.is_defined() {
             self.0 |= Self::UNRESOLVED;
         }
@@ -179,6 +190,8 @@ pub(super) struct SelectedGlobalSymbol {
     pub(super) is_common: bool,
     pub(super) is_undefined: bool,
     pub(super) is_weak: bool,
+    pub(super) name_id: NameId,
+    #[cfg(test)]
     pub(super) name: Vec<u8>,
 }
 
@@ -239,6 +252,10 @@ impl<'data> IncrementalSymbolState<'data> {
         for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
             let symbol = self.intern_borrowed(record.symbol);
             let target = self.intern_borrowed(record.target);
+            // The legacy import bridge considered every selected weak record. Retain that demand
+            // bit without promoting it into an ordinary archive demand (search policy still owns
+            // extraction behavior below).
+            self.states[symbol.index()].mark_demanded();
             let existing = self
                 .weak_names
                 .iter()
@@ -270,12 +287,6 @@ impl<'data> IncrementalSymbolState<'data> {
                 continue;
             }
             let name_id = self.intern_borrowed(name);
-            // This is the final legacy writer bridge. The canonical resolver and archive cache
-            // retain only NameId; Workstream 1 deletes this copy with SelectedGlobalSymbol.
-            crate::perf::removal_counters::add_name_bytes_allocated(name.len() as u64);
-            if !name.is_empty() {
-                crate::perf::removal_counters::increment_hot_phase_allocations();
-            }
             note_vec_push(&self.globals);
             self.globals.push(SelectedGlobalSymbol {
                 object: index,
@@ -288,6 +299,8 @@ impl<'data> IncrementalSymbolState<'data> {
                 is_common: symbol.is_common(),
                 is_undefined: symbol.is_undefined(),
                 is_weak: symbol.is_weak(),
+                name_id,
+                #[cfg(test)]
                 name: name.to_vec(),
             });
             if name.is_empty() {

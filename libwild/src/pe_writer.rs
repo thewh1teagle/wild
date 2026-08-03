@@ -80,9 +80,6 @@ const PE_DETAIL_ABSORB_SELECTED_SYMBOLS: &str = "PE detail: Absorb selected symb
 const PE_DETAIL_REBUILD_SELECTION_ROOTS: &str = "PE detail: Rebuild selection roots";
 const PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES: &str = "PE detail: Evaluate default libraries";
 const PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS: &str = "PE detail: Snapshot resolver outputs";
-const PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA: &str = "PE detail: Scan selected symbol metadata";
-const PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS: &str = "PE detail: Resolve alternate symbols";
-const PE_DETAIL_SCAN_WEAK_METADATA: &str = "PE detail: Scan weak metadata";
 const PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS: &str = "PE detail: Materialize selected imports";
 const PE_DETAIL_REF_CLASSIFY: &str = "PE detail: Classify unreachable COMDATs";
 const PE_DETAIL_REF_DEFINITIONS: &str = "PE detail: Build REF definition graph";
@@ -367,10 +364,10 @@ pub(crate) fn link<F: FileSystem>(
     }
     let objects = selected.objects;
     let selected_imports = selected.selected_imports;
+    let resolver_seed = selected.resolver_seed;
     let symbol_snapshot = selected.symbol_snapshot;
     let entry_name = selected.entry_name;
     let exports = selected.exports;
-    let archive_definitions = selected.archive_definitions;
     let runtime_resolution = selected.directives.runtime_resolution;
     let mut delay_load_dlls = args.delay_load_dlls.clone();
     delay_load_dlls.extend(selected.directives.delay_load_dlls);
@@ -386,15 +383,15 @@ pub(crate) fn link<F: FileSystem>(
     roots.dedup();
     ensure!(!objects.is_empty(), "no COFF object files selected");
 
+    let dense = DenseProductionState::finalize(&objects, resolver_seed)?;
+
     let (imports, symbol_metadata) = {
         crate::timing_phase!(PE_PHASE_RESOLVE_IMPORTS);
-        let (undefined, symbol_metadata) = resolved_undefined_symbols(
-            &objects,
-            &symbol_snapshot,
-            &roots,
-            &archive_definitions,
-            &runtime_resolution,
-        )?;
+        let undefined = dense.import_demands()?;
+        // Remaining legacy layout/COMDAT consumers still use this borrowed compatibility view.
+        // Undefined/import discovery no longer rebuilds global names from it.
+        let (symbol_metadata, _) =
+            SelectedObjectMetadata::new_with_undefined(&symbol_snapshot, &[], Some(&dense));
         let materialize_imports_phase =
             crate::timing_guard!(PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS);
         let imports = pe_imports::select_from_records(&selected_imports, &undefined);
@@ -412,6 +409,7 @@ pub(crate) fn link<F: FileSystem>(
     };
     let mut image = build_image_with_delay_loads(
         &objects,
+        Some(&dense),
         &symbol_metadata,
         &imports,
         &exports,
@@ -700,12 +698,12 @@ struct SelectedInputs<'data> {
     #[cfg(test)]
     archive_bytes: Vec<&'data [u8]>,
     selected_imports: Vec<linker_utils::coff_imports::ShortImportObject<'data>>,
+    resolver_seed: pe_resolver::ResolverSeed<'data>,
     symbol_snapshot: pe_resolver::SelectedSymbolSnapshot,
     entry_name: Option<String>,
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
     directives: crate::args::coff::CoffArgs,
-    archive_definitions: BTreeSet<Vec<u8>>,
     #[cfg(test)]
     resolver_object_scans: usize,
 }
@@ -847,12 +845,12 @@ impl<'data> OpenSelection<'data> {
             #[cfg(test)]
             archive_bytes: self.archive_bytes,
             selected_imports: resolver_output.selected_imports,
+            resolver_seed: resolver_output.seed,
             symbol_snapshot: resolver_output.symbols,
             entry_name: self.entry_name,
             exports: self.exports,
             roots: self.roots,
             directives: self.directives,
-            archive_definitions: self.archive_definitions,
             #[cfg(test)]
             resolver_object_scans: resolver_output.object_scans,
         }
@@ -1208,22 +1206,192 @@ fn implicit_library_name(requested: &Path) -> Option<PathBuf> {
     Some(name)
 }
 
-#[derive(Debug)]
-struct SelectedObjectMetadata<'a> {
+/// Cohesive dense state finalized once after archive selection. The selected `CoffObject`s remain
+/// the owners of all borrowed bytes and therefore outlive this value in `link`.
+struct DenseProductionState<'data> {
+    ir: pe_ir::PeIr<'data>,
+    names: pe_symbol_db::OrderedNameInterner<'data>,
+    symbols: pe_symbol_db::SymbolDb,
+    resolver_states: Box<[pe_resolver::ResolverNameState]>,
+    alternate_targets: Box<[u32]>,
+}
+
+impl<'data> DenseProductionState<'data> {
+    fn finalize(
+        objects: &[crate::coff::CoffObject<'data>],
+        seed: pe_resolver::ResolverSeed<'data>,
+    ) -> Result<Self> {
+        let pe_resolver::ResolverSeedParts {
+            names,
+            states,
+            weak_fallbacks,
+            alternate_fallbacks,
+            providers,
+        } = seed.into_parts();
+        let seed_name_count = names.len();
+        ensure!(
+            states.len() == seed_name_count,
+            "resolver name/state cardinality mismatch"
+        );
+        let pe_ir::SelectedObjectFinalization {
+            ir,
+            names,
+            occurrence_names: _,
+        } = pe_ir::PeIr::finalize_selected_objects(objects, names)?;
+
+        let mut resolver_states = states.into_vec();
+        // Object-local names appended during finalization were never resolver demands. Their
+        // canonical entries deliberately start unresolved without renumbering any seed NameId.
+        resolver_states.resize(names.len(), pe_resolver::ResolverNameState::default());
+        let mut alternate_targets = vec![u32::MAX; names.len()];
+        for fallback in alternate_fallbacks {
+            let slot = alternate_targets
+                .get_mut(fallback.symbol.index())
+                .context("alternate fallback name is outside the canonical namespace")?;
+            *slot = fallback.target.get();
+        }
+
+        let mut builder = pe_symbol_db::SymbolDbBuilder::new(names);
+        for provider in providers {
+            let (name, record) = match provider {
+                pe_resolver::ResolverProviderOccurrence::Object {
+                    name,
+                    object,
+                    raw_symbol,
+                    strength,
+                } => {
+                    let object = pe_ir::ObjectId::from_u32(object);
+                    let symbol = ir.symbol_by_raw(object, raw_symbol).ok_or_else(|| {
+                        error!(
+                            "resolver object provider {object:?}:{raw_symbol} has no dense symbol"
+                        )
+                    })?;
+                    (
+                        name,
+                        pe_symbol_db::ProviderRecord::object(object, symbol, strength),
+                    )
+                }
+                pe_resolver::ResolverProviderOccurrence::Import {
+                    name,
+                    selected_import,
+                    archive,
+                    member: _,
+                } => (
+                    name,
+                    pe_symbol_db::ProviderRecord::import(
+                        pe_ir::ImportLibraryId::from_u32(archive.get()),
+                        pe_ir::ImportId::from_u32(selected_import),
+                    ),
+                ),
+                pe_resolver::ResolverProviderOccurrence::Absolute {
+                    name,
+                    value,
+                    linker_defined,
+                } => {
+                    let value = builder.add_absolute_value(value);
+                    (
+                        name,
+                        pe_symbol_db::ProviderRecord::absolute(value, linker_defined),
+                    )
+                }
+            };
+            builder
+                .add_provider(name, record)
+                .map_err(|error| error!("failed to add resolver provider: {error:?}"))?;
+        }
+        for fallback in weak_fallbacks {
+            builder
+                .set_weak_fallback(fallback.symbol, fallback.target)
+                .map_err(|error| error!("failed to add weak fallback: {error:?}"))?;
+        }
+        let finalized = builder
+            .finish()
+            .map_err(|error| error!("failed to finalize PE symbol database: {error:?}"))?;
+        ensure!(
+            finalized.names.len() == resolver_states.len(),
+            "canonical name and symbol-state cardinality mismatch"
+        );
+        Ok(Self {
+            ir,
+            names: finalized.names,
+            symbols: finalized.symbols,
+            resolver_states: resolver_states.into_boxed_slice(),
+            alternate_targets: alternate_targets.into_boxed_slice(),
+        })
+    }
+
+    /// Materialize only demanded import names for the still-legacy import emitter. All selection
+    /// and fallback decisions come from dense IDs; byte copies remain solely at this API seam.
+    fn import_demands(&self) -> Result<HashSet<Vec<u8>>> {
+        let mut demands = HashSet::new();
+        for (index, state) in self.resolver_states.iter().enumerate() {
+            if !state.is_demanded() {
+                continue;
+            }
+            let mut name = pe_ir::NameId::from_u32(index as u32);
+            for _ in 0..=self.symbols.entries.len() {
+                let entry = self
+                    .symbols
+                    .entry(name)
+                    .context("demanded name is outside the symbol database")?;
+                if let Some(provider) = entry
+                    .resolution
+                    .provider()
+                    .and_then(|provider| self.symbols.provider(provider))
+                    && provider.kind() == pe_symbol_db::ProviderKind::Import
+                {
+                    let bytes = self
+                        .names
+                        .bytes(name)
+                        .context("demanded import has no valid canonical bytes")?;
+                    demands.insert(bytes.to_vec());
+                    break;
+                }
+                if let Some(fallback) = entry.weak_fallback() {
+                    name = fallback;
+                    continue;
+                }
+                let alternate = *self
+                    .alternate_targets
+                    .get(name.index())
+                    .context("alternate fallback row is missing")?;
+                if alternate != u32::MAX {
+                    name = pe_ir::NameId::from_u32(alternate);
+                    continue;
+                }
+                break;
+            }
+        }
+        Ok(demands)
+    }
+}
+
+struct SelectedObjectMetadata<'a, 'data> {
     globals: &'a [pe_resolver::SelectedGlobalSymbol],
     weak: &'a linker_utils::coff_runtime::WeakExternalResolution,
     definition_names: HashSet<&'a [u8]>,
+    dense: Option<&'a DenseProductionState<'data>>,
 }
 
-impl<'a> SelectedObjectMetadata<'a> {
+impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
     fn new_with_undefined(
         snapshot: &'a pe_resolver::SelectedSymbolSnapshot,
         roots: &[Vec<u8>],
+        dense: Option<&'a DenseProductionState<'data>>,
     ) -> (Self, HashSet<Vec<u8>>) {
         let mut undefined = roots.iter().cloned().collect::<HashSet<_>>();
         let mut definitions = HashSet::new();
         for symbol in &snapshot.globals {
-            let name = symbol.name.as_slice();
+            let name = match dense {
+                Some(dense) => dense
+                    .names
+                    .bytes(symbol.name_id)
+                    .expect("resolver global NameId remains canonical"),
+                #[cfg(test)]
+                None => symbol.name.as_slice(),
+                #[cfg(not(test))]
+                None => unreachable!("production metadata requires dense canonical names"),
+            };
             if symbol.is_definition || symbol.is_common {
                 // Keep empty global definitions, matching object_definition_names.
                 definitions.insert(name);
@@ -1237,6 +1405,7 @@ impl<'a> SelectedObjectMetadata<'a> {
                 globals: &snapshot.globals,
                 weak: &snapshot.weak_resolution,
                 definition_names: definitions,
+                dense,
             },
             undefined,
         )
@@ -1248,6 +1417,22 @@ impl<'a> SelectedObjectMetadata<'a> {
 
     fn weak(&self) -> &linker_utils::coff_runtime::WeakExternalResolution {
         self.weak
+    }
+
+    fn symbol_name<'symbol>(
+        &'symbol self,
+        symbol: &'symbol pe_resolver::SelectedGlobalSymbol,
+    ) -> &'symbol [u8] {
+        match self.dense {
+            Some(dense) => dense
+                .names
+                .bytes(symbol.name_id)
+                .expect("resolver global NameId remains canonical"),
+            #[cfg(test)]
+            None => symbol.name.as_slice(),
+            #[cfg(not(test))]
+            None => unreachable!("production metadata requires dense canonical names"),
+        }
     }
 }
 
@@ -1277,6 +1462,7 @@ fn selected_symbol_snapshot(
                 is_common: symbol.is_common(),
                 is_undefined: symbol.is_undefined(),
                 is_weak: symbol.is_weak(),
+                name_id: pe_ir::NameId::from_u32(u32::MAX),
                 name: name.to_vec(),
             });
         }
@@ -1311,71 +1497,16 @@ fn undefined_symbols(
     Ok(undefined)
 }
 
-fn resolved_undefined_symbols<'snapshot>(
-    _objects: &[crate::coff::CoffObject<'_>],
-    snapshot: &'snapshot pe_resolver::SelectedSymbolSnapshot,
-    roots: &[Vec<u8>],
-    archive_definitions: &BTreeSet<Vec<u8>>,
-    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
-) -> Result<(HashSet<Vec<u8>>, SelectedObjectMetadata<'snapshot>)> {
-    let symbol_metadata_phase = crate::timing_guard!(PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA);
-    let (metadata, undefined) = SelectedObjectMetadata::new_with_undefined(snapshot, roots);
-    drop(symbol_metadata_phase);
-    let object_definitions = metadata.definition_names();
-    let alternate_symbols_phase = crate::timing_guard!(PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS);
-    let mut undefined = undefined
-        .into_iter()
-        .map(|name| {
-            // A selected short import of the primary name is a real definition and
-            // must be emitted rather than replaced by its weak fallback.
-            if archive_definitions.contains(&name) {
-                return Ok(name);
-            }
-            let Ok(text) = std::str::from_utf8(&name) else {
-                return Ok(name);
-            };
-            runtime_resolution
-                .resolve_alternate_name(text, |candidate| {
-                    object_definitions.contains(candidate.as_bytes())
-                        || archive_definitions.contains(candidate.as_bytes())
-                })
-                .map(|resolved| resolved.as_bytes().to_vec())
-                .map_err(Into::into)
-        })
-        .collect::<Result<HashSet<_>>>()?;
-    drop(alternate_symbols_phase);
-    let weak_metadata_phase = crate::timing_guard!(PE_DETAIL_SCAN_WEAK_METADATA);
-    let weak = metadata.weak();
-    for (symbol, _, _) in weak.records() {
-        if object_definitions.contains(symbol) {
-            continue;
-        }
-        if archive_definitions.contains(symbol) {
-            undefined.insert(symbol.to_vec());
-            continue;
-        }
-        let target = weak.resolve(symbol, |candidate| {
-            object_definitions.contains(candidate) || archive_definitions.contains(candidate)
-        })?;
-        if !object_definitions.contains(target) {
-            undefined.insert(target.to_vec());
-        }
-    }
-    drop(weak_metadata_phase);
-    undefined.retain(|name| !LINKER_ABSOLUTE_ZERO_SYMBOLS.contains(&name.as_slice()));
-    Ok((undefined, metadata))
-}
-
 fn absolute_symbol_values(
     _objects: &[crate::coff::CoffObject<'_>],
-    metadata: &SelectedObjectMetadata<'_>,
+    metadata: &SelectedObjectMetadata<'_, '_>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashMap<Vec<u8>, u64>> {
     let definitions = metadata.definition_names();
     let mut absolute = HashMap::new();
     for symbol in metadata.globals {
         if symbol.section_kind == object::SymbolSection::Absolute {
-            let name = symbol.name.as_slice();
+            let name = metadata.symbol_name(symbol);
             if !name.is_empty() {
                 absolute.insert(name.to_vec(), symbol.address);
             }
@@ -1424,9 +1555,10 @@ fn build_image(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
     let snapshot = selected_symbol_snapshot(objects)?;
-    let (symbol_metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+    let (symbol_metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
     let mut image = build_image_with_delay_loads(
         objects,
+        None,
         &symbol_metadata,
         imports,
         exports,
@@ -1445,6 +1577,7 @@ fn build_image(
 
 fn build_image_with_delay_loads(
     objects: &[crate::coff::CoffObject<'_>],
+    dense: Option<&DenseProductionState<'_>>,
     symbol_metadata: &SelectedObjectMetadata,
     imports: &[pe_imports::Import],
     exports: &[crate::args::coff::ExportSpec],
@@ -1900,6 +2033,7 @@ fn build_image_with_delay_loads(
     let relocations_phase = crate::timing_guard!(PE_PHASE_APPLY_RELOCATIONS);
     copy_and_apply_relocations(
         objects,
+        dense,
         &contributions,
         &layout,
         &locations,
@@ -2261,7 +2395,7 @@ fn collect_contributions(
     args: &crate::args::coff::CoffArgs,
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     let snapshot = selected_symbol_snapshot(objects)?;
-    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
     collect_contributions_with_roots_metadata(
         objects,
         &metadata,
@@ -2279,7 +2413,7 @@ fn collect_contributions_with_roots(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<(Vec<Contribution>, SectionRedirects)> {
     let snapshot = selected_symbol_snapshot(objects)?;
-    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
     collect_contributions_with_roots_metadata(objects, &metadata, args, roots, runtime_resolution)
 }
 
@@ -2937,7 +3071,7 @@ fn record_comdat_redirects(
 #[cfg(test)]
 fn discarded_comdat_sections(objects: &[crate::coff::CoffObject<'_>]) -> Result<ComdatResolution> {
     let snapshot = selected_symbol_snapshot(objects)?;
-    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+    let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
     discarded_comdat_sections_with_metadata(objects, &metadata)
 }
 
@@ -2974,7 +3108,7 @@ fn discarded_comdat_sections_with_metadata(
         {
             continue;
         }
-        strong_definitions.insert(symbol.name.clone());
+        strong_definitions.insert(metadata.symbol_name(symbol).to_vec());
     }
     drop(classify_phase);
 
@@ -3234,7 +3368,9 @@ fn unreferenced_comdat_sections(
         let Some(group) = resolved_groups[node] else {
             continue;
         };
-        definitions.entry(symbol.name.clone()).or_insert(group);
+        definitions
+            .entry(metadata.symbol_name(symbol).to_vec())
+            .or_insert(group);
     }
     let weak_resolution = metadata.weak();
     let resolve_definition = |name: &[u8]| -> Result<Option<ComdatGroupId>> {
@@ -3415,7 +3551,7 @@ fn add_common_symbols(
     let mut commons = BTreeMap::<Vec<u8>, u64>::new();
     for symbol in metadata.globals.iter().filter(|symbol| symbol.is_common) {
         commons
-            .entry(symbol.name.clone())
+            .entry(metadata.symbol_name(symbol).to_vec())
             .and_modify(|size| *size = (*size).max(symbol.size))
             .or_insert(symbol.size);
     }
@@ -3737,7 +3873,7 @@ fn definitions(
     let locations = source_locations(contributions);
     let mut definitions = HashMap::new();
     for symbol in metadata.globals.iter().filter(|symbol| !symbol.is_common) {
-        let name = symbol.name.clone();
+        let name = metadata.symbol_name(symbol).to_vec();
         let address = if let Some(section) = symbol.section {
             let Some(id) = locations.get(&(symbol.object, section)) else {
                 continue;
@@ -3790,6 +3926,7 @@ fn find_local_symbol(
 
 fn copy_and_apply_relocations(
     objects: &[crate::coff::CoffObject<'_>],
+    dense: Option<&DenseProductionState<'_>>,
     contributions: &[Contribution],
     layout: &SectionLayout,
     locations: &LocationMap,
@@ -3801,8 +3938,19 @@ fn copy_and_apply_relocations(
 ) -> Result<()> {
     validate_object_output_ranges(contributions, layout, image.len())?;
     let parallel_image = pe_layout::DisjointOutput::new(image);
-    let copy = |contribution: &Contribution| {
-        copy_and_relocate_contribution(
+    let copy = |contribution: &Contribution| match dense {
+        Some(dense) => copy_and_relocate_dense_contribution(
+            dense,
+            contribution,
+            layout,
+            locations,
+            redirects,
+            definitions,
+            absolute_symbols,
+            image_base,
+            parallel_image,
+        ),
+        None => copy_and_relocate_contribution(
             objects,
             contribution,
             layout,
@@ -3812,7 +3960,7 @@ fn copy_and_apply_relocations(
             absolute_symbols,
             image_base,
             parallel_image,
-        )
+        ),
     };
     if rayon::current_num_threads() > 1 {
         let results = contributions.par_iter().map(copy).collect::<Vec<_>>();
@@ -3999,6 +4147,204 @@ fn copy_and_relocate_contribution(
         prepared.apply(contribution)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_and_relocate_dense_contribution(
+    dense: &DenseProductionState<'_>,
+    contribution: &Contribution,
+    layout: &SectionLayout,
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+    parallel_image: pe_layout::DisjointOutput<'_>,
+) -> Result<()> {
+    let Source::Object {
+        object,
+        section: raw_section,
+    } = contribution.source
+    else {
+        return Ok(());
+    };
+    let object = pe_ir::ObjectId::from_u32(
+        u32::try_from(object).context("PE object index exceeds dense ID range")?,
+    );
+    let section = dense
+        .ir
+        .section_by_raw(
+            object,
+            u32::try_from(raw_section.0).context("raw COFF section index exceeds u32")?,
+        )
+        .context("real contribution has no dense PE section")?;
+    let record = &dense.ir.sections[section.index()];
+    let relocations = dense
+        .ir
+        .relocations
+        .for_section(section)
+        .context("dense PE section has no relocation row")?;
+    let placement = &layout.placements[&contribution.spec.id];
+    let Some(file_offset) = placement.file_offset else {
+        ensure!(
+            relocations.is_empty(),
+            "relocation in uninitialized section"
+        );
+        return Ok(());
+    };
+    let source_file = usize::try_from(file_offset).context("relocation file offset too large")?;
+    // SAFETY: `validate_object_output_ranges` checked all real contribution ranges immediately
+    // before the shared output handle was created.
+    let output = unsafe {
+        parallel_image.slice(
+            source_file,
+            usize::try_from(placement.size).context("PE contribution size too large")?,
+        )?
+    };
+    let source = record
+        .data
+        .and_then(|source| dense.ir.sources.bytes(source))
+        .context("initialized dense PE section has no source bytes")?;
+    ensure!(
+        source.len() == output.len(),
+        "dense PE source and output contribution sizes differ"
+    );
+    output.copy_from_slice(source);
+    count_pe_bytes_copied(source.len());
+    for relocation in relocations {
+        let mut prepared = prepare_dense_relocation(
+            dense,
+            layout,
+            locations,
+            redirects,
+            definitions,
+            absolute_symbols,
+            image_base,
+            placement,
+            *relocation,
+        )?;
+        prepared.at = prepared
+            .at
+            .checked_sub(source_file)
+            .context("relocation precedes contribution data")?;
+        prepared.apply(output)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn prepare_dense_relocation(
+    dense: &DenseProductionState<'_>,
+    layout: &SectionLayout,
+    locations: &LocationMap,
+    redirects: &SectionRedirects,
+    definitions: &HashMap<Vec<u8>, u64>,
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+    placement: &linker_utils::pe_sections::ContributionPlacement,
+    relocation: pe_ir::RelocationRecord,
+) -> Result<PreparedRelocation> {
+    use linker_utils::coff::Amd64RelocationInputs;
+    use linker_utils::coff::ImageBase;
+    use linker_utils::coff::Rva;
+    use linker_utils::coff::SectionIndex;
+
+    let symbol = dense.ir.relocation_target(relocation)?;
+    let name = dense
+        .names
+        .bytes(symbol.name)
+        .context("relocation target has an invalid canonical name")?;
+    let is_global = symbol.flags & 1 != 0;
+    let (target, target_section, target_section_index, absolute_value) = if is_global
+        && let Some(address) = definitions.get(name)
+    {
+        if let Some(value) = absolute_symbols.get(name) {
+            (0, 0, 0, Some(*value))
+        } else {
+            let (target, section, index) = target_location(layout, image_base, *address)?;
+            (target, section, index, None)
+        }
+    } else if let Some(section) = symbol.section.get() {
+        let target_record = dense
+            .ir
+            .sections
+            .get(section.index())
+            .context("dense relocation target section is invalid")?;
+        let target_object = target_record.object.index();
+        let target_raw = object::SectionIndex(target_record.raw_index as usize);
+        let ((selected_object, selected_raw), id) = redirected_location(
+            locations,
+            redirects,
+            (target_object, target_raw),
+        )?
+        .ok_or_else(|| {
+            error!(
+                "relocation targets discarded section {target_object}:{target_raw:?} via symbol `{}`",
+                String::from_utf8_lossy(name)
+            )
+        })?;
+        let selected = dense
+            .ir
+            .section_by_raw(
+                pe_ir::ObjectId::from_u32(
+                    u32::try_from(selected_object).context("selected object exceeds u32")?,
+                ),
+                u32::try_from(selected_raw.0).context("selected section exceeds u32")?,
+            )
+            .and_then(|section| dense.ir.sections.get(section.index()))
+            .context("COMDAT redirect target has no dense section")?;
+        ensure!(
+            symbol.value <= u64::from(selected.size),
+            "symbol offset exceeds selected COMDAT section"
+        );
+        let target_placement = &layout.placements[&id];
+        let target = target_placement
+            .rva
+            .checked_add(u32::try_from(symbol.value).context("COFF symbol offset exceeds u32")?)
+            .context("COFF symbol RVA overflow")?;
+        (
+            target,
+            layout.sections[target_placement.output_section].rva,
+            u16::try_from(target_placement.output_section + 1)
+                .context("PE section index exceeds u16")?,
+            None,
+        )
+    } else {
+        let address = *definitions
+            .get(name)
+            .ok_or_else(|| error!("undefined symbol `{}`", String::from_utf8_lossy(name)))?;
+        let (target, section, index) = target_location(layout, image_base, address)?;
+        (target, section, index, None)
+    };
+    let kind = linker_utils::coff::Amd64RelocationKind::from_type(object::pe::RelocationType(
+        relocation.typ,
+    ))
+    .context("unsupported AMD64 COFF relocation")?;
+    let offset = u64::from(relocation.offset);
+    let source_file = placement
+        .file_offset
+        .ok_or_else(|| error!("relocation in uninitialized section"))?;
+    let at = usize::try_from(u64::from(source_file) + offset)
+        .context("relocation file offset too large")?;
+    let place = placement
+        .rva
+        .checked_add(relocation.offset)
+        .context("relocation place RVA overflow")?;
+    Ok(PreparedRelocation {
+        at,
+        kind,
+        inputs: Amd64RelocationInputs {
+            image_base: ImageBase(image_base),
+            place: Rva(place),
+            target: Rva(target),
+            target_section: Rva(target_section),
+            target_section_index: SectionIndex(target_section_index),
+        },
+        absolute_value,
+        contribution_rva: placement.rva,
+        offset,
+    })
 }
 
 #[inline]
@@ -4790,6 +5136,7 @@ mod tests {
                 is_common: common,
                 is_undefined: undefined,
                 is_weak: weak,
+                name_id: pe_ir::NameId::from_u32(u32::MAX),
                 name: name.to_vec(),
             }
         };
@@ -4807,6 +5154,7 @@ mod tests {
         let (metadata, undefined) = SelectedObjectMetadata::new_with_undefined(
             &snapshot,
             &[b"defined".to_vec(), b"root".to_vec()],
+            None,
         );
         assert_eq!(
             undefined,
@@ -5055,9 +5403,6 @@ mod tests {
             PE_DETAIL_REBUILD_SELECTION_ROOTS,
             PE_DETAIL_EVALUATE_DEFAULT_LIBRARIES,
             PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS,
-            PE_DETAIL_SCAN_SELECTED_SYMBOL_METADATA,
-            PE_DETAIL_RESOLVE_ALTERNATE_SYMBOLS,
-            PE_DETAIL_SCAN_WEAK_METADATA,
             PE_DETAIL_MATERIALIZE_SELECTED_IMPORTS,
             PE_DETAIL_REF_CLASSIFY,
             PE_DETAIL_REF_DEFINITIONS,
@@ -6200,7 +6545,7 @@ mod tests {
         let bytes = relocation_object_with_invalid_target();
         let objects = [crate::coff::CoffObject::parse(&bytes).unwrap()];
         let snapshot = selected_symbol_snapshot(&objects).unwrap();
-        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
         let section_groups = [HashMap::new()];
         let analysis = CompactComdatAnalysis::new(&objects, &section_groups).unwrap();
         let live = ComdatResolution {
@@ -6218,7 +6563,7 @@ mod tests {
         let bytes = relocation_object_with_invalid_target();
         let objects = [crate::coff::CoffObject::parse(&bytes).unwrap()];
         let snapshot = selected_symbol_snapshot(&objects).unwrap();
-        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
         let section_groups = [HashMap::new()];
         let analysis = CompactComdatAnalysis::new(&objects, &section_groups).unwrap();
         let discarded = ComdatResolution {
@@ -6397,7 +6742,7 @@ mod tests {
         ));
 
         let snapshot = selected_symbol_snapshot(&objects).unwrap();
-        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[]);
+        let (metadata, _) = SelectedObjectMetadata::new_with_undefined(&snapshot, &[], None);
         let object_definitions = metadata.definition_names();
         let import_definitions = [
             b"direct_import".to_vec(),

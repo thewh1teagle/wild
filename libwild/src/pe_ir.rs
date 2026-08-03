@@ -283,6 +283,30 @@ pub(super) struct SelectedObjectFinalization<'data> {
 }
 
 impl<'data> PeIr<'data> {
+    /// Authoritative raw COFF symbol to dense-symbol mapping within one selected object.
+    pub(super) fn symbol_by_raw(&self, object: ObjectId, raw_symbol: u32) -> Option<SymbolId> {
+        let object = self.objects.get(object.index())?;
+        let start = object.symbols.start() as usize;
+        let end = object.symbols.end()? as usize;
+        let local = self.symbols.get(start..end)?;
+        let offset = local
+            .binary_search_by_key(&raw_symbol, |symbol| symbol.raw_index)
+            .ok()?;
+        Some(SymbolId::from_u32(u32::try_from(start + offset).ok()?))
+    }
+
+    /// Authoritative raw COFF section to dense-section mapping within one selected object.
+    pub(super) fn section_by_raw(&self, object: ObjectId, raw_section: u32) -> Option<SectionId> {
+        let object = self.objects.get(object.index())?;
+        let start = object.sections.start() as usize;
+        let end = object.sections.end()? as usize;
+        let local = self.sections.get(start..end)?;
+        let offset = local
+            .binary_search_by_key(&raw_section, |section| section.raw_index)
+            .ok()?;
+        Some(SectionId::from_u32(u32::try_from(start + offset).ok()?))
+    }
+
     /// Finalize selected objects in input order. The only allocations contain records, CSR starts,
     /// hash collision lists, and dense-ID maps; input payload and name bytes remain borrowed.
     pub(super) fn finalize_selected_objects(
