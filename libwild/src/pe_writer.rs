@@ -883,6 +883,7 @@ fn build_image(
             .entry(name.clone())
             .or_insert(config.image_base + u64::from(*rva));
     }
+    add_image_base_symbol(&mut definitions, config.image_base);
     bind_alternate_names(&mut definitions, runtime_resolution)?;
     let load_config_directory = if let Some(id) = load_config_id {
         let cookie_va = definitions
@@ -1059,6 +1060,21 @@ fn build_image(
         bytes: image,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
     })
+}
+
+fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u64) {
+    use linker_utils::coff_runtime::{LinkerDefinedValue, linker_defined_symbol};
+
+    // lld-link and link.exe let an ordinary selected definition win. Otherwise
+    // the canonical symbol denotes the first byte of the loaded PE image.
+    let Some(LinkerDefinedValue::VirtualAddress(address)) =
+        linker_defined_symbol("__ImageBase", image_base, &[])
+    else {
+        unreachable!("the PE runtime policy always defines __ImageBase")
+    };
+    definitions
+        .entry(b"__ImageBase".to_vec())
+        .or_insert(address);
 }
 
 fn bind_alternate_names(
@@ -1835,6 +1851,11 @@ fn target_location(
             .context("relocation target precedes image base")?,
     )
     .context("relocation target RVA exceeds u32")?;
+    if rva == 0 {
+        // `__ImageBase` names the PE headers rather than a section. Relocation
+        // kinds that use section metadata therefore observe section zero.
+        return Ok((0, 0, 0));
+    }
     let (index, section) = layout
         .sections
         .iter()
@@ -2394,6 +2415,53 @@ mod tests {
 
         assert_eq!(definitions[b"primary".as_slice()], 0x1111);
     }
+
+    #[test]
+    fn image_base_symbol_resolves_relocation_to_rva_zero() {
+        let caller = relocation_object(b"caller", b"__ImageBase");
+        let object = crate::coff::CoffObject::parse(&caller).unwrap();
+        let implicit_addend = i32::from_le_bytes(
+            object
+                .file()
+                .section_by_name(".text")
+                .unwrap()
+                .data()
+                .unwrap()[..4]
+                .try_into()
+                .unwrap(),
+        );
+        let image = build_image(
+            &[object],
+            &[],
+            &[],
+            b"image-base.exe",
+            Some("caller"),
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+
+        let file = object::File::parse(image.bytes.as_slice()).unwrap();
+        let text = file.section_by_name(".text").unwrap();
+        let displacement = i32::from_le_bytes(text.data().unwrap()[..4].try_into().unwrap());
+        assert_eq!(
+            i64::try_from(text.address()).unwrap() + 4 + i64::from(displacement)
+                - i64::from(implicit_addend),
+            i64::try_from(PeWriterConfig::default().image_base).unwrap()
+        );
+    }
+
+    #[test]
+    fn strong_image_base_definition_wins_over_linker_default() {
+        let mut definitions = HashMap::from([(b"__ImageBase".to_vec(), 0x1_4000_2000)]);
+
+        add_image_base_symbol(&mut definitions, 0x1_4000_0000);
+
+        assert_eq!(definitions[b"__ImageBase".as_slice()], 0x1_4000_2000);
+    }
+
     #[test]
     fn applies_merge_to_subsection() {
         let args = crate::args::coff::CoffArgs {
