@@ -6,6 +6,7 @@ use super::InputSpec;
 use super::Modifiers;
 use crate::alignment::Alignment;
 use crate::bail;
+use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
 use crate::platform;
@@ -133,6 +134,8 @@ pub struct CoffArgs {
     pub(crate) no_default_libraries: bool,
     pub(crate) excluded_default_libraries: Vec<String>,
     pub(crate) exports: Vec<ExportSpec>,
+    /// Microsoft module-definition files supplied with `/DEF:path`.
+    pub(crate) definition_files: Vec<Box<Path>>,
     pub(crate) force_undefined: Vec<String>,
     pub(crate) debug: bool,
     pub(crate) no_logo: bool,
@@ -188,6 +191,7 @@ impl Default for CoffArgs {
             no_default_libraries: false,
             excluded_default_libraries: Vec::new(),
             exports: Vec::new(),
+            definition_files: Vec::new(),
             force_undefined: Vec::new(),
             debug: false,
             no_logo: false,
@@ -368,6 +372,15 @@ where
             "export" => {
                 let value = required_value("/EXPORT", inline_value, &mut input)?;
                 args.exports.push(parse_export(value)?);
+            }
+            "def" => {
+                let value = required_value("/DEF", inline_value, &mut input)?;
+                ensure!(
+                    args.definition_files.is_empty(),
+                    "multiple /DEF options are not supported"
+                );
+                args.common.save_dir.handle_file(value);
+                args.definition_files.push(Box::from(Path::new(value)));
             }
             "include" => {
                 let value = required_value("/INCLUDE", inline_value, &mut input)?;
@@ -927,6 +940,7 @@ mod tests {
                 "/DEFAULTLIB:ucrt.lib",
                 "/NODEFAULTLIB:oldnames.lib",
                 "/LIBPATH:sdk/lib",
+                "/DEF:exports/lib.def",
                 "/EXPORT:answer,@7",
                 "/INCLUDE:forced_symbol",
                 "/MACHINE:AMD64",
@@ -950,6 +964,10 @@ mod tests {
         assert_eq!(args.default_libraries, ["ucrt.lib"]);
         assert_eq!(args.excluded_default_libraries, ["oldnames.lib"]);
         assert_eq!(args.lib_search_path[0].as_ref(), Path::new("sdk/lib"));
+        assert_eq!(
+            args.definition_files[0].as_ref(),
+            Path::new("exports/lib.def")
+        );
         assert!(args.no_entry);
         assert_eq!(
             args.exports,
@@ -997,6 +1015,18 @@ mod tests {
         assert!(parse(&mut args, ["/EXPORT:answer,NONAME"].into_iter()).is_err());
         let mut args = CoffArgs::default();
         assert!(parse(&mut args, ["/EXPORT:answer,@0"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_definition_file_path() {
+        assert!(parse(&mut CoffArgs::default(), ["/DEF:"].into_iter()).is_err());
+        assert!(
+            parse(
+                &mut CoffArgs::default(),
+                ["/DEF:first.def", "/DEF:second.def"].into_iter()
+            )
+            .is_err()
+        );
     }
 
     #[test]
