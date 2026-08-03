@@ -171,9 +171,58 @@ jobs:
 
       - name: Build Vibe ${{ matrix.profile }} with Wild
         working-directory: vibe-source/desktop
+        env:
+          # Wild's save-dir support records every loaded link input plus a
+          # relocatable run-with script. WILD_SAVE_BASE is concurrency-safe,
+          # unlike WILD_SAVE_DIR, when Cargo invokes multiple linkers.
+          WILD_SAVE_BASE: ${{ runner.temp }}\wild-save-${{ matrix.profile }}
         run: >-
           pnpm exec tauri build ${{ matrix.build-flag }} --no-bundle
           --target x86_64-pc-windows-msvc
+
+      - name: Locate failing Vibe linker repro
+        if: failure()
+        shell: pwsh
+        env:
+          VIBE_PROFILE: ${{ matrix.profile }}
+        run: |
+          $base = Join-Path $env:RUNNER_TEMP "wild-save-$env:VIBE_PROFILE"
+          if (-not (Test-Path $base)) {
+            Write-Warning "Wild did not create a save base at $base"
+            exit 0
+          }
+
+          $candidate = Get-ChildItem $base -Directory |
+            Where-Object {
+              $runWith = Join-Path $_.FullName 'run-with'
+              (Test-Path $runWith) -and
+                (Select-String -Path $runWith -Pattern 'vibe.exe' -SimpleMatch -Quiet)
+            } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if ($null -eq $candidate) {
+            Write-Warning "No saved link invocation targets vibe.exe under $base"
+            Get-ChildItem $base -Directory | Select-Object -ExpandProperty FullName
+            exit 0
+          }
+
+          $files = Get-ChildItem $candidate.FullName -File -Recurse
+          $bytes = ($files | Measure-Object Length -Sum).Sum
+          Write-Host "Captured Vibe link repro at $($candidate.FullName)"
+          Write-Host "Repro contains $($files.Count) files and $bytes bytes"
+          Get-Content (Join-Path $candidate.FullName 'run-with') | Select-Object -Last 3
+          "VIBE_LINK_REPRO=$($candidate.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload failing Vibe linker repro
+        if: failure() && env.VIBE_LINK_REPRO != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-${{ matrix.profile }}-link-repro
+          path: ${{ env.VIBE_LINK_REPRO }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
 
       - name: Verify Vibe ${{ matrix.profile }} executable on Windows
         shell: pwsh
