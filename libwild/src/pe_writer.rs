@@ -120,85 +120,29 @@ pub(crate) fn link<F: FileSystem>(
             _ => return Err(error!("unsupported COFF library input form")),
         }
     }
-    if !args.no_default_libraries {
-        for library in &args.default_libraries {
-            if !is_excluded(library, args) {
-                requested.push(PathBuf::from(library));
-            }
-        }
-    }
 
     let mut inputs = Vec::new();
     for request in requested {
-        open_input(fs, &request, args, &mut inputs)?;
+        open_input(fs, &request, args, &mut inputs, false)?;
     }
-    add_directive_libraries(fs, args, &mut inputs)?;
-
-    let mut objects = Vec::new();
-    let mut resources = Vec::new();
-    let mut archive_bytes = Vec::new();
-    let mut archive_whole = Vec::new();
-    for (path, data) in &inputs {
-        if path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
-        {
-            resources.extend(
-                linker_utils::pe_resources::parse_res(data.bytes())
-                    .with_context(|| format!("while reading `{}`", path.display()))?,
-            );
-            continue;
-        }
-        match object::FileKind::parse(data.bytes())
-            .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
-        {
-            object::FileKind::Coff => objects.push(
-                crate::coff::CoffObject::parse(data.bytes())
-                    .with_context(|| format!("while reading `{}`", path.display()))?,
-            ),
-            object::FileKind::Archive => {
-                archive_bytes.push(data.bytes());
-                archive_whole.push(
-                    args.whole_archive
-                        || args
-                            .whole_archive_libraries
-                            .iter()
-                            .any(|name| path_matches(path, name)),
-                );
-            }
-            kind => {
-                return Err(error!(
-                    "unsupported PE input kind {kind:?} in `{}`",
-                    path.display()
-                ));
-            }
-        }
-    }
-    let initial_directive_exports = directive_exports(&objects)?;
-    let entry_name = pe_entry::select(args, &objects)?;
-    let mut exports = args.exports.clone();
-    exports.extend(initial_directive_exports.iter().cloned());
-    let mut roots = args
-        .force_undefined
-        .iter()
-        .map(|s| s.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-    if let Some(entry) = entry_name.as_deref() {
-        roots.push(entry.as_bytes().to_vec());
-    }
+    let selected = select_inputs_to_fixpoint(fs, args, &mut inputs)?;
+    let objects = selected.objects;
+    let resources = selected.resources;
+    let archive_bytes = selected.archive_bytes;
+    let entry_name = selected.entry_name;
+    let exports = selected.exports;
+    let mut roots = selected.roots;
+    // Preserve the accumulated runtime state through final resolution. Includes already took
+    // part in extraction, and keeping this merge here makes that downstream contract explicit.
     roots.extend(
-        exports
-            .iter()
-            .map(|export| export.target.as_bytes().to_vec()),
+        selected
+            .runtime_resolution
+            .include_roots()
+            .map(|symbol| symbol.as_bytes().to_vec()),
     );
-    pe_resolver::extract(&mut objects, &archive_bytes, &archive_whole, &roots)?;
+    roots.sort();
+    roots.dedup();
     ensure!(!objects.is_empty(), "no COFF object files selected");
-
-    for export in directive_exports(&objects)? {
-        if !exports.contains(&export) {
-            exports.push(export);
-        }
-    }
 
     let undefined = undefined_symbols(&objects, &roots)?;
     let imports = pe_imports::select_from_libraries(&archive_bytes, &undefined)?;
@@ -237,6 +181,7 @@ pub(crate) fn link<F: FileSystem>(
     Ok(crate::LinkerOutput { layout: None })
 }
 
+#[cfg(test)]
 fn directive_exports(
     objects: &[crate::coff::CoffObject<'_>],
 ) -> Result<Vec<crate::args::coff::ExportSpec>> {
@@ -253,6 +198,288 @@ fn directive_exports(
         exports.extend(parsed.exports);
     }
     Ok(exports)
+}
+
+struct SelectedInputs<'data> {
+    objects: Vec<crate::coff::CoffObject<'data>>,
+    resources: Vec<ResourceRecord>,
+    archive_bytes: Vec<&'data [u8]>,
+    entry_name: Option<String>,
+    exports: Vec<crate::args::coff::ExportSpec>,
+    roots: Vec<Vec<u8>>,
+    runtime_resolution: linker_utils::coff_runtime::RuntimeResolution,
+}
+
+/// Rebuilds borrowed COFF state after every newly discovered default library.
+///
+/// This deliberately keeps the `inputs` growth outside the scope holding `CoffObject` and
+/// archive borrows. Besides satisfying Rust's ownership rules, rebuilding is important for
+/// correctness: an archive member selected in one round can carry another `/DEFAULTLIB`,
+/// `/INCLUDE`, or `/EXPORT` that changes the next archive-extraction fixpoint.
+fn select_inputs_to_fixpoint<'data, F: FileSystem>(
+    fs: &F,
+    args: &crate::args::coff::CoffArgs,
+    inputs: &'data mut Vec<(PathBuf, F::Input, bool)>,
+) -> Result<SelectedInputs<'data>> {
+    let mut no_default_libraries = args.no_default_libraries;
+    let mut excluded_default_libraries = args.excluded_default_libraries.clone();
+    loop {
+        let missing = {
+            let selection = select_opened_inputs::<F>(
+                args,
+                inputs,
+                no_default_libraries,
+                &excluded_default_libraries,
+            )?;
+            let old_policy = (no_default_libraries, excluded_default_libraries.len());
+            no_default_libraries |= selection.directives.no_default_libraries;
+            for excluded in &selection.directives.excluded_default_libraries {
+                if !excluded_default_libraries
+                    .iter()
+                    .any(|existing| same_library_name(existing, excluded))
+                {
+                    excluded_default_libraries.push(excluded.clone());
+                }
+            }
+            if old_policy == (no_default_libraries, excluded_default_libraries.len()) {
+                let mut libraries = Vec::new();
+                if !no_default_libraries {
+                    libraries.extend(args.default_libraries.iter().cloned());
+                    libraries.extend(selection.directives.default_libraries.iter().cloned());
+                }
+                libraries.retain(|library| {
+                    !excluded_default_libraries
+                        .iter()
+                        .any(|excluded| same_library_name(excluded, library))
+                });
+                deduplicate_case_insensitive(&mut libraries);
+
+                let disallowed = args
+                    .disallowed_libraries
+                    .iter()
+                    .chain(selection.directives.disallowed_libraries.iter())
+                    .collect::<Vec<_>>();
+                for (path, _, is_default) in inputs.iter() {
+                    if *is_default
+                        && (no_default_libraries
+                            || excluded_default_libraries
+                                .iter()
+                                .any(|name| path_matches(path, name)))
+                    {
+                        continue;
+                    }
+                    if !disallowed.iter().any(|name| path_matches(path, name)) {
+                        continue;
+                    }
+                    return Err(error!(
+                        "COFF library `{}` is forbidden by /DISALLOWLIB",
+                        path.display()
+                    ));
+                }
+                if let Some(library) = libraries.iter().find(|library| {
+                    disallowed
+                        .iter()
+                        .any(|name| same_library_name(name, library))
+                }) {
+                    return Err(error!(
+                        "COFF library `{library}` is forbidden by /DISALLOWLIB"
+                    ));
+                }
+
+                Some(
+                    libraries
+                        .into_iter()
+                        .filter(|library| {
+                            !inputs
+                                .iter()
+                                .any(|(path, _, _)| path_matches(path, library))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                // Re-select before discovering more libraries so a newly observed
+                // /NODEFAULTLIB can deactivate an archive opened in an earlier round.
+                None
+            }
+        };
+        let Some(missing) = missing else {
+            continue;
+        };
+        if missing.is_empty() {
+            break;
+        }
+
+        // Every borrow into `inputs` ended with the discovery scope above. The next iteration
+        // reparses direct objects and deterministically re-extracts archive members.
+        let old_len = inputs.len();
+        for library in missing {
+            open_input(fs, Path::new(&library), args, inputs, true)?;
+        }
+        ensure!(
+            inputs.len() != old_len,
+            "default-library discovery made no progress"
+        );
+    }
+    Ok(select_opened_inputs::<F>(
+        args,
+        inputs,
+        no_default_libraries,
+        &excluded_default_libraries,
+    )?
+    .finish())
+}
+
+struct OpenSelection<'data> {
+    objects: Vec<crate::coff::CoffObject<'data>>,
+    resources: Vec<ResourceRecord>,
+    archive_bytes: Vec<&'data [u8]>,
+    entry_name: Option<String>,
+    exports: Vec<crate::args::coff::ExportSpec>,
+    roots: Vec<Vec<u8>>,
+    directives: crate::args::coff::CoffArgs,
+}
+
+impl<'data> OpenSelection<'data> {
+    fn finish(self) -> SelectedInputs<'data> {
+        SelectedInputs {
+            objects: self.objects,
+            resources: self.resources,
+            archive_bytes: self.archive_bytes,
+            entry_name: self.entry_name,
+            exports: self.exports,
+            roots: self.roots,
+            runtime_resolution: self.directives.runtime_resolution,
+        }
+    }
+}
+
+fn select_opened_inputs<'data, F: FileSystem>(
+    args: &crate::args::coff::CoffArgs,
+    inputs: &'data [(PathBuf, F::Input, bool)],
+    no_default_libraries: bool,
+    excluded_default_libraries: &[String],
+) -> Result<OpenSelection<'data>> {
+    let mut objects = Vec::new();
+    let mut resources = Vec::new();
+    let mut archive_bytes = Vec::new();
+    let mut archive_whole = Vec::new();
+    for (path, data, is_default) in inputs {
+        if *is_default
+            && (no_default_libraries
+                || excluded_default_libraries
+                    .iter()
+                    .any(|name| path_matches(path, name)))
+        {
+            continue;
+        }
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("res"))
+        {
+            resources.extend(
+                linker_utils::pe_resources::parse_res(data.bytes())
+                    .with_context(|| format!("while reading `{}`", path.display()))?,
+            );
+            continue;
+        }
+        match object::FileKind::parse(data.bytes())
+            .with_context(|| format!("cannot identify COFF input `{}`", path.display()))?
+        {
+            object::FileKind::Coff => objects.push(
+                crate::coff::CoffObject::parse(data.bytes())
+                    .with_context(|| format!("while reading `{}`", path.display()))?,
+            ),
+            object::FileKind::Archive => {
+                archive_bytes.push(data.bytes());
+                archive_whole.push(
+                    args.whole_archive
+                        || args
+                            .whole_archive_libraries
+                            .iter()
+                            .any(|name| path_matches(path, name)),
+                );
+            }
+            kind => {
+                return Err(error!(
+                    "unsupported PE input kind {kind:?} in `{}`",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let entry_name = pe_entry::select(args, &objects)?;
+    loop {
+        let directives = directive_args(args, &objects)?;
+        let mut exports = args.exports.clone();
+        for export in &directives.exports {
+            if !exports.contains(export) {
+                exports.push(export.clone());
+            }
+        }
+        let mut roots = args
+            .force_undefined
+            .iter()
+            .chain(directives.force_undefined.iter())
+            .map(|symbol| symbol.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        roots.extend(
+            directives
+                .runtime_resolution
+                .include_roots()
+                .map(|symbol| symbol.as_bytes().to_vec()),
+        );
+        if let Some(entry) = entry_name.as_deref() {
+            roots.push(entry.as_bytes().to_vec());
+        }
+        roots.extend(
+            exports
+                .iter()
+                .map(|export| export.target.as_bytes().to_vec()),
+        );
+        roots.sort();
+        roots.dedup();
+
+        let old_len = objects.len();
+        pe_resolver::extract(&mut objects, &archive_bytes, &archive_whole, &roots)?;
+        if objects.len() == old_len {
+            return Ok(OpenSelection {
+                objects,
+                resources,
+                archive_bytes,
+                entry_name,
+                exports,
+                roots,
+                directives,
+            });
+        }
+    }
+}
+
+fn directive_args(
+    args: &crate::args::coff::CoffArgs,
+    objects: &[crate::coff::CoffObject<'_>],
+) -> Result<crate::args::coff::CoffArgs> {
+    let mut parsed = crate::args::coff::CoffArgs {
+        runtime_resolution: args.runtime_resolution.clone(),
+        ..Default::default()
+    };
+    for (index, object) in objects.iter().enumerate() {
+        let Some(section) = object.file().section_by_name(".drectve") else {
+            continue;
+        };
+        let text = std::str::from_utf8(section.data().context("invalid COFF .drectve")?)
+            .with_context(|| format!("non-UTF-8 .drectve in selected COFF object #{index}"))?
+            .trim_end_matches('\0');
+        crate::args::coff::parse_directives(&mut parsed, text)
+            .with_context(|| format!("in selected COFF object #{index}"))?;
+    }
+    Ok(parsed)
+}
+
+fn deduplicate_case_insensitive(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.to_ascii_lowercase()));
 }
 
 fn write_import_library<F: FileSystem>(
@@ -307,71 +534,41 @@ fn path_matches(path: &Path, requested: &str) -> bool {
     path.to_string_lossy().eq_ignore_ascii_case(requested)
         || path
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(requested))
+            .is_some_and(|name| same_library_name(&name.to_string_lossy(), requested))
 }
 
-fn is_excluded(library: &str, args: &crate::args::coff::CoffArgs) -> bool {
-    args.excluded_default_libraries
-        .iter()
-        .any(|excluded| excluded.eq_ignore_ascii_case(library))
+fn same_library_name(left: &str, right: &str) -> bool {
+    fn canonical(name: &str) -> String {
+        let file_name = Path::new(name)
+            .file_name()
+            .map_or(name, |value| value.to_str().unwrap_or(name));
+        let mut canonical = file_name.to_ascii_lowercase();
+        if Path::new(&canonical)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lib"))
+        {
+            canonical.truncate(canonical.len() - 4);
+        }
+        canonical
+    }
+    canonical(left) == canonical(right)
 }
 
 fn open_input<F: FileSystem>(
     fs: &F,
     request: &Path,
     args: &crate::args::coff::CoffArgs,
-    inputs: &mut Vec<(PathBuf, F::Input)>,
+    inputs: &mut Vec<(PathBuf, F::Input, bool)>,
+    is_default: bool,
 ) -> Result<()> {
     let path = find_input(fs, request, args)?;
-    if inputs.iter().any(|(existing, _)| existing == &path) {
+    if inputs.iter().any(|(existing, _, _)| existing == &path) {
         return Ok(());
     }
     let (data, _) = fs
         .open_input(&path, args.common.prepopulate_maps)
         .with_context(|| format!("Failed to open COFF input `{}`", path.display()))?;
-    inputs.push((path, data));
-    Ok(())
-}
-
-fn add_directive_libraries<F: FileSystem>(
-    fs: &F,
-    args: &crate::args::coff::CoffArgs,
-    inputs: &mut Vec<(PathBuf, F::Input)>,
-) -> Result<()> {
-    if args.no_default_libraries {
-        return Ok(());
-    }
-    let mut libraries = Vec::new();
-    for (path, data) in inputs.iter() {
-        if object::FileKind::parse(data.bytes()).ok() != Some(object::FileKind::Coff) {
-            continue;
-        }
-        let file = crate::coff::CoffObject::parse(data.bytes())?;
-        let Some(section) = file.file().section_by_name(".drectve") else {
-            continue;
-        };
-        let text = std::str::from_utf8(
-            section
-                .data()
-                .with_context(|| format!("invalid .drectve in `{}`", path.display()))?,
-        )
-        .with_context(|| format!("non-UTF-8 .drectve in `{}`", path.display()))?
-        .trim_end_matches('\0');
-        let mut parsed = crate::args::coff::CoffArgs::default();
-        crate::args::coff::parse_directives(&mut parsed, text)?;
-        if !parsed.no_default_libraries {
-            libraries.extend(parsed.default_libraries.into_iter().filter(|lib| {
-                !is_excluded(lib, args)
-                    && !parsed
-                        .excluded_default_libraries
-                        .iter()
-                        .any(|x| x.eq_ignore_ascii_case(lib))
-            }));
-        }
-    }
-    for library in libraries {
-        open_input(fs, Path::new(&library), args, inputs)?;
-    }
+    inputs.push((path, data, is_default));
     Ok(())
 }
 
@@ -1817,6 +2014,62 @@ mod tests {
     use super::*;
     use object::write::{Object as WritableObject, Symbol, SymbolSection};
 
+    fn directive_object(
+        definition: Option<&[u8]>,
+        undefined: Option<&[u8]>,
+        directives: &[u8],
+    ) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        if let Some(name) = definition {
+            let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            object.append_section_data(text, &[0xc3], 1);
+            object.add_symbol(Symbol {
+                name: name.to_vec(),
+                value: 0,
+                size: 1,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Section(text),
+                flags: object::SymbolFlags::None,
+            });
+        }
+        if let Some(name) = undefined {
+            object.add_symbol(Symbol {
+                name: name.to_vec(),
+                value: 0,
+                size: 0,
+                kind: object::SymbolKind::Unknown,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            });
+        }
+        if !directives.is_empty() {
+            let section = object.add_section(
+                Vec::new(),
+                b".drectve".to_vec(),
+                object::SectionKind::ReadOnlyData,
+            );
+            object.append_section_data(section, directives, 1);
+        }
+        object.write().unwrap()
+    }
+
+    fn single_member_archive(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut builder = ar::Builder::new(&mut bytes);
+        let header = ar::Header::new(name.to_vec(), data.len() as u64);
+        builder.append(&header, data).unwrap();
+        drop(builder);
+        bytes
+    }
+
     fn export_test_object(directives: Option<&[u8]>) -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -1984,6 +2237,66 @@ mod tests {
         assert!(!exports[0].data);
         assert_eq!(exports[1].name, "value");
         assert!(exports[1].data);
+    }
+
+    #[test]
+    fn discovers_default_libraries_from_extracted_members_to_a_fixpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let direct_path = directory.path().join("direct.obj");
+        let first_path = directory.path().join("first.lib");
+        let second_path = directory.path().join("second.lib");
+        std::fs::write(
+            &direct_path,
+            directive_object(
+                None,
+                Some(b"first"),
+                b" /DEFAULTLIB:first.lib /INCLUDE:first",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &first_path,
+            single_member_archive(
+                b"first.obj",
+                &directive_object(
+                    Some(b"first"),
+                    Some(b"second"),
+                    b" /DEFAULTLIB:second.lib /FAILIFMISMATCH:RuntimeLibrary=MD",
+                ),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            single_member_archive(
+                b"second.obj",
+                &directive_object(Some(b"second"), None, b" /FAILIFMISMATCH:RuntimeLibrary=MD"),
+            ),
+        )
+        .unwrap();
+
+        let args = crate::args::coff::CoffArgs {
+            no_entry: true,
+            is_dll: true,
+            lib_search_path: vec![directory.path().into()],
+            ..Default::default()
+        };
+        let fs = crate::fs::OsFileSystem;
+        let mut inputs = Vec::new();
+        open_input(&fs, &direct_path, &args, &mut inputs, false).unwrap();
+        let selected = select_inputs_to_fixpoint(&fs, &args, &mut inputs).unwrap();
+
+        assert_eq!(selected.archive_bytes.len(), 2);
+        assert_eq!(selected.objects.len(), 3);
+        assert_eq!(
+            selected.runtime_resolution.mismatch_value("RuntimeLibrary"),
+            Some("MD")
+        );
+        assert!(
+            undefined_symbols(&selected.objects, &selected.roots)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
