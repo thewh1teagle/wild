@@ -416,6 +416,10 @@ where
                 });
             }
             "editandcontinue" if inline_value.is_none() => args.edit_and_continue = true,
+            // MSVC emits this compatibility marker from its C++ runtime. Both
+            // link.exe and lld-link accept it on the command line and in
+            // `.drectve`, but it does not alter the linked image.
+            "throwingnew" if inline_value.is_none() => {}
             "disallowlib" => {
                 let value = required_value("/DISALLOWLIB", inline_value, &mut input)?;
                 args.disallowed_libraries.push(value.to_owned());
@@ -1053,6 +1057,18 @@ mod tests {
         .unwrap();
         assert!(args.common.inputs.is_empty());
         assert!(parse(&mut CoffArgs::default(), ["/NATVIS:"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn accepts_throwing_new_compatibility_marker_without_a_value() {
+        let mut command_line = CoffArgs::default();
+        parse(&mut command_line, ["/ThrowingNew"].into_iter()).unwrap();
+
+        let mut directives = CoffArgs::default();
+        parse_directives(&mut directives, " /THROWINGNEW").unwrap();
+
+        assert!(parse(&mut CoffArgs::default(), ["/ThrowingNew:yes"].into_iter()).is_err());
+        assert!(parse_directives(&mut CoffArgs::default(), "/ThrowingNew:yes").is_err());
     }
 
     #[test]
