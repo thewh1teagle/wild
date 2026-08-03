@@ -5,6 +5,7 @@ use crate::error;
 use crate::error::{Context, Result};
 use crate::fs::{FileReplacementMode, FileSystem, InputFileData, OutputFileData, OutputOptions};
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
+use linker_utils::pe_exports::{Export, ExportTarget, ResolvedExport};
 use linker_utils::pe_sections::{
     ContributionId, ContributionKind, DataDirectoryKind, SectionContribution, SectionLayout,
     SectionLayoutOptions, directory_range_for_section, layout_sections,
@@ -88,15 +89,28 @@ struct Contribution {
     data: Vec<u8>,
 }
 
+struct BuiltImage {
+    bytes: Vec<u8>,
+    exports: Vec<ResolvedExport>,
+}
+
 pub(crate) fn link<F: FileSystem>(
     fs: &F,
     args: &crate::args::coff::CoffArgs,
 ) -> Result<crate::LinkerOutput<'static>> {
     ensure!(!args.common.inputs.is_empty(), "no COFF input files");
-    let entry_name = args.entry.as_deref();
+    let entry_name = (!args.no_entry).then_some(args.entry.as_deref()).flatten();
     ensure!(
-        args.is_dll || entry_name.is_some(),
+        args.is_dll || args.no_entry || entry_name.is_some(),
         "PE executable output requires /ENTRY:<symbol>"
+    );
+    ensure!(
+        !(args.no_entry && args.entry.is_some()),
+        "/ENTRY and /NOENTRY cannot be used together"
+    );
+    ensure!(
+        !args.no_entry || args.is_dll,
+        "/NOENTRY is only valid with /DLL"
     );
 
     let mut requested = Vec::new();
@@ -149,6 +163,9 @@ pub(crate) fn link<F: FileSystem>(
             }
         }
     }
+    let initial_directive_exports = directive_exports(&objects)?;
+    let mut exports = args.exports.clone();
+    exports.extend(initial_directive_exports.iter().cloned());
     let mut roots = args
         .force_undefined
         .iter()
@@ -157,14 +174,33 @@ pub(crate) fn link<F: FileSystem>(
     if let Some(entry) = entry_name {
         roots.push(entry.as_bytes().to_vec());
     }
+    roots.extend(
+        exports
+            .iter()
+            .map(|export| export.target.as_bytes().to_vec()),
+    );
     pe_resolver::extract(&mut objects, &archive_bytes, &archive_whole, &roots)?;
     ensure!(!objects.is_empty(), "no COFF object files selected");
 
+    for export in directive_exports(&objects)? {
+        if !exports.contains(&export) {
+            exports.push(export);
+        }
+    }
+
     let undefined = undefined_symbols(&objects, &roots)?;
     let imports = pe_imports::select_from_libraries(&archive_bytes, &undefined)?;
+    let dll_name = args
+        .common
+        .output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("PE output file name is not valid UTF-8")?;
     let image = build_image(
         &objects,
         &imports,
+        &exports,
+        dll_name.as_bytes(),
         entry_name,
         args,
         PeWriterConfig::from_args(args)?,
@@ -172,7 +208,7 @@ pub(crate) fn link<F: FileSystem>(
     let mut output = fs.create_output(
         args.common.output.clone(),
         OutputOptions {
-            size: image.len() as u64,
+            size: image.bytes.len() as u64,
             file_replacement_mode: args
                 .common
                 .file_replacement_mode
@@ -180,9 +216,78 @@ pub(crate) fn link<F: FileSystem>(
             write_mode: args.common.file_write_mode,
         },
     )?;
-    output.bytes_mut().copy_from_slice(&image);
+    output.bytes_mut().copy_from_slice(&image.bytes);
     output.finish()?;
+    if !image.exports.is_empty() {
+        write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
+    }
     Ok(crate::LinkerOutput { layout: None })
+}
+
+fn directive_exports(
+    objects: &[crate::coff::CoffObject<'_>],
+) -> Result<Vec<crate::args::coff::ExportSpec>> {
+    let mut exports = Vec::new();
+    for object in objects {
+        let Some(section) = object.file().section_by_name(".drectve") else {
+            continue;
+        };
+        let text = std::str::from_utf8(section.data().context("invalid COFF .drectve")?)
+            .context("non-UTF-8 COFF .drectve")?
+            .trim_end_matches('\0');
+        let mut parsed = crate::args::coff::CoffArgs::default();
+        crate::args::coff::parse_directives(&mut parsed, text)?;
+        exports.extend(parsed.exports);
+    }
+    Ok(exports)
+}
+
+fn write_import_library<F: FileSystem>(
+    fs: &F,
+    args: &crate::args::coff::CoffArgs,
+    dll_name: &[u8],
+    specs: &[crate::args::coff::ExportSpec],
+    resolved: &[ResolvedExport],
+) -> Result<()> {
+    use linker_utils::coff_import_library_writer::{
+        ImportLibraryExport, ImportLibrarySymbolType, build_amd64_import_library,
+    };
+
+    let private = specs
+        .iter()
+        .filter(|spec| spec.private)
+        .map(|spec| spec.name.as_bytes())
+        .collect::<HashSet<_>>();
+    let exports = resolved
+        .iter()
+        .filter(|export| !private.contains(export.name.as_slice()))
+        .map(|export| ImportLibraryExport {
+            symbol: export.name.as_slice(),
+            export_name: export.name.as_slice(),
+            ordinal: export.ordinal,
+            noname: export.noname,
+            symbol_type: if export.data {
+                ImportLibrarySymbolType::Data
+            } else {
+                ImportLibrarySymbolType::Code
+            },
+        })
+        .collect::<Vec<_>>();
+    if exports.is_empty() {
+        return Ok(());
+    }
+    let bytes = build_amd64_import_library(dll_name, &exports)
+        .context("failed to build COFF import library")?;
+    let path = args.import_library.as_deref().map_or_else(
+        || {
+            let mut path = args.common.output.to_path_buf();
+            path.set_extension("lib");
+            path
+        },
+        Path::to_path_buf,
+    );
+    fs.write_auxiliary(&path, &bytes)
+        .with_context(|| format!("failed to write import library `{}`", path.display()))
 }
 
 fn path_matches(path: &Path, requested: &str) -> bool {
@@ -308,10 +413,12 @@ fn undefined_symbols(
 fn build_image(
     objects: &[crate::coff::CoffObject<'_>],
     imports: &[pe_imports::Import],
+    exports: &[crate::args::coff::ExportSpec],
+    dll_name: &[u8],
     entry_name: Option<&str>,
     args: &crate::args::coff::CoffArgs,
     config: PeWriterConfig,
-) -> Result<Vec<u8>> {
+) -> Result<BuiltImage> {
     let mut contributions = collect_contributions(objects, args)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
@@ -330,6 +437,13 @@ fn build_image(
         b".idata",
         idata_size,
         data_characteristics(),
+    )?;
+    let edata_size = estimated_export_size(dll_name, exports)?;
+    let edata_id = add_synthetic(
+        &mut contributions,
+        b".edata",
+        edata_size,
+        readonly_data_characteristics(),
     )?;
 
     let dynamic_base = args.dynamic_base && !args.fixed;
@@ -455,6 +569,42 @@ fn build_image(
         None => 0,
     };
 
+    let export_directory = if let Some(id) = edata_id {
+        let section_rva = layout.placements[&id].rva;
+        let values = exports
+            .iter()
+            .map(|export| {
+                let target = resolve_export_target(
+                    export,
+                    objects,
+                    &locations,
+                    &layout,
+                    &definitions,
+                    config.image_base,
+                )?;
+                Ok(Export {
+                    name: export.name.as_bytes(),
+                    ordinal: export.ordinal,
+                    noname: export.noname,
+                    data: export.data,
+                    target,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let directory =
+            linker_utils::pe_exports::build_export_directory(dll_name, section_rva, &values)
+                .context("failed to build PE export directory")?;
+        let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
+        ensure!(
+            directory.bytes.len() <= contribution.data.len(),
+            "PE export directory exceeded its reserved size"
+        );
+        contribution.data[..directory.bytes.len()].copy_from_slice(&directory.bytes);
+        Some(directory)
+    } else {
+        None
+    };
+
     let mut image = vec![0; layout.file_size as usize];
     for contribution in &contributions {
         let placement = &layout.placements[&contribution.spec.id];
@@ -480,8 +630,83 @@ fn build_image(
         emitted_imports.import_directory,
         emitted_imports.iat_directory,
         reloc_id.is_some() && !reloc_data.is_empty(),
+        export_directory
+            .as_ref()
+            .map(|directory| (directory.rva, directory.size)),
     );
-    Ok(image)
+    Ok(BuiltImage {
+        bytes: image,
+        exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
+    })
+}
+
+fn estimated_export_size(
+    dll_name: &[u8],
+    exports: &[crate::args::coff::ExportSpec],
+) -> Result<usize> {
+    if exports.is_empty() {
+        return Ok(0);
+    }
+    let values = exports
+        .iter()
+        .map(|export| Export {
+            name: export.name.as_bytes(),
+            ordinal: export.ordinal,
+            noname: export.noname,
+            data: export.data,
+            target: if looks_like_forwarder(export) {
+                ExportTarget::Forwarder(export.target.as_bytes())
+            } else {
+                ExportTarget::Rva(1)
+            },
+        })
+        .collect::<Vec<_>>();
+    Ok(
+        linker_utils::pe_exports::build_export_directory(dll_name, 0x7000_0000, &values)
+            .context("invalid PE exports")?
+            .bytes
+            .len(),
+    )
+}
+
+fn looks_like_forwarder(export: &crate::args::coff::ExportSpec) -> bool {
+    export.target != export.name
+        && export
+            .target
+            .split_once('.')
+            .is_some_and(|(dll, symbol)| !dll.is_empty() && !symbol.is_empty())
+}
+
+fn resolve_export_target<'a>(
+    export: &'a crate::args::coff::ExportSpec,
+    objects: &[crate::coff::CoffObject<'_>],
+    locations: &LocationMap,
+    layout: &SectionLayout,
+    definitions: &HashMap<Vec<u8>, u64>,
+    image_base: u64,
+) -> Result<ExportTarget<'a>> {
+    let name = export.target.as_bytes();
+    let address = if let Some(address) = definitions.get(name).copied() {
+        Some(address)
+    } else {
+        find_local_symbol(objects, locations, layout, name, image_base)?
+    };
+    if let Some(address) = address {
+        let rva = u32::try_from(
+            address
+                .checked_sub(image_base)
+                .context("export target precedes image base")?,
+        )
+        .context("export target RVA exceeds u32")?;
+        return Ok(ExportTarget::Rva(rva));
+    }
+    if looks_like_forwarder(export) {
+        return Ok(ExportTarget::Forwarder(name));
+    }
+    Err(error!(
+        "export `{}` targets undefined symbol `{}`",
+        export.name, export.target
+    ))
 }
 
 fn collect_contributions(
@@ -1035,6 +1260,7 @@ fn write_headers(
     import_directory: Option<(u32, u32)>,
     iat_directory: Option<(u32, u32)>,
     has_relocs: bool,
+    export_directory: Option<(u32, u32)>,
 ) {
     image[..2].copy_from_slice(b"MZ");
     put_u32(image, 0x3c, 0x80);
@@ -1151,6 +1377,10 @@ fn write_headers(
     put_u64(image, opt + 88, heap.reserve);
     put_u64(image, opt + 96, heap.commit.unwrap_or(0x1000));
     put_u32(image, opt + 108, 16);
+    if let Some((rva, size)) = export_directory {
+        put_u32(image, opt + 112, rva);
+        put_u32(image, opt + 116, size);
+    }
     if let Some((rva, size)) = import_directory {
         put_u32(image, opt + 120, rva);
         put_u32(image, opt + 124, size);
@@ -1251,6 +1481,9 @@ fn data_characteristics() -> u32 {
         | object::pe::IMAGE_SCN_MEM_WRITE)
         .0
 }
+fn readonly_data_characteristics() -> u32 {
+    (object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA | object::pe::IMAGE_SCN_MEM_READ).0
+}
 fn bss_characteristics() -> u32 {
     (object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
         | object::pe::IMAGE_SCN_MEM_READ
@@ -1279,6 +1512,49 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object::write::{Object as WritableObject, Symbol, SymbolSection};
+
+    fn export_test_object(directives: Option<&[u8]>) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0xc3], 1);
+        object.add_symbol(Symbol {
+            name: b"function".to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+        object.append_section_data(data, &17u32.to_le_bytes(), 4);
+        object.add_symbol(Symbol {
+            name: b"value".to_vec(),
+            value: 0,
+            size: 4,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(data),
+            flags: object::SymbolFlags::None,
+        });
+        if let Some(directives) = directives {
+            let section = object.add_section(
+                Vec::new(),
+                b".drectve".to_vec(),
+                object::SectionKind::ReadOnlyData,
+            );
+            object.append_section_data(section, directives, 1);
+        }
+        object.write().unwrap()
+    }
+
     #[test]
     fn args_drive_writer_configuration() {
         let args = crate::args::coff::CoffArgs {
@@ -1305,5 +1581,75 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merged_name(b".foo$z", &args).unwrap(), b".data$z");
+    }
+
+    #[test]
+    fn builds_dll_exports_at_final_rvas() {
+        let bytes = export_test_object(None);
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let args = crate::args::coff::CoffArgs {
+            is_dll: true,
+            no_entry: true,
+            ..Default::default()
+        };
+        let exports = vec![
+            crate::args::coff::ExportSpec {
+                name: "function".into(),
+                target: "function".into(),
+                ordinal: None,
+                noname: false,
+                data: false,
+                private: false,
+            },
+            crate::args::coff::ExportSpec {
+                name: "value".into(),
+                target: "value".into(),
+                ordinal: Some(9),
+                noname: false,
+                data: true,
+                private: false,
+            },
+        ];
+        let image = build_image(
+            &[object],
+            &[],
+            &exports,
+            b"sample.dll",
+            None,
+            &args,
+            PeWriterConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            image
+                .exports
+                .iter()
+                .map(|export| (export.name.as_slice(), export.ordinal, export.data))
+                .collect::<Vec<_>>(),
+            [
+                (b"function".as_slice(), 1, false),
+                (b"value".as_slice(), 9, true)
+            ]
+        );
+        assert_ne!(
+            u32::from_le_bytes(image.bytes[0x108..0x10c].try_into().unwrap()),
+            0
+        );
+        assert_ne!(
+            u32::from_le_bytes(image.bytes[0x10c..0x110].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn reads_compiler_generated_export_directives() {
+        let bytes = export_test_object(Some(b" /EXPORT:function /EXPORT:value,DATA"));
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+        let exports = directive_exports(&[object]).unwrap();
+        assert_eq!(exports.len(), 2);
+        assert_eq!(exports[0].name, "function");
+        assert!(!exports[0].data);
+        assert_eq!(exports[1].name, "value");
+        assert!(exports[1].data);
     }
 }
