@@ -14,8 +14,10 @@ use linker_utils::coff_symbols::ArchiveDemand;
 use linker_utils::coff_symbols::ArchiveDemandKind;
 use object::Object;
 use object::ObjectSymbol;
+use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 type SymbolState = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
@@ -71,8 +73,61 @@ impl IncrementalSymbolState {
 }
 
 /// Incremental archive extraction state retained while default libraries are discovered.
+struct LazyArchive<'data> {
+    bytes: &'data [u8],
+    indexed: bool,
+    parsed: OnceLock<linker_utils::coff_archives::Result<CoffArchive<'data>>>,
+}
+
+impl<'data> LazyArchive<'data> {
+    fn new(bytes: &'data [u8]) -> Result<Self> {
+        Ok(Self {
+            bytes,
+            indexed: CoffArchive::has_symbol_index(bytes).context("invalid AMD64 COFF archive")?,
+            parsed: OnceLock::new(),
+        })
+    }
+
+    fn parsed(&self) -> &linker_utils::coff_archives::Result<CoffArchive<'data>> {
+        self.parsed.get_or_init(|| CoffArchive::parse(self.bytes))
+    }
+}
+
+fn prepare_archives(archives: &[LazyArchive<'_>]) {
+    if rayon::current_num_threads() == 1 {
+        for archive in archives {
+            let _ = archive.parsed();
+        }
+    } else {
+        archives
+            .par_iter()
+            .filter(|archive| archive.indexed)
+            .for_each(|archive| {
+                let _ = archive.parsed();
+            });
+        // Indexless archives require eager member parsing to discover their definitions. Keep
+        // that fallback serial rather than spending cores on members that will not be selected.
+        for archive in archives.iter().filter(|archive| !archive.indexed) {
+            let _ = archive.parsed();
+        }
+    }
+}
+
+fn parsed_archives<'session, 'data>(
+    archives: &'session [LazyArchive<'data>],
+) -> Result<Vec<&'session CoffArchive<'data>>> {
+    prepare_archives(archives);
+    archives
+        .iter()
+        .map(|archive| match archive.parsed() {
+            Ok(archive) => Ok(archive),
+            Err(parse_error) => Err(error!("{parse_error}")).context("invalid AMD64 COFF archive"),
+        })
+        .collect()
+}
+
 pub(super) struct ResolverSession<'data> {
-    archives: Vec<CoffArchive<'data>>,
+    archives: Vec<LazyArchive<'data>>,
     whole_archive: Vec<bool>,
     extracted: HashSet<(usize, usize)>,
     import_definitions: BTreeSet<Vec<u8>>,
@@ -95,8 +150,7 @@ impl<'data> ResolverSession<'data> {
     }
 
     pub(super) fn add_archive(&mut self, bytes: &'data [u8], whole_archive: bool) -> Result<()> {
-        self.archives
-            .push(CoffArchive::parse(bytes).context("invalid AMD64 COFF archive")?);
+        self.archives.push(LazyArchive::new(bytes)?);
         self.whole_archive.push(whole_archive);
         Ok(())
     }
@@ -113,8 +167,10 @@ impl<'data> ResolverSession<'data> {
     /// to that symbol. The caller uses this query to add that conditional root
     /// without turning an absent optional symbol into an unresolved external.
     pub(super) fn has_archive_definition(&self, name: &[u8]) -> bool {
+        prepare_archives(&self.archives);
         self.archives
             .iter()
+            .filter_map(|archive| archive.parsed().as_ref().ok())
             .any(|archive| archive.has_object_definition(name))
     }
 
@@ -129,6 +185,7 @@ impl<'data> ResolverSession<'data> {
         runtime_resolution: &mut RuntimeResolution,
     ) -> Result<BTreeSet<Vec<u8>>> {
         crate::timing_phase!(super::PE_PHASE_RESOLVE_ARCHIVES);
+        let archives = parsed_archives(&self.archives)?;
         self.symbol_state.add_roots(roots);
         for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
             self.symbol_state.absorb_object(object, index)?;
@@ -139,7 +196,7 @@ impl<'data> ResolverSession<'data> {
         // because the caller rebuilds runtime directives whenever newly selected objects add
         // another `.drectve` wave.
         for &(archive_index, member_index) in &self.selected_aliases {
-            let member = &self.archives[archive_index].members()[member_index];
+            let member = &archives[archive_index].members()[member_index];
             let aliases = parse_legacy_alias_object(member.data())?
                 .expect("selected legacy alias member remains a legacy alias");
             for directive in aliases.directives()? {
@@ -150,7 +207,7 @@ impl<'data> ResolverSession<'data> {
         loop {
             let mut changed = false;
             changed |= extract_pass(
-                &self.archives,
+                &archives,
                 objects,
                 &self.whole_archive,
                 runtime_resolution,
@@ -165,7 +222,7 @@ impl<'data> ResolverSession<'data> {
                 continue;
             }
             changed |= extract_pass(
-                &self.archives,
+                &archives,
                 objects,
                 &self.whole_archive,
                 runtime_resolution,
@@ -207,7 +264,7 @@ fn extract<'data>(
 
 #[allow(clippy::too_many_arguments)]
 fn extract_pass<'data>(
-    archives: &[CoffArchive<'data>],
+    archives: &[&CoffArchive<'data>],
     objects: &mut Vec<crate::coff::CoffObject<'data>>,
     whole_archive: &[bool],
     runtime_resolution: &mut RuntimeResolution,
@@ -525,6 +582,59 @@ mod tests {
 
             assert_eq!(objects.len() == 2, extracts_primary, "search type {search}");
         }
+    }
+
+    #[test]
+    fn archive_preparation_is_deterministic_across_thread_counts() {
+        let baseline = extraction_signature(1);
+        for threads in [2, 4] {
+            assert_eq!(extraction_signature(threads), baseline);
+        }
+    }
+
+    fn extraction_signature(threads: usize) -> (Vec<Vec<Vec<u8>>>, BTreeSet<Vec<u8>>) {
+        let root = coff_object(&[], &["sym0"]);
+        let libraries = (0..8)
+            .rev()
+            .map(|index| {
+                let definition = format!("sym{index}");
+                let undefined = (index < 7).then(|| format!("sym{}", index + 1));
+                archive(&[(
+                    "member.o",
+                    coff_object(
+                        &[definition.as_str()],
+                        &undefined.as_deref().into_iter().collect::<Vec<_>>(),
+                    ),
+                )])
+            })
+            .collect::<Vec<_>>();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                assert_eq!(rayon::current_num_threads(), threads);
+                let mut session = ResolverSession::new();
+                for library in &libraries {
+                    session.add_archive(library, false).unwrap();
+                }
+                let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+                let imports = session
+                    .resolve(&mut objects, &[], &mut RuntimeResolution::new())
+                    .unwrap();
+                let definitions = objects
+                    .iter()
+                    .map(|object| {
+                        object
+                            .file()
+                            .symbols()
+                            .filter(|symbol| symbol.is_global() && symbol.is_definition())
+                            .map(|symbol| symbol.name_bytes().unwrap().to_vec())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                (definitions, imports)
+            })
     }
 
     fn coff_object(definitions: &[&str], undefined: &[&str]) -> Vec<u8> {
