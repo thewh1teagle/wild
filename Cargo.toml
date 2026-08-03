@@ -85,7 +85,7 @@ libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 libtest-mimic = { version = "0.8.2", default-features = false }
 memchr = { version = "2.7.0", default-features = false }
 memmap2 = { version = "0.9.0", default-features = false }
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 nix = { version = "0.31.1", default-features = false, features = [
   "resource",
   "fs",
