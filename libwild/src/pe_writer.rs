@@ -1463,6 +1463,32 @@ fn collect_contributions(
             });
         }
     }
+    // lld-link gives an empty input contribution a boundary location only when its merged
+    // output section exists for some non-empty input. Entirely empty groups are omitted.
+    let non_empty_groups = output
+        .iter()
+        .filter(|contribution| contribution.spec.size != 0)
+        .map(|contribution| {
+            contribution
+                .spec
+                .name
+                .split(|byte| *byte == b'$')
+                .next()
+                .unwrap()
+                .to_vec()
+        })
+        .collect::<HashSet<_>>();
+    output.retain(|contribution| {
+        contribution.spec.size != 0
+            || non_empty_groups.contains(
+                contribution
+                    .spec
+                    .name
+                    .split(|byte| *byte == b'$')
+                    .next()
+                    .unwrap(),
+            )
+    });
     Ok((output, comdats.redirects))
 }
 
@@ -3420,6 +3446,29 @@ mod tests {
                 0x00, 0x00, // Padding between the two relocation fields.
                 0x08, 0x00, 0x00, 0x00, // SECREL: byte 8 within `.rdata`.
             ]
+        );
+    }
+
+    #[test]
+    fn wholly_empty_output_section_is_still_omitted() {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let empty = object.add_section(
+            Vec::new(),
+            b".rdata$z".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        object.append_section_data(empty, &[], 8);
+        let bytes = object.write().unwrap();
+        let object = crate::coff::CoffObject::parse(&bytes).unwrap();
+
+        assert!(
+            collect_contributions(&[object], &crate::args::coff::CoffArgs::default())
+                .unwrap()
+                .is_empty()
         );
     }
 
