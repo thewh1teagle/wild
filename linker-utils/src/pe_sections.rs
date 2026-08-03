@@ -1,9 +1,11 @@
 //! Deterministic layout of COFF section contributions in PE images.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use object::pe;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const MAX_COFF_ALIGNMENT: u32 = 8192;
 const CONTENT_MASK: u32 = pe::IMAGE_SCN_CNT_CODE.0
@@ -265,7 +267,6 @@ pub fn layout_sections(
 }
 
 /// Returns the full non-empty output section range for a standard directory.
-///
 #[must_use]
 pub fn directory_range_for_section(
     layout: &SectionLayout,

@@ -5,9 +5,16 @@
 //! module keeps all strings borrowed because COFF names are byte strings, not
 //! necessarily UTF-8.
 
-use anyhow::{Context, Result, bail, ensure};
-use object::read::archive::{ArchiveFile, ArchiveMemberIterator};
-use object::{Architecture, FileKind, Object as _, pe};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use object::Architecture;
+use object::FileKind;
+use object::Object as _;
+use object::pe;
+use object::read::archive::ArchiveFile;
+use object::read::archive::ArchiveMemberIterator;
 
 const IMPORT_HEADER_SIZE: usize = 20;
 const IMPORT_FLAGS_MASK: u16 = 0x1f;

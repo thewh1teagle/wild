@@ -1,11 +1,16 @@
 //! Command-line parsing for the MSVC-compatible (`link.exe`) driver.
 
-use super::{CommonArgs, Input, InputSpec, Modifiers};
+use super::CommonArgs;
+use super::Input;
+use super::InputSpec;
+use super::Modifiers;
 use crate::alignment::Alignment;
 use crate::bail;
-use crate::error::{Context, Result};
+use crate::error::Context;
+use crate::error::Result;
 use crate::platform;
-use linker_utils::coff_runtime::{RuntimeDirective, RuntimeResolution};
+use linker_utils::coff_runtime::RuntimeDirective;
+use linker_utils::coff_runtime::RuntimeResolution;
 use std::path::Path;
 use std::sync::Arc;
 

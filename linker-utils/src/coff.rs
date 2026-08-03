@@ -4,7 +4,9 @@
 //! helpers in this module deliberately use RVAs for locations in the output
 //! image, adding the image base only for relocations that require a VA.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use object::pe;
 
 /// The preferred load address of a PE image.

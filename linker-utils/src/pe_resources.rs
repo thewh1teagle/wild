@@ -4,9 +4,11 @@
 //! Rust strings. This preserves the exact ordering used by the Windows loader
 //! and avoids lossy conversion of input produced by resource compilers.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const DIRECTORY_SIZE: usize = 16;
 const DIRECTORY_ENTRY_SIZE: usize = 8;
