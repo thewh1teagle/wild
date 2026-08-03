@@ -3,10 +3,13 @@
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
+#[cfg(test)]
 use linker_utils::coff_imports::ImportLibrary;
+#[cfg(test)]
 use linker_utils::coff_imports::ImportLibraryMember;
 use linker_utils::coff_imports::ImportTarget;
 use linker_utils::coff_imports::ImportType;
+use linker_utils::coff_imports::ShortImportObject;
 use linker_utils::pe_delay_imports::DelayImportDll;
 use linker_utils::pe_delay_imports::DelayImportLayout;
 use linker_utils::pe_delay_imports::DelayImportTarget;
@@ -110,67 +113,58 @@ pub(super) fn retain_referenced(imports: &mut Vec<Import>, references: &HashSet<
     });
 }
 
-/// Select short import objects that satisfy an undefined symbol.
-pub(super) fn select_from_libraries(
-    libraries: &[&[u8]],
+/// Materialize the short-import records already selected by archive resolution.
+pub(super) fn select_from_records(
+    records: &[ShortImportObject<'_>],
     undefined: &HashSet<Vec<u8>>,
-) -> Result<Vec<Import>> {
+) -> Vec<Import> {
     let mut selected = Vec::new();
     let mut selected_symbols = HashSet::new();
-    for bytes in libraries {
-        // General static COFF archives are handled by the object resolver. Avoid interpreting
-        // every regular archive as an import library merely because both use the `ar` container.
-        if !bytes.windows(8).any(|window| {
-            window
-                == [
-                    0,
-                    0,
-                    0xff,
-                    0xff,
-                    0,
-                    0,
-                    object::pe::IMAGE_FILE_MACHINE_AMD64.0 as u8,
-                    (object::pe::IMAGE_FILE_MACHINE_AMD64.0 >> 8) as u8,
-                ]
-        }) {
+    for &import in records {
+        let symbol = import.symbol();
+        let mut imp_symbol = b"__imp_".to_vec();
+        imp_symbol.extend_from_slice(symbol);
+        if !undefined.contains(symbol) && !undefined.contains(&imp_symbol) {
             continue;
         }
-        let library = ImportLibrary::parse(bytes)?;
-        for member in library.members() {
-            let ImportLibraryMember::ShortImport { import, .. } = member? else {
-                continue;
-            };
-            let symbol = import.symbol();
-            let mut imp_symbol = b"__imp_".to_vec();
-            imp_symbol.extend_from_slice(symbol);
-            if !undefined.contains(symbol) && !undefined.contains(&imp_symbol) {
-                continue;
-            }
-            if !selected_symbols.insert(symbol.to_vec()) {
-                continue;
-            }
-            let target = match import.target() {
-                ImportTarget::Ordinal(ordinal) => OwnedTarget::Ordinal(ordinal),
-                ImportTarget::Name { name, hint } => OwnedTarget::Name {
-                    name: name.to_vec(),
-                    hint,
-                },
-            };
-            selected.push(Import {
-                dll: import.dll().to_vec(),
-                symbol: symbol.to_vec(),
-                target,
-                import_type: match import.import_type() {
-                    ImportType::Code => 0,
-                    ImportType::Data => 1,
-                    ImportType::Const => 2,
-                },
-                needs_thunk: undefined.contains(symbol),
-            });
+        if !selected_symbols.insert(symbol.to_vec()) {
+            continue;
         }
+        let target = match import.target() {
+            ImportTarget::Ordinal(ordinal) => OwnedTarget::Ordinal(ordinal),
+            ImportTarget::Name { name, hint } => OwnedTarget::Name {
+                name: name.to_vec(),
+                hint,
+            },
+        };
+        selected.push(Import {
+            dll: import.dll().to_vec(),
+            symbol: symbol.to_vec(),
+            target,
+            import_type: match import.import_type() {
+                ImportType::Code => 0,
+                ImportType::Data => 1,
+                ImportType::Const => 2,
+            },
+            needs_thunk: undefined.contains(symbol),
+        });
     }
     selected.sort();
-    Ok(selected)
+    selected
+}
+
+#[cfg(test)]
+fn select_from_libraries(libraries: &[&[u8]], undefined: &HashSet<Vec<u8>>) -> Result<Vec<Import>> {
+    let mut records = Vec::new();
+    for bytes in libraries {
+        let library = ImportLibrary::parse(bytes)?;
+        for member in library.members() {
+            if let ImportLibraryMember::ShortImport { import, .. } = member? {
+                records.push(import);
+            }
+        }
+    }
+    Ok(select_from_records(&records, undefined))
 }
 
 /// Compute the generated section sizes without requiring their eventual RVAs.
@@ -892,6 +886,46 @@ mod tests {
         assert_eq!(imports[0].symbol, b"ExitProcess");
         assert!(!imports[0].needs_thunk);
         assert_eq!(section_sizes(&imports).unwrap().1, 0);
+    }
+
+    #[test]
+    fn selected_records_keep_first_duplicate_and_sort_output() {
+        let first = short_import(b"Zulu", b"FIRST.dll");
+        let duplicate = short_import(b"Zulu", b"SECOND.dll");
+        let alpha = short_import(b"Alpha", b"FIRST.dll");
+        let records =
+            [&first, &duplicate, &alpha].map(|bytes| ShortImportObject::parse(bytes).unwrap());
+        let undefined = HashSet::from([b"Zulu".to_vec(), b"Alpha".to_vec()]);
+
+        let imports = select_from_records(&records, &undefined);
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].symbol, b"Alpha");
+        assert_eq!(imports[1].symbol, b"Zulu");
+        assert_eq!(imports[1].dll, b"FIRST.dll");
+    }
+
+    #[test]
+    fn selected_records_preserve_ordinal_and_delay_partition() {
+        let mut ordinal = short_import(b"OrdinalApi", b"DELAY.dll");
+        ordinal[16..18].copy_from_slice(&7u16.to_le_bytes());
+        ordinal[18..20].copy_from_slice(
+            &(object::pe::IMPORT_OBJECT_CODE.0
+                | (object::pe::IMPORT_OBJECT_ORDINAL.0 << object::pe::IMPORT_OBJECT_NAME_SHIFT))
+                .to_le_bytes(),
+        );
+        let eager = short_import(b"NamedApi", b"EAGER.dll");
+        let records = [&ordinal, &eager].map(|bytes| ShortImportObject::parse(bytes).unwrap());
+        let undefined = HashSet::from([b"OrdinalApi".to_vec(), b"NamedApi".to_vec()]);
+
+        let imports = select_from_records(&records, &undefined);
+        let (eager, delayed) = partition_delay_imports(imports, &["delay.DLL".into()]);
+
+        assert_eq!(eager.len(), 1);
+        assert_eq!(eager[0].symbol, b"NamedApi");
+        assert_eq!(delayed.len(), 1);
+        assert_eq!(delayed[0].symbol, b"OrdinalApi");
+        assert_eq!(delayed[0].target, OwnedTarget::Ordinal(7));
     }
 
     #[test]
