@@ -66,7 +66,9 @@ pub struct ContributionPlacement {
 /// One output PE section after subsection grouping and layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputSection {
-    /// Canonical name (the part before `$`).
+    /// Full canonical input name (the part before `$`). The PE image section
+    /// header stores only its first eight bytes, but layout must retain the
+    /// full name so distinct long input sections are not accidentally merged.
     pub name: Vec<u8>,
     pub characteristics: u32,
     pub rva: u32,
@@ -142,11 +144,6 @@ pub fn layout_sections(
             !base.is_empty(),
             "contribution {} has an empty canonical section name",
             contribution.id.0
-        );
-        ensure!(
-            base.len() <= 8,
-            "output section name {:?} exceeds the PE 8-byte limit",
-            String::from_utf8_lossy(base)
         );
         groups
             .entry(base.to_vec())
@@ -555,6 +552,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_colliding_long_logical_names_as_distinct_output_sections() {
+        let inputs = [
+            contribution(1, b".a_very_long_section$z", ContributionKind::Data, 3, 1),
+            contribution(2, b".a_very_long_section2", ContributionKind::Data, 5, 1),
+            contribution(3, b".eh_frame", ContributionKind::Data, 8, 8),
+        ];
+        let layout = layout_sections(&inputs, options()).unwrap();
+        let actual = layout
+            .sections
+            .iter()
+            .map(|section| section.name.as_slice())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            [
+                b".a_very_long_section".as_slice(),
+                b".a_very_long_section2",
+                b".eh_frame",
+            ]
+        );
+        assert_ne!(
+            layout.placements[&ContributionId(1)].output_section,
+            layout.placements[&ContributionId(2)].output_section
+        );
+    }
+
+    #[test]
     fn lays_out_rvas_files_data_and_bss_with_padding() {
         let inputs = [
             contribution(1, b".data$a", ContributionKind::Data, 3, 1),
@@ -653,13 +678,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
-        );
-        assert!(
-            layout_sections(
-                &[contribution(1, b"toolongxx", ContributionKind::Data, 1, 1)],
-                options()
-            )
-            .is_err()
         );
         assert!(
             layout_sections(
