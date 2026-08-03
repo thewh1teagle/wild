@@ -3053,7 +3053,10 @@ fn unreferenced_comdat_sections(
     drop(roots_phase);
 
     let reachability_phase = crate::timing_guard!(PE_DETAIL_REF_REACHABILITY);
-    let mut edges = vec![Vec::<ComdatGroupId>::new(); comdats.analysis.groups.len()];
+    let no_edge = usize::MAX;
+    let mut edge_heads = vec![no_edge; comdats.analysis.groups.len()];
+    let mut edge_targets = Vec::<ComdatGroupId>::new();
+    let mut edge_next = Vec::<usize>::new();
     for (object_index, object) in objects.iter().enumerate() {
         for section in object.file().sections() {
             let key = (object_index, section.index());
@@ -3087,18 +3090,19 @@ fn unreferenced_comdat_sections(
                     None
                 };
                 if let Some(target) = target {
-                    edges[source_group].push(target);
+                    let edge = edge_targets.len();
+                    edge_targets.push(target);
+                    edge_next.push(edge_heads[source_group]);
+                    edge_heads[source_group] = edge;
                 }
             }
         }
     }
-    for targets in &mut edges {
-        targets.sort_unstable();
-        targets.dedup();
-    }
     while let Some(group) = pending.pop() {
-        for &target in &edges[group] {
-            mark_live(target, &mut live, &mut pending);
+        let mut edge = edge_heads[group];
+        while edge != no_edge {
+            mark_live(edge_targets[edge], &mut live, &mut pending);
+            edge = edge_next[edge];
         }
     }
     drop(reachability_phase);
