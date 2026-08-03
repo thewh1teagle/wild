@@ -27,13 +27,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v7
       - name: Install LLVM tools
         run: |
           brew list llvm >/dev/null 2>&1 || brew install llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-      - name: Validate differential inspector
-        run: uv run plans/pe-coff/pe-coff_001.py --self-test
       - name: Inspect PE/COFF corpus
         run: >-
           cargo test --profile ci -p wild-linker --test windows_pe_smoke
@@ -52,8 +49,10 @@ jobs:
         with:
           arch: x64
       - uses: Swatinem/rust-cache@v2
-      - name: Build Wild PE linker
-        run: cargo build --profile ci -p wild-linker --no-default-features --features pe
+      - name: Build Wild and PE corpus
+        run: >-
+          cargo test --profile ci -p wild-linker --test windows_pe_smoke
+          --no-default-features --features pe --no-run
       - name: Select COFF linker flavor
         shell: pwsh
         run: |

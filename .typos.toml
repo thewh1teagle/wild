@@ -1,3 +1,9 @@
+[default]
+extend-ignore-re = ['/Fo\{\}']
+
+[default.extend-identifiers]
+IMPORT_OBJECT_NAME_EXPORTAS = "IMPORT_OBJECT_NAME_EXPORTAS"
+
 [default.extend-words]
 flate = "flate"
 rela = "rela"
