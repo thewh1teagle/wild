@@ -2,21 +2,39 @@
 
 use crate::ensure;
 use crate::error;
-use crate::error::{Context, Result};
-use crate::fs::{FileReplacementMode, FileSystem, InputFileData, OutputFileData, OutputOptions};
+use crate::error::Context;
+use crate::error::Result;
+use crate::fs::FileReplacementMode;
+use crate::fs::FileSystem;
+use crate::fs::InputFileData;
+use crate::fs::OutputFileData;
+use crate::fs::OutputOptions;
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
-use linker_utils::pe_exports::{Export, ExportTarget, ResolvedExport};
+use linker_utils::pe_exports::Export;
+use linker_utils::pe_exports::ExportTarget;
+use linker_utils::pe_exports::ResolvedExport;
 use linker_utils::pe_resources::ResourceRecord;
-use linker_utils::pe_sections::{
-    ContributionId, ContributionKind, DataDirectoryKind, SectionContribution, SectionLayout,
-    SectionLayoutOptions, directory_range_for_section, layout_sections,
-};
-use object::{
-    Object, ObjectComdat, ObjectSection, ObjectSymbol, RelocationKind, RelocationTarget,
-    SectionFlags,
-};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use linker_utils::pe_sections::ContributionId;
+use linker_utils::pe_sections::ContributionKind;
+use linker_utils::pe_sections::DataDirectoryKind;
+use linker_utils::pe_sections::SectionContribution;
+use linker_utils::pe_sections::SectionLayout;
+use linker_utils::pe_sections::SectionLayoutOptions;
+use linker_utils::pe_sections::directory_range_for_section;
+use linker_utils::pe_sections::layout_sections;
+use object::Object;
+use object::ObjectComdat;
+use object::ObjectSection;
+use object::ObjectSymbol;
+use object::RelocationKind;
+use object::RelocationTarget;
+use object::SectionFlags;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 
 const LOAD_CONFIG_SECURITY_COOKIE_OFFSET: u32 = 88;
 
@@ -131,12 +149,13 @@ pub(crate) fn link<F: FileSystem>(
     let archive_bytes = selected.archive_bytes;
     let entry_name = selected.entry_name;
     let exports = selected.exports;
+    let archive_definitions = selected.archive_definitions;
+    let runtime_resolution = selected.runtime_resolution;
     let mut roots = selected.roots;
     // Preserve the accumulated runtime state through final resolution. Includes already took
     // part in extraction, and keeping this merge here makes that downstream contract explicit.
     roots.extend(
-        selected
-            .runtime_resolution
+        runtime_resolution
             .include_roots()
             .map(|symbol| symbol.as_bytes().to_vec()),
     );
@@ -144,7 +163,8 @@ pub(crate) fn link<F: FileSystem>(
     roots.dedup();
     ensure!(!objects.is_empty(), "no COFF object files selected");
 
-    let undefined = undefined_symbols(&objects, &roots)?;
+    let undefined =
+        resolved_undefined_symbols(&objects, &roots, &archive_definitions, &runtime_resolution)?;
     let imports = pe_imports::select_from_libraries(&archive_bytes, &undefined)?;
     let dll_name = args
         .common
@@ -161,6 +181,7 @@ pub(crate) fn link<F: FileSystem>(
         args,
         PeWriterConfig::from_args(args)?,
         &resources,
+        &runtime_resolution,
     )?;
     let mut output = fs.create_output(
         args.common.output.clone(),
@@ -208,6 +229,7 @@ struct SelectedInputs<'data> {
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
     runtime_resolution: linker_utils::coff_runtime::RuntimeResolution,
+    archive_definitions: BTreeSet<Vec<u8>>,
 }
 
 /// Rebuilds borrowed COFF state after every newly discovered default library.
@@ -337,6 +359,7 @@ struct OpenSelection<'data> {
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
     directives: crate::args::coff::CoffArgs,
+    archive_definitions: BTreeSet<Vec<u8>>,
 }
 
 impl<'data> OpenSelection<'data> {
@@ -349,6 +372,7 @@ impl<'data> OpenSelection<'data> {
             exports: self.exports,
             roots: self.roots,
             runtime_resolution: self.directives.runtime_resolution,
+            archive_definitions: self.archive_definitions,
         }
     }
 }
@@ -410,7 +434,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
 
     let entry_name = pe_entry::select(args, &objects)?;
     loop {
-        let directives = directive_args(args, &objects)?;
+        let mut directives = directive_args(args, &objects)?;
         let mut exports = args.exports.clone();
         for export in &directives.exports {
             if !exports.contains(export) {
@@ -441,7 +465,13 @@ fn select_opened_inputs<'data, F: FileSystem>(
         roots.dedup();
 
         let old_len = objects.len();
-        pe_resolver::extract(&mut objects, &archive_bytes, &archive_whole, &roots)?;
+        let archive_definitions = pe_resolver::extract(
+            &mut objects,
+            &archive_bytes,
+            &archive_whole,
+            &roots,
+            &mut directives.runtime_resolution,
+        )?;
         if objects.len() == old_len {
             return Ok(OpenSelection {
                 objects,
@@ -451,6 +481,7 @@ fn select_opened_inputs<'data, F: FileSystem>(
                 exports,
                 roots,
                 directives,
+                archive_definitions,
             });
         }
     }
@@ -489,9 +520,9 @@ fn write_import_library<F: FileSystem>(
     specs: &[crate::args::coff::ExportSpec],
     resolved: &[ResolvedExport],
 ) -> Result<()> {
-    use linker_utils::coff_import_library_writer::{
-        ImportLibraryExport, ImportLibrarySymbolType, build_amd64_import_library,
-    };
+    use linker_utils::coff_import_library_writer::ImportLibraryExport;
+    use linker_utils::coff_import_library_writer::ImportLibrarySymbolType;
+    use linker_utils::coff_import_library_writer::build_amd64_import_library;
 
     let private = specs
         .iter()
@@ -620,6 +651,48 @@ fn undefined_symbols(
     Ok(undefined)
 }
 
+fn resolved_undefined_symbols(
+    objects: &[crate::coff::CoffObject<'_>],
+    roots: &[Vec<u8>],
+    archive_definitions: &BTreeSet<Vec<u8>>,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<HashSet<Vec<u8>>> {
+    let undefined = undefined_symbols(objects, roots)?;
+    let object_definitions = object_definition_names(objects)?;
+    undefined
+        .into_iter()
+        .map(|name| {
+            // A selected short import of the primary name is a real definition and
+            // must be emitted rather than replaced by its weak fallback.
+            if archive_definitions.contains(&name) {
+                return Ok(name);
+            }
+            let Ok(text) = std::str::from_utf8(&name) else {
+                return Ok(name);
+            };
+            runtime_resolution
+                .resolve_alternate_name(text, |candidate| {
+                    object_definitions.contains(candidate.as_bytes())
+                        || archive_definitions.contains(candidate.as_bytes())
+                })
+                .map(|resolved| resolved.as_bytes().to_vec())
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn object_definition_names(objects: &[crate::coff::CoffObject<'_>]) -> Result<HashSet<Vec<u8>>> {
+    let mut definitions = HashSet::new();
+    for input in objects {
+        for symbol in input.file().symbols() {
+            if symbol.is_global() && (symbol.is_definition() || symbol.is_common()) {
+                definitions.insert(symbol.name_bytes()?.to_vec());
+            }
+        }
+    }
+    Ok(definitions)
+}
+
 fn build_image(
     objects: &[crate::coff::CoffObject<'_>],
     imports: &[pe_imports::Import],
@@ -629,6 +702,7 @@ fn build_image(
     args: &crate::args::coff::CoffArgs,
     config: PeWriterConfig,
     resources: &[ResourceRecord],
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<BuiltImage> {
     let mut contributions = collect_contributions(objects, args)?;
     let common_offsets = add_common_symbols(objects, &mut contributions)?;
@@ -809,6 +883,7 @@ fn build_image(
             .entry(name.clone())
             .or_insert(config.image_base + u64::from(*rva));
     }
+    bind_alternate_names(&mut definitions, runtime_resolution)?;
     let load_config_directory = if let Some(id) = load_config_id {
         let cookie_va = definitions
             .get(b"__security_cookie".as_slice())
@@ -984,6 +1059,26 @@ fn build_image(
         bytes: image,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
     })
+}
+
+fn bind_alternate_names(
+    definitions: &mut HashMap<Vec<u8>, u64>,
+    runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
+) -> Result<()> {
+    // Resolve every chain against the immutable set of real definitions. Alias
+    // bindings added earlier in this loop must never become strong definitions.
+    let strong = definitions.keys().cloned().collect::<HashSet<_>>();
+    for (symbol, _) in runtime_resolution.alternate_names() {
+        if strong.contains(symbol.as_bytes()) {
+            continue;
+        }
+        let target = runtime_resolution
+            .resolve_alternate_name(symbol, |candidate| strong.contains(candidate.as_bytes()))?;
+        if let Some(address) = definitions.get(target.as_bytes()).copied() {
+            definitions.insert(symbol.as_bytes().to_vec(), address);
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize_exception_directory(
@@ -1291,9 +1386,10 @@ struct SelectedComdat {
 fn discarded_comdat_sections(
     objects: &[crate::coff::CoffObject<'_>],
 ) -> Result<HashSet<(usize, object::SectionIndex)>> {
-    use linker_utils::coff_symbols::{
-        ComdatCandidate, ComdatDecision, ComdatSelection, select_comdat,
-    };
+    use linker_utils::coff_symbols::ComdatCandidate;
+    use linker_utils::coff_symbols::ComdatDecision;
+    use linker_utils::coff_symbols::ComdatSelection;
+    use linker_utils::coff_symbols::select_comdat;
 
     let mut selected = HashMap::<Vec<u8>, SelectedComdat>::new();
     let mut discarded = HashSet::new();
@@ -1637,10 +1733,12 @@ fn apply_relocations(
             };
             let placement = &layout.placements[source_id];
             for (offset, relocation) in source.relocations() {
-                use linker_utils::coff::{
-                    Amd64RelocationInputs, Amd64RelocationKind, ImageBase, Rva, SectionIndex,
-                    apply_amd64_relocation,
-                };
+                use linker_utils::coff::Amd64RelocationInputs;
+                use linker_utils::coff::Amd64RelocationKind;
+                use linker_utils::coff::ImageBase;
+                use linker_utils::coff::Rva;
+                use linker_utils::coff::SectionIndex;
+                use linker_utils::coff::apply_amd64_relocation;
                 let source_file = placement
                     .file_offset
                     .ok_or_else(|| error!("relocation in uninitialized section"))?;
@@ -2046,7 +2144,10 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object::write::{Object as WritableObject, Symbol, SymbolSection};
+    use object::write::Object as WritableObject;
+    use object::write::Relocation;
+    use object::write::Symbol;
+    use object::write::SymbolSection;
 
     fn directive_object(
         definition: Option<&[u8]>,
@@ -2166,6 +2267,50 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn relocation_object(source: &[u8], target: &[u8]) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(text, &[0, 0, 0, 0, 0xc3], 1);
+        object.add_symbol(Symbol {
+            name: source.to_vec(),
+            value: 0,
+            size: 5,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        let target = object.add_symbol(Symbol {
+            name: target.to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                text,
+                Relocation {
+                    offset: 0,
+                    symbol: target,
+                    addend: 0,
+                    flags: object::RelocationFlags::Coff {
+                        typ: object::pe::IMAGE_REL_AMD64_REL32,
+                    },
+                },
+            )
+            .unwrap();
+        object.write().unwrap()
+    }
+
     fn guard_metadata_object() -> Vec<u8> {
         let mut object = WritableObject::new(
             object::BinaryFormat::Coff,
@@ -2202,6 +2347,52 @@ mod tests {
         assert_eq!(config.section_alignment, 0x2000);
         assert_eq!(config.file_alignment, 0x400);
         assert_eq!(config.image_base, 0x180000000);
+    }
+
+    #[test]
+    fn alternate_chain_binds_original_relocation_to_fallback_address() {
+        let caller = relocation_object(b"caller", b"primary");
+        let fallback = directive_object(Some(b"fallback"), None, b"");
+        let objects = [
+            crate::coff::CoffObject::parse(&caller).unwrap(),
+            crate::coff::CoffObject::parse(&fallback).unwrap(),
+        ];
+        let mut runtime = linker_utils::coff_runtime::RuntimeResolution::new();
+        runtime
+            .parse_and_apply(
+                "/alternatename:primary=middle /alternatename:middle=fallback",
+                "caller.obj",
+            )
+            .unwrap();
+
+        build_image(
+            &objects,
+            &[],
+            &[],
+            b"alias.exe",
+            Some("caller"),
+            &crate::args::coff::CoffArgs::default(),
+            PeWriterConfig::default(),
+            &[],
+            &runtime,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn alternate_binding_never_overrides_a_strong_definition() {
+        let mut definitions = HashMap::from([
+            (b"primary".to_vec(), 0x1111),
+            (b"fallback".to_vec(), 0x2222),
+        ]);
+        let mut runtime = linker_utils::coff_runtime::RuntimeResolution::new();
+        runtime
+            .parse_and_apply("/alternatename:primary=fallback", "directives.obj")
+            .unwrap();
+
+        bind_alternate_names(&mut definitions, &runtime).unwrap();
+
+        assert_eq!(definitions[b"primary".as_slice()], 0x1111);
     }
     #[test]
     fn applies_merge_to_subsection() {
@@ -2259,6 +2450,7 @@ mod tests {
             &args,
             PeWriterConfig::default(),
             &[],
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2356,7 +2548,8 @@ mod tests {
 
     #[test]
     fn emits_resources_and_repro_debug_directory_deterministically() {
-        use linker_utils::pe_resources::{ResourceId, ResourceRecord};
+        use linker_utils::pe_resources::ResourceId;
+        use linker_utils::pe_resources::ResourceRecord;
 
         let args = crate::args::coff::CoffArgs {
             debug: true,
@@ -2382,6 +2575,7 @@ mod tests {
                 &args,
                 PeWriterConfig::default(),
                 &resources,
+                &Default::default(),
             )
             .unwrap()
             .bytes
@@ -2500,6 +2694,7 @@ mod tests {
             &crate::args::coff::CoffArgs::default(),
             PeWriterConfig::default(),
             &[],
+            &Default::default(),
         )
         .unwrap()
         .bytes;
@@ -2527,7 +2722,8 @@ mod tests {
 
     #[test]
     fn validates_and_publishes_exact_exception_directory() {
-        use linker_utils::pe_sections::{OutputSection, SectionLayout};
+        use linker_utils::pe_sections::OutputSection;
+        use linker_utils::pe_sections::SectionLayout;
 
         let mut image = vec![0; 0x600];
         image[0x200..0x204].copy_from_slice(&[1, 0, 0, 0]);

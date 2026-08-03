@@ -6,6 +6,8 @@ use crate::error::Context;
 use crate::error::Result;
 use linker_utils::coff_archives::CoffArchive;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
+use linker_utils::coff_runtime::RuntimeResolution;
+use linker_utils::coff_runtime::parse_legacy_alias_object;
 use linker_utils::coff_symbols::ArchiveDemand;
 use linker_utils::coff_symbols::ArchiveDemandKind;
 use object::Object;
@@ -23,7 +25,8 @@ pub(super) fn extract<'data>(
     archive_bytes: &[&'data [u8]],
     whole_archive: &[bool],
     roots: &[Vec<u8>],
-) -> Result<()> {
+    runtime_resolution: &mut RuntimeResolution,
+) -> Result<BTreeSet<Vec<u8>>> {
     ensure!(
         archive_bytes.len() == whole_archive.len(),
         "internal archive policy mismatch"
@@ -38,55 +41,114 @@ pub(super) fn extract<'data>(
     loop {
         let mut changed = false;
 
-        for (archive_index, archive) in archives.iter().enumerate() {
-            // Archive order is significant. In particular, a definition selected from an
-            // earlier library must suppress a competing definition in a later one during this
-            // same pass. Keep the outer loop because a later library may introduce a new demand
-            // that can be satisfied by an earlier library on the next pass.
-            let (mut defined, mut unresolved) = symbol_state(objects, roots)?;
-            defined.extend(import_definitions.iter().cloned());
-            unresolved.retain(|name| !defined.contains(name));
-            let demands = unresolved
-                .iter()
-                .map(|name| ArchiveDemand {
-                    name,
-                    kind: ArchiveDemandKind::Strong,
-                })
-                .collect::<Vec<_>>();
-            let defined_refs = defined.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            let plan = archive.plan(&demands, &defined_refs, whole_archive[archive_index]);
-            for selected in plan.selected() {
-                let member = selected.member();
-                if !extracted.insert((archive_index, member.index())) {
-                    continue;
+        // First give ordinary strong demands a complete pass over every archive.
+        // Only after that reaches a global fixpoint may weak fallback targets pull
+        // members. This ensures a real definition (including a short import) of
+        // the primary name always wins over /alternatename.
+        changed |= extract_pass(
+            &archives,
+            objects,
+            whole_archive,
+            roots,
+            runtime_resolution,
+            &mut extracted,
+            &mut import_definitions,
+            false,
+        )?;
+        if changed {
+            continue;
+        }
+        changed |= extract_pass(
+            &archives,
+            objects,
+            whole_archive,
+            roots,
+            runtime_resolution,
+            &mut extracted,
+            &mut import_definitions,
+            true,
+        )?;
+        if !changed {
+            return Ok(import_definitions);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_pass<'data>(
+    archives: &[CoffArchive<'data>],
+    objects: &mut Vec<crate::coff::CoffObject<'data>>,
+    whole_archive: &[bool],
+    roots: &[Vec<u8>],
+    runtime_resolution: &mut RuntimeResolution,
+    extracted: &mut HashSet<(usize, usize)>,
+    import_definitions: &mut BTreeSet<Vec<u8>>,
+    use_alternates: bool,
+) -> Result<bool> {
+    let mut changed = false;
+    for (archive_index, archive) in archives.iter().enumerate() {
+        // Archive order is significant. In particular, a definition selected from an
+        // earlier library must suppress a competing definition in a later one during this
+        // same pass. Keep the outer loop because a later library may introduce a new demand
+        // that can be satisfied by an earlier library on the next pass.
+        let (mut defined, mut unresolved) = symbol_state(objects, roots)?;
+        defined.extend(import_definitions.iter().cloned());
+        unresolved.retain(|name| !defined.contains(name));
+        let unresolved = if use_alternates {
+            resolve_alternate_demands(unresolved, &defined, runtime_resolution)?
+        } else {
+            unresolved
+        };
+        let demands = unresolved
+            .iter()
+            .map(|name| ArchiveDemand {
+                name,
+                kind: ArchiveDemandKind::Strong,
+            })
+            .collect::<Vec<_>>();
+        let defined_refs = defined.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plan = archive.plan(&demands, &defined_refs, whole_archive[archive_index]);
+        for selected in plan.selected() {
+            let member = selected.member();
+            if !extracted.insert((archive_index, member.index())) {
+                continue;
+            }
+            match member.kind() {
+                CoffArchiveMemberKind::CoffObject { is_bigobj: false } => {
+                    objects.push(crate::coff::CoffObject::parse(member.data()).with_context(
+                        || {
+                            format!(
+                                "invalid COFF archive member `{}`",
+                                String::from_utf8_lossy(member.name())
+                            )
+                        },
+                    )?);
+                    changed = true;
                 }
-                match member.kind() {
-                    CoffArchiveMemberKind::CoffObject { is_bigobj: false } => {
-                        objects.push(crate::coff::CoffObject::parse(member.data()).with_context(
-                            || {
-                                format!(
-                                    "invalid COFF archive member `{}`",
-                                    String::from_utf8_lossy(member.name())
-                                )
-                            },
-                        )?);
-                        changed = true;
+                CoffArchiveMemberKind::CoffObject { is_bigobj: true } => {
+                    return Err(error!(
+                        "bigobj archive member `{}` is not supported yet",
+                        String::from_utf8_lossy(member.name())
+                    ));
+                }
+                CoffArchiveMemberKind::ShortImport(_) => {
+                    // The PE import builder consumes selected import symbols from
+                    // the original archive. Do not parse these as ordinary objects, but do
+                    // retain their definitions for subsequent archive decisions.
+                    for definition in member.definitions() {
+                        changed |= import_definitions.insert(definition.to_vec());
                     }
-                    CoffArchiveMemberKind::CoffObject { is_bigobj: true } => {
-                        return Err(error!(
-                            "bigobj archive member `{}` is not supported yet",
-                            String::from_utf8_lossy(member.name())
-                        ));
-                    }
-                    CoffArchiveMemberKind::ShortImport(_) => {
-                        // The PE import builder consumes selected import symbols from
-                        // the original archive. Do not parse these as ordinary objects, but do
-                        // retain their definitions for subsequent archive decisions.
-                        for definition in member.definitions() {
-                            changed |= import_definitions.insert(definition.to_vec());
+                }
+                CoffArchiveMemberKind::Opaque => {
+                    if let Some(aliases) = parse_legacy_alias_object(member.data())
+                        .context("invalid legacy COFF alias member")?
+                    {
+                        for directive in aliases.directives()? {
+                            runtime_resolution
+                                .apply(directive, &String::from_utf8_lossy(member.name()))?;
                         }
-                    }
-                    CoffArchiveMemberKind::Opaque => {
+                        changed = true;
+                    } else {
                         return Err(error!(
                             "unsupported selected COFF archive member `{}`: {}",
                             String::from_utf8_lossy(member.name()),
@@ -98,10 +160,27 @@ pub(super) fn extract<'data>(
                 }
             }
         }
-        if !changed {
-            return Ok(());
-        }
     }
+    Ok(changed)
+}
+
+fn resolve_alternate_demands(
+    unresolved: BTreeSet<Vec<u8>>,
+    defined: &BTreeSet<Vec<u8>>,
+    runtime_resolution: &RuntimeResolution,
+) -> Result<BTreeSet<Vec<u8>>> {
+    unresolved
+        .into_iter()
+        .map(|name| {
+            let Ok(text) = std::str::from_utf8(&name) else {
+                return Ok(name);
+            };
+            runtime_resolution
+                .resolve_alternate_name(text, |candidate| defined.contains(candidate.as_bytes()))
+                .map(|resolved| resolved.as_bytes().to_vec())
+                .map_err(Into::into)
+        })
+        .collect()
 }
 
 fn symbol_state(objects: &[crate::coff::CoffObject<'_>], roots: &[Vec<u8>]) -> Result<SymbolState> {
@@ -139,7 +218,14 @@ mod tests {
         ]);
         let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
 
-        extract(&mut objects, &[&first, &second], &[false, false], &[]).unwrap();
+        extract(
+            &mut objects,
+            &[&first, &second],
+            &[false, false],
+            &[],
+            &mut RuntimeResolution::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             objects.len(),
@@ -159,7 +245,14 @@ mod tests {
         let second = archive(&[("foo.obj", coff_object(&["foo"], &["bar"]))]);
         let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
 
-        extract(&mut objects, &[&first, &second], &[false, false], &[]).unwrap();
+        extract(
+            &mut objects,
+            &[&first, &second],
+            &[false, false],
+            &[],
+            &mut RuntimeResolution::new(),
+        )
+        .unwrap();
 
         assert_eq!(objects.len(), 3);
         let (_, unresolved) = symbol_state(&objects, &[]).unwrap();
@@ -173,9 +266,54 @@ mod tests {
         let fallback = archive(&[("fallback.obj", coff_object(&["foo"], &[]))]);
         let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
 
-        extract(&mut objects, &[&imports, &fallback], &[false, false], &[]).unwrap();
+        extract(
+            &mut objects,
+            &[&imports, &fallback],
+            &[false, false],
+            &[],
+            &mut RuntimeResolution::new(),
+        )
+        .unwrap();
 
         assert_eq!(objects.len(), 1, "the fallback definition was extracted");
+    }
+
+    #[test]
+    fn alternatename_extracts_fallback_only_after_primary_search_fails() {
+        let root = coff_object(&[], &["primary"]);
+        let fallback = archive(&[("fallback.obj", coff_object(&["fallback"], &[]))]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+        let mut runtime = RuntimeResolution::new();
+        runtime
+            .parse_and_apply("/alternatename:primary=fallback", "root.obj")
+            .unwrap();
+
+        extract(&mut objects, &[&fallback], &[false], &[], &mut runtime).unwrap();
+
+        assert_eq!(objects.len(), 2);
+        let (defined, _) = symbol_state(&objects, &[]).unwrap();
+        assert!(defined.contains(b"fallback".as_slice()));
+    }
+
+    #[test]
+    fn strong_archive_definition_beats_alternatename_fallback() {
+        let root = coff_object(&[], &["primary"]);
+        let library = archive(&[
+            ("fallback.obj", coff_object(&["fallback"], &[])),
+            ("primary.obj", coff_object(&["primary"], &[])),
+        ]);
+        let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+        let mut runtime = RuntimeResolution::new();
+        runtime
+            .parse_and_apply("/alternatename:primary=fallback", "root.obj")
+            .unwrap();
+
+        extract(&mut objects, &[&library], &[false], &[], &mut runtime).unwrap();
+
+        assert_eq!(objects.len(), 2, "fallback was extracted beside primary");
+        let (defined, _) = symbol_state(&objects, &[]).unwrap();
+        assert!(defined.contains(b"primary".as_slice()));
+        assert!(!defined.contains(b"fallback".as_slice()));
     }
 
     fn coff_object(definitions: &[&str], undefined: &[&str]) -> Vec<u8> {
