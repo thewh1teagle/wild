@@ -21,6 +21,10 @@ harness = false
 name = "windows_pe_smoke"
 path = "tests/windows_pe_smoke.rs"
 
+[[test]]
+name = "windows_pe_runtime"
+path = "tests/windows_pe_runtime.rs"
+
 [dependencies]
 libwild = { path = "../libwild", version = "0.10.0", default-features = false }
 
