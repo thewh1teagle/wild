@@ -5559,6 +5559,69 @@ fn validate_object_output_ranges(
     layout: &SectionLayout,
     image_len: usize,
 ) -> Result<()> {
+    let dense_ids = contributions
+        .iter()
+        .enumerate()
+        .all(|(index, contribution)| u32::try_from(index).ok() == Some(contribution.spec.id.0));
+    if dense_ids {
+        let expected_objects = contributions
+            .iter()
+            .filter(|contribution| matches!(contribution.source, Source::Object { .. }))
+            .count();
+        let mut validated_objects = 0usize;
+        let mut previous_file_end = 0usize;
+        for section in &layout.sections {
+            for &id in &section.contributions {
+                let contribution = contributions
+                    .get(id.0 as usize)
+                    .filter(|contribution| contribution.spec.id == id)
+                    .context("dense PE layout contribution ID is invalid")?;
+                if !matches!(contribution.source, Source::Object { .. }) {
+                    continue;
+                }
+                let placement = layout
+                    .placements
+                    .get(&id)
+                    .context("real PE contribution has no layout placement")?;
+                ensure!(
+                    placement.size == contribution.spec.size,
+                    "real PE contribution placement has the wrong size"
+                );
+                match (placement.file_offset, contribution.spec.kind) {
+                    (Some(offset), ContributionKind::Data) => {
+                        let start =
+                            usize::try_from(offset).context("PE contribution offset too large")?;
+                        let end = start
+                            .checked_add(
+                                usize::try_from(placement.size)
+                                    .context("PE contribution size too large")?,
+                            )
+                            .context("PE contribution file range overflow")?;
+                        ensure!(end <= image_len, "PE contribution extends past file data");
+                        ensure!(
+                            start >= previous_file_end,
+                            "real PE contribution file placements overlap"
+                        );
+                        previous_file_end = end;
+                    }
+                    (None, ContributionKind::Bss) => {}
+                    (Some(_), ContributionKind::Bss) => {
+                        return Err(error!("uninitialized PE contribution has file data"));
+                    }
+                    (None, ContributionKind::Data) => {
+                        return Err(error!("initialized PE contribution has no file placement"));
+                    }
+                }
+                validated_objects += 1;
+            }
+        }
+        ensure!(
+            validated_objects == expected_objects,
+            "real PE contribution is missing or repeated in the layout"
+        );
+        return Ok(());
+    }
+
     count_pe_hot_allocation();
     count_pe_hot_allocation();
     let object_count = contributions
