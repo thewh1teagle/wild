@@ -165,6 +165,7 @@ zstd = { version = "0.13.0", default-features = false }
 
 [profile.release]
 codegen-units = 1
+lto = "fat"
 
 [profile.release-debug]
 inherits = "release"
