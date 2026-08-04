@@ -178,9 +178,11 @@ impl<'data> ResolverSeed<'data> {
 struct IncrementalSymbolState<'data> {
     names: OrderedNameInterner<'data>,
     states: Vec<ResolverNameState>,
-    /// Active unresolved names, maintained in byte order. The set is normally small, so insertion
-    /// and removal shifts are cheaper than rescanning or sorting all canonical names every wave.
+    /// Active unresolved names in dense insertion order, with an O(1) removal index by NameId.
+    /// Deterministic archive consumers sort their comparatively infrequent snapshots by bytes;
+    /// definitions must not shift the active set once for every resolved symbol.
     unresolved_names: Vec<NameId>,
+    unresolved_positions: Vec<u32>,
     weak_resolution: WeakExternalResolution,
     weak_names: Vec<ResolverWeakFallback>,
     alternate_names: Vec<ResolverAlternateFallback>,
@@ -257,6 +259,7 @@ impl<'data> IncrementalSymbolState<'data> {
             names: OrderedNameInterner::new(),
             states: Vec::new(),
             unresolved_names: Vec::new(),
+            unresolved_positions: Vec::new(),
             weak_resolution: WeakExternalResolution::default(),
             weak_names: Vec::new(),
             alternate_names: Vec::new(),
@@ -422,6 +425,7 @@ impl<'data> IncrementalSymbolState<'data> {
             }
             self.states
                 .resize(id.index() + 1, ResolverNameState::default());
+            self.unresolved_positions.resize(id.index() + 1, u32::MAX);
         }
     }
 
@@ -429,35 +433,22 @@ impl<'data> IncrementalSymbolState<'data> {
         let was_unresolved = self.states[id.index()].is_unresolved();
         let changed = self.states[id.index()].mark_defined();
         if was_unresolved {
-            let name = self.names.bytes(id).expect("state NameId is interned");
-            let position = self
-                .unresolved_names
-                .binary_search_by(|candidate| {
-                    self.names
-                        .bytes(*candidate)
-                        .expect("unresolved NameId is interned")
-                        .cmp(name)
-                })
-                .expect("active unresolved NameId is present");
-            self.unresolved_names.remove(position);
+            let position = std::mem::replace(&mut self.unresolved_positions[id.index()], u32::MAX);
+            let position = position as usize;
+            debug_assert!(position < self.unresolved_names.len());
+            self.unresolved_names.swap_remove(position);
+            if let Some(&moved) = self.unresolved_names.get(position) {
+                self.unresolved_positions[moved.index()] = position as u32;
+            }
         }
         changed
     }
 
     fn mark_unresolved(&mut self, id: NameId) {
         if self.states[id.index()].mark_unresolved() {
-            let name = self.names.bytes(id).expect("state NameId is interned");
-            let position = self
-                .unresolved_names
-                .binary_search_by(|candidate| {
-                    self.names
-                        .bytes(*candidate)
-                        .expect("unresolved NameId is interned")
-                        .cmp(name)
-                })
-                .expect_err("new unresolved NameId is not already active");
             note_vec_push(&self.unresolved_names);
-            self.unresolved_names.insert(position, id);
+            self.unresolved_positions[id.index()] = self.unresolved_names.len() as u32;
+            self.unresolved_names.push(id);
             note_vec_push(&self.archive_demand_events);
             self.archive_demand_events
                 .push(ArchiveDemandEvent::Unresolved(id));
@@ -486,8 +477,19 @@ impl<'data> IncrementalSymbolState<'data> {
             .is_some_and(|state| state.is_defined())
     }
 
-    fn unresolved_in_byte_order(&self) -> &[NameId] {
-        &self.unresolved_names
+    fn unresolved_in_byte_order(&self) -> Vec<NameId> {
+        let mut unresolved = self.unresolved_names.clone();
+        unresolved.sort_unstable_by(|&left, &right| {
+            self.names
+                .bytes(left)
+                .expect("unresolved NameId is interned")
+                .cmp(
+                    self.names
+                        .bytes(right)
+                        .expect("unresolved NameId is interned"),
+                )
+        });
+        unresolved
     }
 }
 
@@ -725,6 +727,7 @@ impl<'data> ResolverSession<'data> {
             names,
             states,
             unresolved_names: _,
+            unresolved_positions: _,
             weak_resolution,
             weak_names,
             alternate_names,
@@ -967,8 +970,7 @@ fn extract_pass<'data>(
         } else {
             let mut demands = symbol_state
                 .unresolved_in_byte_order()
-                .iter()
-                .copied()
+                .into_iter()
                 .map(|name| CanonicalArchiveDemand { name })
                 .collect::<Vec<_>>();
             demands.extend(
@@ -1166,7 +1168,7 @@ impl PrimaryArchiveScheduler {
             event_cursor: symbols.archive_demand_events.len(),
             lookups: 0,
         };
-        for &name in symbols.unresolved_in_byte_order() {
+        for name in symbols.unresolved_in_byte_order() {
             scheduler.add(
                 archives,
                 &symbols.names,
@@ -1370,7 +1372,7 @@ fn fallback_demands<'data>(
     runtime_resolution: &RuntimeResolution,
 ) -> Result<Vec<NameId>> {
     // Alternate resolution may intern names, so release the active-set borrow before the loop.
-    let unresolved = state.unresolved_in_byte_order().to_vec();
+    let unresolved = state.unresolved_in_byte_order();
     let mut demands = Vec::with_capacity(unresolved.len() + state.weak_names.len());
     for name in unresolved {
         let resolved = {
