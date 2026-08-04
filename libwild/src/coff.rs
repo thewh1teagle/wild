@@ -11,6 +11,7 @@
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
+use object::LittleEndian as LE;
 use object::Object as _;
 use object::ObjectSection as _;
 use object::ObjectSymbol as _;
@@ -30,6 +31,7 @@ pub(crate) struct CoffObject<'data> {
     file: object::File<'data>,
     bytes: &'data [u8],
     index: OnceLock<CoffRelocationIndex>,
+    resolver_summary: OnceLock<CoffResolverSummary>,
     legacy_relocation_index_accessed: AtomicBool,
 }
 
@@ -43,6 +45,37 @@ pub(crate) struct CoffRelocationIndex {
     names: Box<[CoffNameOccurrence]>,
 }
 
+/// The resolution-facing subset of a COFF symbol table. It is populated directly from the raw
+/// table on first selection and retained for the dense-index pass, avoiding a second generic
+/// `object::Symbol` traversal and a second hash of every externally visible name.
+#[derive(Debug)]
+pub(crate) struct CoffResolverSummary {
+    globals: Box<[CoffGlobalSymbolSummary]>,
+    weak_externals: Box<[CoffWeakExternalSummary]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoffGlobalSymbolSummary {
+    pub(super) hash: u64,
+    pub(super) symbol_occurrence: u32,
+    pub(super) raw_index: u32,
+    name_start: u32,
+    name_len: u32,
+    section: u32,
+    pub(super) address: u32,
+    pub(super) size: u32,
+    flags: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoffWeakExternalSummary {
+    pub(super) symbol: CoffSourceRange,
+    pub(super) symbol_hash: u64,
+    pub(super) target: CoffSourceRange,
+    pub(super) target_hash: u64,
+    pub(super) search: linker_utils::coff_symbols::WeakSearch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CoffSourceRange {
     pub(super) start: u32,
@@ -51,6 +84,18 @@ pub(super) struct CoffSourceRange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CoffNameId(pub(super) u32);
+
+impl CoffNameId {
+    pub(super) const NONE: Self = Self(u32::MAX);
+
+    pub(super) const fn get(self) -> Option<usize> {
+        if self.0 == u32::MAX {
+            None
+        } else {
+            Some(self.0 as usize)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CoffDeferredNameError {
@@ -140,6 +185,7 @@ impl<'data> CoffObject<'data> {
             file,
             bytes,
             index: OnceLock::new(),
+            resolver_summary: OnceLock::new(),
             legacy_relocation_index_accessed: AtomicBool::new(false),
         })
     }
@@ -171,6 +217,18 @@ impl<'data> CoffObject<'data> {
             .expect("valid selected COFF object must have a materializable index")
     }
 
+    pub(crate) fn resolver_summary(&self) -> Result<&CoffResolverSummary> {
+        if let Some(summary) = self.resolver_summary.get() {
+            return Ok(summary);
+        }
+        let summary = CoffResolverSummary::new(&self.file, self.bytes)?;
+        let _ = self.resolver_summary.set(summary);
+        Ok(self
+            .resolver_summary
+            .get()
+            .expect("COFF resolver summary was just initialized"))
+    }
+
     /// Build the full section/symbol/relocation index on demand. Archive extraction deliberately
     /// uses `file()` instead, so unselected members never pay this cost. The writer calls this for
     /// every selected object in parallel before dense finalization, which also keeps construction
@@ -179,7 +237,7 @@ impl<'data> CoffObject<'data> {
         if let Some(index) = self.index.get() {
             return Ok(index);
         }
-        let index = CoffRelocationIndex::new(&self.file, self.bytes)?;
+        let index = CoffRelocationIndex::new(&self.file, self.bytes, self.resolver_summary()?)?;
         // Each selected object occupies one deterministic parallel slot. Retain correctness if a
         // future caller races on the same object: either identical immutable index may win.
         let _ = self.index.set(index);
@@ -198,12 +256,228 @@ impl<'data> CoffObject<'data> {
     }
 }
 
-impl CoffRelocationIndex {
+impl CoffResolverSummary {
     fn new(file: &object::File<'_>, bytes: &[u8]) -> Result<Self> {
-        count_object_parse();
         match file {
             object::File::Coff(file) => Self::new_typed(file, bytes),
             object::File::CoffBig(file) => Self::new_typed(file, bytes),
+            _ => Err(crate::error!(
+                "Internal non-COFF file reached resolver summarization"
+            )),
+        }
+    }
+
+    fn new_typed<'data, Coff>(
+        file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
+        bytes: &[u8],
+    ) -> Result<Self>
+    where
+        Coff: CoffHeader,
+    {
+        let mut globals = Vec::new();
+        let mut weak_externals = Vec::new();
+        for (symbol_occurrence, (raw_index, symbol)) in file.coff_symbol_table().iter().enumerate()
+        {
+            let storage_class = symbol.storage_class();
+            if !matches!(
+                storage_class,
+                object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            ) {
+                continue;
+            }
+            let name_result = symbol.name(file.coff_symbol_table().strings());
+            if symbol.has_aux_weak_external() {
+                let weak_name = name_result
+                    .as_ref()
+                    .map_err(|error| crate::error!("invalid weak symbol name: {error}"))?;
+                let auxiliary = file
+                    .coff_symbol_table()
+                    .aux_weak_external(raw_index)
+                    .context("invalid weak-external auxiliary record")?;
+                let target = file
+                    .coff_symbol_table()
+                    .symbol(auxiliary.default_symbol())
+                    .context("invalid weak-external target index")?;
+                let target_name = target
+                    .name(file.coff_symbol_table().strings())
+                    .context("invalid weak fallback name")?;
+                let search = match auxiliary.weak_search_type.get(LE) {
+                    value if value == object::pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY => {
+                        linker_utils::coff_symbols::WeakSearch::NoLibrary
+                    }
+                    value if value == object::pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY => {
+                        linker_utils::coff_symbols::WeakSearch::Library
+                    }
+                    value if value == object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS => {
+                        linker_utils::coff_symbols::WeakSearch::Alias
+                    }
+                    value if value == object::pe::IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY => {
+                        linker_utils::coff_symbols::WeakSearch::AntiDependency
+                    }
+                    value => {
+                        return Err(crate::error!(
+                            "unsupported weak-external search characteristic {}",
+                            value.0
+                        ));
+                    }
+                };
+                crate::ensure!(
+                    !weak_name.is_empty() && !target_name.is_empty() && *weak_name != target_name,
+                    "weak external has an empty or self-referential fallback"
+                );
+                weak_externals.push(CoffWeakExternalSummary {
+                    symbol: source_range(bytes, weak_name)
+                        .context("invalid weak COFF symbol name range")?,
+                    symbol_hash: hash_name_once(weak_name),
+                    target: source_range(bytes, target_name)
+                        .context("invalid weak COFF fallback name range")?,
+                    target_hash: hash_name_once(target_name),
+                    search,
+                });
+            }
+            let section_number = symbol.section_number();
+            let parsed = file.symbol_by_index(raw_index).ok();
+            let name = make_name_occurrence(bytes, name_result, true);
+            let source = name.source.unwrap_or(CoffSourceRange {
+                start: u32::MAX,
+                len: 0,
+            });
+            let flags = u8::from(
+                storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
+                    && section_number == object::pe::IMAGE_SYM_UNDEFINED
+                    && symbol.value() != 0,
+            ) | (u8::from(storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL)
+                << 1)
+                | (u8::from(symbol.is_definition()) << 2)
+                | (u8::from(
+                    storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
+                        && section_number == object::pe::IMAGE_SYM_UNDEFINED
+                        && symbol.value() == 0,
+                ) << 3)
+                | (u8::from(section_number == object::pe::IMAGE_SYM_ABSOLUTE) << 4);
+            globals.push(CoffGlobalSymbolSummary {
+                hash: name.hash.unwrap_or(0),
+                symbol_occurrence: dense_u32(symbol_occurrence, "COFF symbol occurrence")?,
+                raw_index: dense_u32(raw_index.0, "raw COFF symbol index")?,
+                name_start: source.start,
+                name_len: source.len,
+                section: symbol.section().map_or(0, |section| section.0 as u32),
+                address: symbol.value(),
+                size: parsed
+                    .as_ref()
+                    .and_then(|symbol| u32::try_from(symbol.size()).ok())
+                    .unwrap_or(0),
+                flags,
+            });
+        }
+        weak_externals.sort_unstable_by(|left, right| {
+            source_bytes(bytes, left.symbol).cmp(source_bytes(bytes, right.symbol))
+        });
+        Ok(Self {
+            globals: globals.into_boxed_slice(),
+            weak_externals: weak_externals.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn globals(&self) -> &[CoffGlobalSymbolSummary] {
+        &self.globals
+    }
+
+    pub(crate) fn weak_externals(&self) -> &[CoffWeakExternalSummary] {
+        &self.weak_externals
+    }
+}
+
+impl CoffGlobalSymbolSummary {
+    const COMMON: u8 = 1 << 0;
+    const WEAK: u8 = 1 << 1;
+    const DEFINITION: u8 = 1 << 2;
+    const UNDEFINED: u8 = 1 << 3;
+    const ABSOLUTE: u8 = 1 << 4;
+
+    pub(super) fn name(self) -> CoffNameOccurrence {
+        if self.name_start == u32::MAX {
+            CoffNameOccurrence {
+                source: None,
+                hash: None,
+                error: Some(CoffDeferredNameError::InvalidNameOffset),
+            }
+        } else {
+            CoffNameOccurrence {
+                source: Some(CoffSourceRange {
+                    start: self.name_start,
+                    len: self.name_len,
+                }),
+                hash: Some(self.hash),
+                error: None,
+            }
+        }
+    }
+
+    pub(super) fn section(self) -> Option<object::SectionIndex> {
+        (self.section != 0).then_some(object::SectionIndex(self.section as usize))
+    }
+
+    pub(super) fn section_kind(self) -> object::SymbolSection {
+        if self.flags & Self::ABSOLUTE != 0 {
+            object::SymbolSection::Absolute
+        } else if self.flags & Self::COMMON != 0 {
+            object::SymbolSection::Common
+        } else if self.flags & Self::UNDEFINED != 0 {
+            object::SymbolSection::Undefined
+        } else if let Some(section) = self.section() {
+            object::SymbolSection::Section(section)
+        } else {
+            object::SymbolSection::Unknown
+        }
+    }
+
+    pub(super) const fn is_common(self) -> bool {
+        self.flags & Self::COMMON != 0
+    }
+
+    pub(super) const fn is_weak(self) -> bool {
+        self.flags & Self::WEAK != 0
+    }
+
+    pub(super) const fn is_definition(self) -> bool {
+        self.flags & Self::DEFINITION != 0
+    }
+
+    pub(super) const fn is_undefined(self) -> bool {
+        self.flags & Self::UNDEFINED != 0
+    }
+
+    pub(super) const fn is_absolute(self) -> bool {
+        self.flags & Self::ABSOLUTE != 0
+    }
+}
+
+impl CoffWeakExternalSummary {
+    pub(crate) fn symbol(self, bytes: &[u8]) -> &[u8] {
+        source_bytes(bytes, self.symbol)
+    }
+
+    pub(crate) fn target(self, bytes: &[u8]) -> &[u8] {
+        source_bytes(bytes, self.target)
+    }
+}
+
+fn source_bytes(bytes: &[u8], source: CoffSourceRange) -> &[u8] {
+    &bytes[source.start as usize..source.start as usize + source.len as usize]
+}
+
+fn hash_name_once(name: &[u8]) -> u64 {
+    count_name_hash();
+    crate::hash::hash_bytes(name)
+}
+
+impl CoffRelocationIndex {
+    fn new(file: &object::File<'_>, bytes: &[u8], resolver: &CoffResolverSummary) -> Result<Self> {
+        count_object_parse();
+        match file {
+            object::File::Coff(file) => Self::new_typed(file, bytes, resolver),
+            object::File::CoffBig(file) => Self::new_typed(file, bytes, resolver),
             _ => Err(crate::error!(
                 "Internal non-COFF file reached COFF indexing"
             )),
@@ -213,6 +487,7 @@ impl CoffRelocationIndex {
     fn new_typed<'data, Coff>(
         file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
         bytes: &[u8],
+        resolver: &CoffResolverSummary,
     ) -> Result<Self>
     where
         Coff: CoffHeader,
@@ -226,13 +501,10 @@ impl CoffRelocationIndex {
         let mut weak_defaults = Vec::new();
         let mut section_comdats = vec![(0, None); section_count];
 
-        for (raw_index, raw_symbol) in file.coff_symbol_table().iter() {
-            let name_bytes = if raw_symbol.has_aux_file_name() {
-                file.coff_symbol_table()
-                    .aux_file_name(raw_index, raw_symbol.number_of_aux_symbols())
-            } else {
-                raw_symbol.name(file.coff_symbol_table().strings())
-            };
+        let mut next_global = 0usize;
+        for (symbol_occurrence, (raw_index, raw_symbol)) in
+            file.coff_symbol_table().iter().enumerate()
+        {
             let storage_class = raw_symbol.storage_class();
             let section_number = raw_symbol.section_number();
             let parsed_symbol = file.symbol_by_index(raw_index).ok();
@@ -240,34 +512,84 @@ impl CoffRelocationIndex {
                 storage_class,
                 object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
             );
-            let name = push_name_occurrence(&mut names, bytes, name_bytes, !is_global)?;
+            let global = if is_global {
+                let global = resolver.globals.get(next_global).ok_or_else(|| {
+                    crate::error!("COFF resolver summary is missing a global symbol")
+                })?;
+                crate::ensure!(
+                    global.symbol_occurrence as usize == symbol_occurrence
+                        && global.raw_index as usize == raw_index.0,
+                    "COFF resolver summary does not match the raw symbol table"
+                );
+                next_global += 1;
+                Some(global)
+            } else {
+                None
+            };
+            // Local symbols resolve directly to a section/value pair. Their names have no
+            // semantic consumer and therefore never enter the global canonical namespace.
+            let name = global.map_or(Ok(CoffNameId::NONE), |global| {
+                push_existing_name_occurrence(&mut names, global.name())
+            })?;
             let symbol_id = CoffRelocationSymbolId(dense_u32(symbols.len(), "COFF symbol")?);
             raw_to_dense[raw_index.0] = Some(symbol_id);
             symbols.push(CoffSymbolRecord {
                 raw_index: dense_u32(raw_index.0, "raw COFF symbol index")?,
                 name,
                 shape: Some(CoffRelocationSymbolShape {
-                    section: raw_symbol.section(),
-                    address: u64::from(raw_symbol.value()),
+                    section: global.map_or_else(|| raw_symbol.section(), |global| global.section()),
+                    address: global.map_or_else(
+                        || u64::from(raw_symbol.value()),
+                        |global| u64::from(global.address),
+                    ),
                     is_global,
-                    is_common: storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
-                        && section_number == object::pe::IMAGE_SYM_UNDEFINED
-                        && raw_symbol.value() != 0,
-                    is_weak: storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL,
-                    is_definition: parsed_symbol
-                        .as_ref()
-                        .is_some_and(|symbol| symbol.is_definition()),
-                    is_undefined: parsed_symbol
-                        .as_ref()
-                        .is_some_and(|symbol| symbol.is_undefined()),
-                    is_absolute: parsed_symbol
-                        .as_ref()
-                        .is_some_and(|symbol| symbol.section() == object::SymbolSection::Absolute),
+                    is_common: global.map_or_else(
+                        || {
+                            storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
+                                && section_number == object::pe::IMAGE_SYM_UNDEFINED
+                                && raw_symbol.value() != 0
+                        },
+                        |global| global.is_common(),
+                    ),
+                    is_weak: global.map_or(
+                        storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                        |global| global.is_weak(),
+                    ),
+                    is_definition: global.map_or_else(
+                        || {
+                            parsed_symbol
+                                .as_ref()
+                                .is_some_and(|symbol| symbol.is_definition())
+                        },
+                        |global| global.is_definition(),
+                    ),
+                    is_undefined: global.map_or_else(
+                        || {
+                            parsed_symbol
+                                .as_ref()
+                                .is_some_and(|symbol| symbol.is_undefined())
+                        },
+                        |global| global.is_undefined(),
+                    ),
+                    is_absolute: global.map_or_else(
+                        || {
+                            parsed_symbol.as_ref().is_some_and(|symbol| {
+                                symbol.section() == object::SymbolSection::Absolute
+                            })
+                        },
+                        |global| global.is_absolute(),
+                    ),
                 }),
                 value: raw_symbol.value(),
-                size: parsed_symbol
-                    .and_then(|symbol| u32::try_from(symbol.size()).ok())
-                    .unwrap_or(0),
+                size: global.map_or_else(
+                    || {
+                        parsed_symbol
+                            .as_ref()
+                            .and_then(|symbol| u32::try_from(symbol.size()).ok())
+                            .unwrap_or(0)
+                    },
+                    |global| global.size,
+                ),
                 typ: raw_symbol.typ().0,
                 storage_class: storage_class.0,
                 weak_default: None,
@@ -292,6 +614,10 @@ impl CoffRelocationIndex {
                 *slot = (selection.0, associative_section);
             }
         }
+        crate::ensure!(
+            next_global == resolver.globals.len(),
+            "COFF resolver summary has excess global symbols"
+        );
 
         // Auxiliary weak records refer to raw table indices; translate them after the single
         // primary-symbol pass has assigned every dense ID.
@@ -323,13 +649,9 @@ impl CoffRelocationIndex {
                         symbols.len(),
                         "invalid COFF relocation symbol",
                     )?);
-                    let name = push_invalid_name(
-                        &mut names,
-                        CoffDeferredNameError::InvalidRelocationSymbol,
-                    )?;
                     symbols.push(CoffSymbolRecord {
                         raw_index: dense_u32(raw_index.0, "invalid raw COFF symbol index")?,
-                        name,
+                        name: CoffNameId::NONE,
                         shape: None,
                         value: 0,
                         size: 0,
@@ -462,24 +784,38 @@ fn push_name_occurrence(
     name: object::read::Result<&[u8]>,
     prehash: bool,
 ) -> Result<CoffNameId> {
-    match name
-        .ok()
+    let occurrence = make_name_occurrence(bytes, name, prehash);
+    push_existing_name_occurrence(names, occurrence)
+}
+
+fn make_name_occurrence(
+    bytes: &[u8],
+    name: object::read::Result<&[u8]>,
+    prehash: bool,
+) -> CoffNameOccurrence {
+    name.ok()
         .and_then(|name| source_range(bytes, name).map(|source| (source, name)))
-    {
-        Some((source, name)) => {
-            let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
-            names.push(CoffNameOccurrence {
+        .map_or(
+            CoffNameOccurrence {
+                source: None,
+                hash: None,
+                error: Some(CoffDeferredNameError::InvalidNameOffset),
+            },
+            |(source, name)| CoffNameOccurrence {
                 source: Some(source),
-                hash: prehash.then(|| {
-                    count_name_hash();
-                    crate::hash::hash_bytes(name)
-                }),
+                hash: prehash.then(|| hash_name_once(name)),
                 error: None,
-            });
-            Ok(id)
-        }
-        None => push_invalid_name(names, CoffDeferredNameError::InvalidNameOffset),
-    }
+            },
+        )
+}
+
+fn push_existing_name_occurrence(
+    names: &mut Vec<CoffNameOccurrence>,
+    occurrence: CoffNameOccurrence,
+) -> Result<CoffNameId> {
+    let id = CoffNameId(dense_u32(names.len(), "COFF name occurrence")?);
+    names.push(occurrence);
+    Ok(id)
 }
 
 fn push_invalid_name(
@@ -776,6 +1112,7 @@ mod tests {
     #[test]
     fn deferred_index_is_stable_ordered_and_interns_relocation_targets() {
         assert_send_sync::<CoffRelocationIndex>();
+        assert!(std::mem::size_of::<CoffGlobalSymbolSummary>() <= 40);
         assert_eq!(std::mem::size_of::<CoffRelocationRecord>(), 12);
         assert!(std::mem::size_of::<CoffSectionRecord>() <= 80);
         assert!(std::mem::size_of::<CoffSymbolRecord>() <= 64);
@@ -819,7 +1156,7 @@ mod tests {
         assert!(occurrence.source.is_some());
         assert!(symbol.shape(&object).unwrap().is_global);
         assert_eq!(symbol.name(&object).unwrap(), b"target");
-        assert_eq!(occurrence.hash(), None);
+        assert_eq!(occurrence.hash(), Some(crate::hash::hash_bytes(b"target")));
     }
 
     #[test]
@@ -863,7 +1200,11 @@ mod tests {
         }
         for (record, raw) in index.symbols.iter().zip(raw_symbols) {
             assert_eq!(record.raw_index as usize, raw.index().0);
-            assert_eq!(record.name(&object).unwrap(), raw.name_bytes().unwrap());
+            if raw.is_global() {
+                assert_eq!(record.name(&object).unwrap(), raw.name_bytes().unwrap());
+            } else {
+                assert_eq!(record.name, CoffNameId::NONE);
+            }
             assert_eq!(u64::from(record.value), raw.address());
             assert_eq!(u64::from(record.size), raw.size());
             let shape = record.shape(&object).unwrap();

@@ -15,6 +15,7 @@ use super::pe_symbol_db::SymbolDb;
 use crate::coff::CoffDeferredNameError;
 use crate::coff::CoffObject;
 use crate::error::Result;
+use rayon::prelude::*;
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -428,6 +429,23 @@ pub(super) struct SelectedObjectFinalization<'data> {
     pub(super) occurrence_names: Box<[NameId]>,
 }
 
+#[derive(Clone, Copy)]
+struct DenseObjectOffsets {
+    section: u32,
+    symbol: u32,
+    name: usize,
+    relocation: u32,
+}
+
+struct DenseObjectChunk {
+    object: ObjectRecord,
+    sections: Vec<SectionRecord>,
+    symbols: Vec<SymbolRecord>,
+    globals: Vec<SymbolId>,
+    relocation_starts: Vec<u32>,
+    relocations: Vec<RelocationRecord>,
+}
+
 impl<'data> PeIr<'data> {
     pub(super) fn resolve_symbol_targets(
         &self,
@@ -610,132 +628,66 @@ impl<'data> PeIr<'data> {
         records_phase
             .0
             .add(crate::timing::PeMetric::Names, symbol_count);
+        // Prefix offsets are assigned once on the caller thread. Independent objects can then
+        // build records concurrently without changing any externally visible dense ID or order.
+        let mut offsets = Vec::with_capacity(objects.len());
+        let (mut section_end, mut symbol_end, mut name_end, mut relocation_end) =
+            (0u32, 0u32, 0usize, 0u32);
+        for object in objects {
+            let index = object.index();
+            offsets.push(DenseObjectOffsets {
+                section: section_end,
+                symbol: symbol_end,
+                name: name_end,
+                relocation: relocation_end,
+            });
+            section_end = section_end
+                .checked_add(as_u32(index.sections().len(), "selected section")?)
+                .ok_or_else(|| crate::error!("Selected COFF section count overflow"))?;
+            symbol_end = symbol_end
+                .checked_add(as_u32(index.symbols().len(), "selected symbol")?)
+                .ok_or_else(|| crate::error!("Selected COFF symbol count overflow"))?;
+            name_end = name_end
+                .checked_add(index.names().len())
+                .ok_or_else(|| crate::error!("Selected COFF name count overflow"))?;
+            relocation_end = relocation_end
+                .checked_add(as_u32(
+                    index
+                        .sections()
+                        .iter()
+                        .map(|section| index.relocations(section).len())
+                        .sum(),
+                    "selected relocation",
+                )?)
+                .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?;
+        }
+        crate::ensure!(
+            name_end == occurrence_names.len(),
+            "Selected COFF name prefix does not match canonical occurrences"
+        );
+        let chunks = objects
+            .par_iter()
+            .zip(offsets.par_iter().copied())
+            .enumerate()
+            .map(|(object_index, (object, offsets))| {
+                build_dense_object_chunk(object_index, object, offsets, &occurrence_names)
+            })
+            .collect::<Vec<_>>();
         let mut object_records = Vec::with_capacity(objects.len());
         let mut sections = Vec::with_capacity(section_count);
         let mut symbols = Vec::with_capacity(symbol_count);
         let mut global_symbols = Vec::with_capacity(globals.len());
         let mut starts = Vec::with_capacity(section_count.saturating_add(1));
-        let mut relocations = Vec::new();
         starts.push(0);
-
-        let mut occurrence_start = 0usize;
-        for (object_index, object) in objects.iter().enumerate() {
-            let object_id = ObjectId::from_u32(as_u32(object_index, "selected object")?);
-            let section_start = as_u32(sections.len(), "selected section")?;
-            let symbol_start = as_u32(symbols.len(), "selected symbol")?;
-            let index = object.index();
-            let occurrence_end = occurrence_start
-                .checked_add(index.names().len())
-                .ok_or_else(|| crate::error!("Selected COFF name occurrence count overflow"))?;
-            let local_names = occurrence_names
-                .get(occurrence_start..occurrence_end)
-                .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
-            occurrence_start = occurrence_end;
-
-            for section in index.sections() {
-                let data = section.data_range.map(|range| SourceRange {
-                    file: FileId::from_u32(object_id.get()),
-                    start: range.start,
-                    len: range.len,
-                });
-                let associative_section = section
-                    .associative_section
-                    .map(|raw| section_from_raw(section_start, raw))
-                    .transpose()?
-                    .map_or(OptionalSectionId::NONE, OptionalSectionId::some);
-                sections.push(SectionRecord {
-                    object: object_id,
-                    raw_index: as_u32(section.index.0, "raw COFF section")?,
-                    name: local_names[section.name.0 as usize],
-                    data,
-                    size: u32::try_from(section.size)
-                        .map_err(|_| crate::error!("COFF section size exceeds u32"))?,
-                    alignment: u32::try_from(section.align)
-                        .map_err(|_| crate::error!("COFF section alignment exceeds u32"))?,
-                    characteristics: section.characteristics.unwrap_or(0),
-                    contents: section_contents(section.kind),
-                    comdat_selection: section.comdat_selection,
-                    associative_section,
-                });
-                for relocation in index.relocations(section) {
-                    relocations.push(RelocationRecord {
-                        offset: relocation.offset,
-                        target: SymbolId::from_u32(
-                            symbol_start
-                                .checked_add(relocation.symbol.0)
-                                .ok_or_else(|| {
-                                    crate::error!("Selected COFF relocation symbol ID overflow")
-                                })?,
-                        ),
-                        typ: relocation.typ,
-                        flags: 0,
-                    });
-                }
-                starts.push(as_u32(relocations.len(), "selected relocation")?);
-            }
-
-            for symbol in index.symbols() {
-                let section = symbol
-                    .shape
-                    .as_ref()
-                    .and_then(|shape| shape.section)
-                    .map(|raw| section_from_raw(section_start, raw))
-                    .transpose()?
-                    .map_or(OptionalSectionId::NONE, OptionalSectionId::some);
-                let weak_default = symbol
-                    .weak_default
-                    .map(|local| {
-                        symbol_start
-                            .checked_add(local.0)
-                            .map(SymbolId::from_u32)
-                            .ok_or_else(|| crate::error!("Selected COFF weak symbol ID overflow"))
-                    })
-                    .transpose()?
-                    .map_or(OptionalSymbolId::NONE, OptionalSymbolId::some);
-                let shape = symbol.shape.as_ref();
-                let flags = u16::from(shape.is_some_and(|shape| shape.is_global))
-                    | (u16::from(shape.is_some_and(|shape| shape.is_common)) << 1)
-                    | (u16::from(shape.is_some_and(|shape| shape.is_weak)) << 2)
-                    | (u16::from(shape.is_some_and(|shape| shape.is_definition)) << 3)
-                    | (u16::from(shape.is_some_and(|shape| shape.is_undefined)) << 4)
-                    | (u16::from(shape.is_some_and(|shape| shape.is_absolute)) << 5);
-                if flags & SymbolRecord::GLOBAL != 0 {
-                    global_symbols.push(SymbolId::from_u32(as_u32(
-                        symbols.len(),
-                        "selected global symbol",
-                    )?));
-                }
-                symbols.push(SymbolRecord {
-                    object: object_id,
-                    raw_index: symbol.raw_index,
-                    name: local_names[symbol.name.0 as usize],
-                    section,
-                    value: u64::from(symbol.value),
-                    size: symbol.size,
-                    flags,
-                    storage_class: symbol.storage_class,
-                    typ: symbol.typ,
-                    weak_default,
-                    diagnostic: if symbol.shape.is_some() {
-                        SymbolDiagnostic::None
-                    } else {
-                        SymbolDiagnostic::InvalidRelocationTarget
-                    },
-                });
-            }
-
-            object_records.push(ObjectRecord {
-                file: FileId::from_u32(as_u32(object_index, "source file")?),
-                sections: DenseRange::new(
-                    section_start,
-                    as_u32(sections.len(), "selected section")? - section_start,
-                ),
-                symbols: DenseRange::new(
-                    symbol_start,
-                    as_u32(symbols.len(), "selected symbol")? - symbol_start,
-                ),
-                input_ordinal: as_u32(object_index, "input ordinal")?,
-            });
+        let mut relocations = Vec::with_capacity(relocation_end as usize);
+        for chunk in chunks {
+            let mut chunk = chunk?;
+            object_records.push(chunk.object);
+            sections.append(&mut chunk.sections);
+            symbols.append(&mut chunk.symbols);
+            global_symbols.append(&mut chunk.globals);
+            starts.append(&mut chunk.relocation_starts);
+            relocations.append(&mut chunk.relocations);
         }
 
         let relocations = RelocationCsr {
@@ -805,6 +757,139 @@ impl<'data> PeIr<'data> {
     }
 }
 
+fn build_dense_object_chunk(
+    object_index: usize,
+    object: &CoffObject<'_>,
+    offsets: DenseObjectOffsets,
+    occurrence_names: &[NameId],
+) -> Result<DenseObjectChunk> {
+    let object_id = ObjectId::from_u32(as_u32(object_index, "selected object")?);
+    let index = object.index();
+    let local_names = occurrence_names
+        .get(offsets.name..offsets.name + index.names().len())
+        .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
+    let mut sections = Vec::with_capacity(index.sections().len());
+    let mut symbols = Vec::with_capacity(index.symbols().len());
+    let mut globals = Vec::new();
+    let mut relocation_starts = Vec::with_capacity(index.sections().len());
+    let mut relocations = Vec::new();
+    for section in index.sections() {
+        let data = section.data_range.map(|range| SourceRange {
+            file: FileId::from_u32(object_id.get()),
+            start: range.start,
+            len: range.len,
+        });
+        let associative_section = section
+            .associative_section
+            .map(|raw| section_from_raw(offsets.section, raw))
+            .transpose()?
+            .map_or(OptionalSectionId::NONE, OptionalSectionId::some);
+        sections.push(SectionRecord {
+            object: object_id,
+            raw_index: as_u32(section.index.0, "raw COFF section")?,
+            name: local_names[section.name.0 as usize],
+            data,
+            size: u32::try_from(section.size)
+                .map_err(|_| crate::error!("COFF section size exceeds u32"))?,
+            alignment: u32::try_from(section.align)
+                .map_err(|_| crate::error!("COFF section alignment exceeds u32"))?,
+            characteristics: section.characteristics.unwrap_or(0),
+            contents: section_contents(section.kind),
+            comdat_selection: section.comdat_selection,
+            associative_section,
+        });
+        for relocation in index.relocations(section) {
+            relocations.push(RelocationRecord {
+                offset: relocation.offset,
+                target: SymbolId::from_u32(
+                    offsets
+                        .symbol
+                        .checked_add(relocation.symbol.0)
+                        .ok_or_else(|| {
+                            crate::error!("Selected COFF relocation symbol ID overflow")
+                        })?,
+                ),
+                typ: relocation.typ,
+                flags: 0,
+            });
+        }
+        relocation_starts.push(
+            offsets
+                .relocation
+                .checked_add(as_u32(relocations.len(), "selected relocation")?)
+                .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?,
+        );
+    }
+    for (local_symbol, symbol) in index.symbols().iter().enumerate() {
+        let section = symbol
+            .shape
+            .as_ref()
+            .and_then(|shape| shape.section)
+            .map(|raw| section_from_raw(offsets.section, raw))
+            .transpose()?
+            .map_or(OptionalSectionId::NONE, OptionalSectionId::some);
+        let weak_default = symbol
+            .weak_default
+            .map(|local| {
+                offsets
+                    .symbol
+                    .checked_add(local.0)
+                    .map(SymbolId::from_u32)
+                    .ok_or_else(|| crate::error!("Selected COFF weak symbol ID overflow"))
+            })
+            .transpose()?
+            .map_or(OptionalSymbolId::NONE, OptionalSymbolId::some);
+        let shape = symbol.shape.as_ref();
+        let flags = u16::from(shape.is_some_and(|shape| shape.is_global))
+            | (u16::from(shape.is_some_and(|shape| shape.is_common)) << 1)
+            | (u16::from(shape.is_some_and(|shape| shape.is_weak)) << 2)
+            | (u16::from(shape.is_some_and(|shape| shape.is_definition)) << 3)
+            | (u16::from(shape.is_some_and(|shape| shape.is_undefined)) << 4)
+            | (u16::from(shape.is_some_and(|shape| shape.is_absolute)) << 5);
+        if flags & SymbolRecord::GLOBAL != 0 {
+            globals.push(SymbolId::from_u32(
+                offsets
+                    .symbol
+                    .checked_add(as_u32(local_symbol, "selected global symbol")?)
+                    .ok_or_else(|| crate::error!("Selected global symbol ID overflow"))?,
+            ));
+        }
+        symbols.push(SymbolRecord {
+            object: object_id,
+            raw_index: symbol.raw_index,
+            name: symbol
+                .name
+                .get()
+                .map_or(NameId::from_u32(u32::MAX), |name| local_names[name]),
+            section,
+            value: u64::from(symbol.value),
+            size: symbol.size,
+            flags,
+            storage_class: symbol.storage_class,
+            typ: symbol.typ,
+            weak_default,
+            diagnostic: if symbol.shape.is_some() {
+                SymbolDiagnostic::None
+            } else {
+                SymbolDiagnostic::InvalidRelocationTarget
+            },
+        });
+    }
+    Ok(DenseObjectChunk {
+        object: ObjectRecord {
+            file: FileId::from_u32(as_u32(object_index, "source file")?),
+            sections: DenseRange::new(offsets.section, as_u32(sections.len(), "selected section")?),
+            symbols: DenseRange::new(offsets.symbol, as_u32(symbols.len(), "selected symbol")?),
+            input_ordinal: as_u32(object_index, "input ordinal")?,
+        },
+        sections,
+        symbols,
+        globals,
+        relocation_starts,
+        relocations,
+    })
+}
+
 fn finalize_selected_names<'data>(
     objects: &[CoffObject<'data>],
     mut names: OrderedNameInterner<'data>,
@@ -828,11 +913,12 @@ fn finalize_selected_names<'data>(
             }
             let occurrence = usize::try_from(global.name_occurrence)
                 .map_err(|_| crate::error!("Resolver name occurrence exceeds usize"))?;
-            crate::ensure!(
-                occurrence < index.names().len(),
-                "Resolver global has no indexed COFF name occurrence"
-            );
-            known.push((occurrence, global.name));
+            let name_occurrence = index
+                .symbols()
+                .get(occurrence)
+                .and_then(|symbol| symbol.name.get())
+                .ok_or_else(|| crate::error!("Resolver global has no indexed COFF symbol name"))?;
+            known.push((name_occurrence, global.name));
             global_position += 1;
         }
         let mut known = known.iter().copied().peekable();
@@ -1075,10 +1161,12 @@ mod tests {
                 [occurrence_start..occurrence_start + index.names().len()];
             let object_record = ir.objects[object_index];
             for (local_symbol, symbol) in index.symbols().iter().enumerate() {
-                assert_eq!(
-                    ir.symbols[object_record.symbols.start() as usize + local_symbol].name,
-                    local[symbol.name.0 as usize]
-                );
+                let dense = ir.symbols[object_record.symbols.start() as usize + local_symbol].name;
+                if let Some(name) = symbol.name.get() {
+                    assert_eq!(dense, local[name]);
+                } else {
+                    assert_eq!(dense, NameId::from_u32(u32::MAX));
+                }
             }
             for (local_section, section) in index.sections().iter().enumerate() {
                 assert_eq!(
@@ -1102,6 +1190,34 @@ mod tests {
                 .name,
             ir.symbols[1].name
         );
+    }
+
+    #[test]
+    fn parallel_dense_chunks_are_identical_at_one_and_twenty_threads() {
+        let bytes = (0..24).map(|_| selected_fixture()).collect::<Vec<_>>();
+        let objects = bytes
+            .iter()
+            .map(|bytes| CoffObject::parse(bytes).unwrap())
+            .collect::<Vec<_>>();
+        let finalize = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    PeIr::finalize_selected_objects(&objects, OrderedNameInterner::new()).unwrap()
+                })
+        };
+        let one = finalize(1);
+        let twenty = finalize(20);
+        assert_eq!(one.ir.objects, twenty.ir.objects);
+        assert_eq!(one.ir.sections, twenty.ir.sections);
+        assert_eq!(one.ir.symbols, twenty.ir.symbols);
+        assert_eq!(one.ir.global_symbols, twenty.ir.global_symbols);
+        assert_eq!(one.ir.names, twenty.ir.names);
+        assert_eq!(one.ir.relocations.starts, twenty.ir.relocations.starts);
+        assert_eq!(one.ir.relocations.records, twenty.ir.relocations.records);
+        assert_eq!(one.occurrence_names, twenty.occurrence_names);
     }
 
     #[test]

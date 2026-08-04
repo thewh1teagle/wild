@@ -18,7 +18,9 @@ use linker_utils::coff_runtime::parse_legacy_alias_object;
 use linker_utils::coff_symbols::ArchiveDemand;
 #[cfg(test)]
 use linker_utils::coff_symbols::ArchiveDemandKind;
+#[cfg(test)]
 use object::Object;
+#[cfg(test)]
 use object::ObjectSymbol;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -269,9 +271,12 @@ impl<'data> IncrementalSymbolState<'data> {
         index: usize,
     ) -> Result<()> {
         self.absorbed_objects += 1;
-        for record in linker_utils::coff_runtime::parse_weak_externals(object.bytes())? {
-            let symbol = self.intern_borrowed(record.symbol);
-            let target = self.intern_borrowed(record.target);
+        let summary = object.resolver_summary()?;
+        for &record in summary.weak_externals() {
+            let symbol_bytes = record.symbol(object.bytes());
+            let target_bytes = record.target(object.bytes());
+            let symbol = self.intern_borrowed_prehashed(symbol_bytes, record.symbol_hash);
+            let target = self.intern_borrowed_prehashed(target_bytes, record.target_hash);
             // The legacy import bridge considered every selected weak record. Retain that demand
             // bit without promoting it into an ordinary archive demand (search policy still owns
             // extraction behavior below).
@@ -280,8 +285,14 @@ impl<'data> IncrementalSymbolState<'data> {
                 .weak_names
                 .iter()
                 .position(|fallback| fallback.symbol == symbol);
-            self.weak_resolution
-                .apply(record, &format!("selected COFF object #{index}"))?;
+            self.weak_resolution.apply(
+                linker_utils::coff_runtime::WeakExternalRecord {
+                    symbol: symbol_bytes,
+                    target: target_bytes,
+                    search: record.search,
+                },
+                &format!("selected COFF object #{index}"),
+            )?;
             let fallback = ResolverWeakFallback {
                 symbol,
                 target,
@@ -301,18 +312,24 @@ impl<'data> IncrementalSymbolState<'data> {
                 self.weak_names.push(fallback);
             }
         }
-        for (symbol_occurrence, symbol) in object.file().symbols().enumerate() {
-            let name = symbol.name_bytes().context("invalid COFF symbol name")?;
-            if !symbol.is_global() {
-                continue;
-            }
-            let name_id = self.intern_borrowed(name);
-            let object = u32::try_from(index).context("PE object index exceeds u32")?;
+        let object_id = u32::try_from(index).context("PE object index exceeds u32")?;
+        for symbol in summary.globals() {
+            let name_occurrence = symbol.name();
+            let source = name_occurrence
+                .source()
+                .context("invalid COFF symbol name")?;
+            let name =
+                &object.bytes()[source.start as usize..source.start as usize + source.len as usize];
+            let name_id = self.intern_borrowed_prehashed(
+                name,
+                name_occurrence
+                    .hash()
+                    .expect("valid resolver summary names are prehashed"),
+            );
             note_vec_push(&self.global_names);
             self.global_names.push(ResolverGlobalName {
-                object,
-                name_occurrence: u32::try_from(symbol_occurrence)
-                    .context("COFF symbol occurrence exceeds u32")?,
+                object: object_id,
+                name_occurrence: symbol.symbol_occurrence,
                 name: name_id,
             });
             #[cfg(test)]
@@ -320,11 +337,11 @@ impl<'data> IncrementalSymbolState<'data> {
                 note_vec_push(&self.globals);
                 self.globals.push(SelectedGlobalSymbol {
                     object: index,
-                    index: symbol.index(),
-                    section: symbol.section_index(),
-                    section_kind: symbol.section(),
-                    address: symbol.address(),
-                    size: symbol.size(),
+                    index: object::SymbolIndex(symbol.raw_index as usize),
+                    section: symbol.section(),
+                    section_kind: symbol.section_kind(),
+                    address: u64::from(symbol.address),
+                    size: u64::from(symbol.size),
                     is_definition: symbol.is_definition(),
                     is_common: symbol.is_common(),
                     is_undefined: symbol.is_undefined(),
@@ -339,8 +356,6 @@ impl<'data> IncrementalSymbolState<'data> {
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
                 self.mark_unresolved(name_id);
             } else if symbol.is_definition() || symbol.is_common() {
-                let raw_symbol =
-                    u32::try_from(symbol.index().0).context("raw COFF symbol index exceeds u32")?;
                 let strength = if symbol.is_common() {
                     BindingStrength::Common
                 } else if symbol.is_weak() {
@@ -351,8 +366,8 @@ impl<'data> IncrementalSymbolState<'data> {
                 note_vec_push(&self.providers);
                 self.providers.push(ResolverProviderOccurrence::Object {
                     name: name_id,
-                    object,
-                    raw_symbol,
+                    object: object_id,
+                    raw_symbol: symbol.raw_index,
                     strength,
                 });
                 self.define_id(name_id);
@@ -361,8 +376,8 @@ impl<'data> IncrementalSymbolState<'data> {
         Ok(())
     }
 
-    fn intern_borrowed(&mut self, name: &'data [u8]) -> NameId {
-        let id = self.names.intern_borrowed_prehashed(name, hash_name(name));
+    fn intern_borrowed_prehashed(&mut self, name: &'data [u8], hash: u64) -> NameId {
+        let id = self.names.intern_borrowed_prehashed(name, hash);
         self.ensure_state(id);
         id
     }
@@ -1273,16 +1288,12 @@ mod tests {
     }
 
     #[test]
-    fn resolver_still_validates_local_symbol_names() {
+    fn resolver_skips_unconsumed_local_symbol_names() {
         let bytes = object_with_malformed_local_name();
         let object = crate::coff::CoffObject::parse(&bytes).unwrap();
-        let error = IncrementalSymbolState::new()
+        IncrementalSymbolState::new()
             .absorb_object(&object, 0)
-            .unwrap_err();
-        assert!(
-            format!("{error:?}").contains("invalid COFF symbol name"),
-            "{error:?}"
-        );
+            .unwrap();
     }
 
     #[test]
