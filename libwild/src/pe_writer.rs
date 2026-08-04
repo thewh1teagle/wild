@@ -398,7 +398,7 @@ pub(crate) fn link<F: FileSystem>(
         select_inputs_to_fixpoint(fs, args, &definition.exports, &input_storage, &mut inputs)?;
     // Preserve the historical diagnostic/side-effect boundary: validate every retained object's
     // full shape before manifest preparation can write an auxiliary file.
-    materialize_selected_object_indices(&selected.objects)?;
+    materialize_selected_object_plans(&selected.objects)?;
     let mut resources = selected.resources;
     {
         crate::timing_phase!(PE_PHASE_PREPARE_RESOURCES);
@@ -513,12 +513,12 @@ pub(crate) fn link<F: FileSystem>(
 /// Materialize only the objects retained by archive selection. Indexed collection preserves input
 /// order (and therefore deterministic error selection) while each independent object does its
 /// generic COFF traversal on the Rayon pool.
-fn materialize_selected_object_indices(objects: &[crate::coff::CoffObject<'_>]) -> Result<()> {
-    let mut phase = crate::pe_timing_guard!("PE index: Materialize full COFF indices");
+fn materialize_selected_object_plans(objects: &[crate::coff::CoffObject<'_>]) -> Result<()> {
+    let mut phase = crate::pe_timing_guard!("PE index: Materialize dense COFF plans");
     phase.0.add(crate::timing::PeMetric::Objects, objects.len());
     let results = objects
         .par_iter()
-        .map(crate::coff::CoffObject::materialize_full_index)
+        .map(crate::coff::CoffObject::materialize_dense_plan)
         .collect::<Vec<_>>();
     for result in results {
         result?;
@@ -528,21 +528,14 @@ fn materialize_selected_object_indices(objects: &[crate::coff::CoffObject<'_>]) 
             crate::timing::PeMetric::Sections,
             objects
                 .iter()
-                .map(|object| object.index().sections().len())
+                .map(|object| object.dense_plan().section_count())
                 .sum(),
         );
         phase.0.add(
             crate::timing::PeMetric::Relocations,
             objects
                 .iter()
-                .map(|object| {
-                    object
-                        .index()
-                        .sections()
-                        .iter()
-                        .map(|section| object.index().relocations(section).len())
-                        .sum::<usize>()
-                })
+                .map(|object| object.dense_plan().relocation_count() as usize)
                 .sum(),
         );
     }
@@ -1895,7 +1888,7 @@ fn build_image(
     let mut resolver_runtime = runtime_resolution.clone();
     resolver.resolve(&mut dense_objects, &[], &mut resolver_runtime)?;
     let resolved = resolver.finish();
-    materialize_selected_object_indices(&dense_objects)?;
+    materialize_selected_object_plans(&dense_objects)?;
     let dense = DenseProductionState::finalize(&dense_objects, resolved.seed, &resolved.symbols)?;
     let (symbol_metadata, _) =
         SelectedObjectMetadata::new_with_undefined(&resolved.symbols, &[], Some(&dense));

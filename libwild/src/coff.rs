@@ -1,10 +1,11 @@
 //! PE/COFF input primitives.
 //!
 //! `CoffObject::parse` only validates the container. Once archive selection has reached its
-//! fixpoint, selected objects build one immutable, source-backed index in parallel. Generic
-//! `object` iterators are confined to that indexing boundary. Malformed symbol-name offsets and
-//! relocation symbol indices are recorded, not diagnosed: the consumer that first needs a live
-//! name or target remains the final diagnostic boundary.
+//! fixpoint, selected objects build compact prefix/name plans in parallel, then raw standard or
+//! bigobj records are written directly into the final dense PE IR. Malformed symbol-name offsets
+//! and relocation symbol indices are recorded, not diagnosed: the consumer that first needs a
+//! live name or target remains the final diagnostic boundary. The older full local index remains
+//! available for isolated legacy/test consumers but is not materialized by production linking.
 
 #![allow(dead_code)]
 
@@ -31,6 +32,7 @@ pub(crate) struct CoffObject<'data> {
     file: object::File<'data>,
     bytes: &'data [u8],
     index: OnceLock<CoffRelocationIndex>,
+    dense_plan: OnceLock<CoffDensePlan>,
     resolver_summary: OnceLock<CoffResolverSummary>,
     legacy_relocation_index_accessed: AtomicBool,
 }
@@ -43,6 +45,27 @@ pub(crate) struct CoffRelocationIndex {
     relocations: Box<[CoffRelocationRecord]>,
     symbols: Box<[CoffSymbolRecord]>,
     names: Box<[CoffNameOccurrence]>,
+}
+
+/// Compact validation and prefix plan for production dense-IR construction. Full section,
+/// symbol and relocation records are written directly into `PeIr`; only data needed to assign
+/// deterministic global IDs before that parallel fill is retained here.
+#[derive(Debug)]
+pub(crate) struct CoffDensePlan {
+    names: Box<[CoffNameOccurrence]>,
+    raw_to_dense_symbol: Box<[u32]>,
+    section_comdats: Box<[CoffDenseComdat]>,
+    primary_symbol_count: u32,
+    symbol_count: u32,
+    relocation_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoffDenseComdat {
+    pub(super) selection: u8,
+    pub(super) associative_section: u32,
+    pub(super) leader: u32,
+    pub(super) order: u32,
 }
 
 /// The resolution-facing subset of a COFF symbol table. It is populated directly from the raw
@@ -187,6 +210,7 @@ impl<'data> CoffObject<'data> {
             file,
             bytes,
             index: OnceLock::new(),
+            dense_plan: OnceLock::new(),
             resolver_summary: OnceLock::new(),
             legacy_relocation_index_accessed: AtomicBool::new(false),
         })
@@ -244,6 +268,23 @@ impl<'data> CoffObject<'data> {
         // future caller races on the same object: either identical immutable index may win.
         let _ = self.index.set(index);
         Ok(self.index.get().expect("COFF index was just initialized"))
+    }
+
+    pub(crate) fn materialize_dense_plan(&self) -> Result<&CoffDensePlan> {
+        if let Some(plan) = self.dense_plan.get() {
+            return Ok(plan);
+        }
+        let plan = CoffDensePlan::new(&self.file, self.bytes, self.resolver_summary()?)?;
+        let _ = self.dense_plan.set(plan);
+        Ok(self
+            .dense_plan
+            .get()
+            .expect("COFF dense plan was just initialized"))
+    }
+
+    pub(super) fn dense_plan(&self) -> &CoffDensePlan {
+        self.materialize_dense_plan()
+            .expect("valid selected COFF object must have a dense plan")
     }
 
     #[cfg(test)]
@@ -472,6 +513,168 @@ fn source_bytes(bytes: &[u8], source: CoffSourceRange) -> &[u8] {
 fn hash_name_once(name: &[u8]) -> u64 {
     count_name_hash();
     crate::hash::hash_bytes(name)
+}
+
+impl CoffDensePlan {
+    fn new(file: &object::File<'_>, bytes: &[u8], resolver: &CoffResolverSummary) -> Result<Self> {
+        count_object_parse();
+        match file {
+            object::File::Coff(file) => Self::new_typed(file, bytes, resolver),
+            object::File::CoffBig(file) => Self::new_typed(file, bytes, resolver),
+            _ => Err(crate::error!(
+                "Internal non-COFF file reached dense COFF planning"
+            )),
+        }
+    }
+
+    fn new_typed<'data, Coff>(
+        file: &object::read::coff::CoffFile<'data, &'data [u8], Coff>,
+        bytes: &[u8],
+        resolver: &CoffResolverSummary,
+    ) -> Result<Self>
+    where
+        Coff: CoffHeader,
+    {
+        let section_count = file.coff_header().number_of_sections() as usize;
+        let mut names = Vec::with_capacity(resolver.globals.len().saturating_add(section_count));
+        let mut raw_to_dense_symbol = vec![u32::MAX; file.coff_symbol_table().len()];
+        let mut section_comdats = vec![
+            CoffDenseComdat {
+                selection: 0,
+                associative_section: u32::MAX,
+                leader: u32::MAX,
+                order: u32::MAX,
+            };
+            section_count
+        ];
+
+        let mut next_global = 0usize;
+        let mut primary_symbol_count = 0u32;
+        for (symbol_occurrence, (raw_index, raw_symbol)) in
+            file.coff_symbol_table().iter().enumerate()
+        {
+            let dense = primary_symbol_count;
+            primary_symbol_count = primary_symbol_count
+                .checked_add(1)
+                .ok_or_else(|| crate::error!("COFF symbol count exceeds u32"))?;
+            raw_to_dense_symbol[raw_index.0] = dense;
+            let storage_class = raw_symbol.storage_class();
+            let is_global = matches!(
+                storage_class,
+                object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            );
+            let global = if is_global {
+                let global = resolver.globals.get(next_global).ok_or_else(|| {
+                    crate::error!("COFF resolver summary is missing a global symbol")
+                })?;
+                crate::ensure!(
+                    global.symbol_occurrence as usize == symbol_occurrence
+                        && global.raw_index as usize == raw_index.0,
+                    "COFF resolver summary does not match the raw symbol table"
+                );
+                next_global += 1;
+                Some(global)
+            } else {
+                None
+            };
+            if let Some(global) = global {
+                push_existing_name_occurrence(&mut names, global.name())?;
+            }
+
+            if let Ok(symbol) = file.symbol_by_index(raw_index)
+                && let object::SymbolFlags::CoffSection {
+                    selection,
+                    associative_section,
+                    ..
+                } = symbol.flags()
+                && let Some(section) = symbol.section_index()
+                && let Some(slot) = section
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| section_comdats.get_mut(index))
+            {
+                slot.selection = selection.0;
+                slot.associative_section = associative_section
+                    .map(|section| dense_u32(section.0, "associative COMDAT parent"))
+                    .transpose()?
+                    .unwrap_or(u32::MAX);
+                slot.order = dense_u32(raw_index.0, "COFF COMDAT auxiliary order")?;
+            }
+
+            let section = global.map_or_else(|| raw_symbol.section(), |global| global.section());
+            if let Some(section) = section
+                && let Some(slot) = section
+                    .0
+                    .checked_sub(1)
+                    .and_then(|index| section_comdats.get_mut(index))
+                && slot.selection != 0
+                && slot.selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0
+                && slot.leader == u32::MAX
+                && dense_u32(raw_index.0, "raw COFF symbol index")? > slot.order
+            {
+                slot.leader = dense;
+            }
+        }
+        crate::ensure!(
+            next_global == resolver.globals.len(),
+            "COFF resolver summary has excess global symbols"
+        );
+
+        let mut symbol_count = primary_symbol_count;
+        let mut relocation_count = 0u32;
+        for section in file.sections() {
+            push_name_occurrence(&mut names, bytes, section.name_bytes(), true)?;
+            let relocations = section.coff_relocations().unwrap_or(&[]);
+            relocation_count = relocation_count
+                .checked_add(dense_u32(relocations.len(), "COFF relocation")?)
+                .ok_or_else(|| crate::error!("COFF relocation count exceeds u32"))?;
+            for relocation in relocations {
+                let raw = relocation.symbol_table_index.get(LE) as usize;
+                if raw_to_dense_symbol.get(raw).copied().unwrap_or(u32::MAX) == u32::MAX {
+                    symbol_count = symbol_count
+                        .checked_add(1)
+                        .ok_or_else(|| crate::error!("COFF symbol count exceeds u32"))?;
+                }
+            }
+        }
+
+        Ok(Self {
+            names: names.into_boxed_slice(),
+            raw_to_dense_symbol: raw_to_dense_symbol.into_boxed_slice(),
+            section_comdats: section_comdats.into_boxed_slice(),
+            primary_symbol_count,
+            symbol_count,
+            relocation_count,
+        })
+    }
+
+    pub(super) fn names(&self) -> &[CoffNameOccurrence] {
+        &self.names
+    }
+
+    pub(super) fn raw_to_dense_symbol(&self) -> &[u32] {
+        &self.raw_to_dense_symbol
+    }
+
+    pub(super) fn section_comdats(&self) -> &[CoffDenseComdat] {
+        &self.section_comdats
+    }
+
+    pub(super) const fn primary_symbol_count(&self) -> u32 {
+        self.primary_symbol_count
+    }
+
+    pub(super) const fn symbol_count(&self) -> u32 {
+        self.symbol_count
+    }
+
+    pub(super) const fn relocation_count(&self) -> u32 {
+        self.relocation_count
+    }
+
+    pub(super) fn section_count(&self) -> usize {
+        self.section_comdats.len()
+    }
 }
 
 impl CoffRelocationIndex {
