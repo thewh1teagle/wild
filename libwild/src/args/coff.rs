@@ -396,6 +396,7 @@ where
                 // report every PE phase as intended.
                 args.common.should_fork = false;
             }
+            "nofork" if inline_value.is_none() => args.common.should_fork = false,
             "threads" => {
                 let value = required_value("/THREADS", inline_value, &mut input)?;
                 args.common.num_threads = Some(
@@ -1406,6 +1407,10 @@ mod tests {
         );
         assert_eq!(args.common.num_threads, NonZeroUsize::new(7));
         assert!(!args.common.should_fork());
+
+        let mut nofork = CoffArgs::default();
+        parse(&mut nofork, ["/NOFORK"].into_iter()).unwrap();
+        assert!(!nofork.common.should_fork());
 
         let mut defaults = CoffArgs::default();
         parse(&mut defaults, ["-time", "-threads", "3"].into_iter()).unwrap();
