@@ -3873,28 +3873,6 @@ fn collect_dense_gc(
         }
     }
 
-    let mut groups = Vec::with_capacity(comdats.analysis.group_count());
-    let mut group_members = Vec::new();
-    for group_id in 0..comdats.analysis.group_count() {
-        let group = comdats
-            .analysis
-            .group(group_id)
-            .context("missing dense COMDAT reachability group")?;
-        let start = u32::try_from(group_members.len()).context("too many COMDAT group members")?;
-        for &node in group {
-            group_members.push(pe_ir::SectionId::from_u32(
-                u32::try_from(node).context("COMDAT node exceeds dense ID range")?,
-            ));
-        }
-        let Some(&leader) = group_members.get(start as usize) else {
-            return Err(error!("empty COMDAT reachability group"));
-        };
-        groups.push(pe_gc::SectionGroup {
-            leader,
-            member_start: start,
-            member_len: u32::try_from(group.len()).context("COMDAT group is too large")?,
-        });
-    }
     let collector = pe_gc::DenseEventGc::new_resolved(
         &dense.ir,
         &dense.alternate_targets,
@@ -3913,8 +3891,9 @@ fn collect_dense_gc(
         discarded,
         is_comdat: &comdats.analysis.is_comdat,
         root_names: &root_names,
-        groups: &groups,
-        group_members: &group_members,
+        group_starts: &comdats.analysis.dense_group_starts,
+        group_members: &comdats.analysis.dense_group_members,
+        group_by_section: &comdats.analysis.group_by_node,
     })
 }
 

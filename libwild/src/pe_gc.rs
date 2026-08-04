@@ -150,8 +150,11 @@ pub(super) struct ProductionGcInput<'a> {
     pub(super) discarded: Vec<bool>,
     pub(super) is_comdat: &'a [bool],
     pub(super) root_names: &'a [NameId],
-    pub(super) groups: &'a [SectionGroup],
-    pub(super) group_members: &'a [SectionId],
+    /// Authoritative `CompactComdatAnalysis` CSR. Every dense section belongs to exactly one
+    /// group, and associative descendants are already coalesced with their ultimate leader.
+    pub(super) group_starts: &'a [u32],
+    pub(super) group_members: &'a [usize],
+    pub(super) group_by_section: &'a [usize],
 }
 
 impl<'ir, 'data> DenseEventGc<'ir, 'data> {
@@ -342,13 +345,15 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             crate::timing::PeMetric::Relocations,
             self.ir.relocations.records.len(),
         );
-        collect_phase
-            .0
-            .add(crate::timing::PeMetric::Groups, input.groups.len());
+        collect_phase.0.add(
+            crate::timing::PeMetric::Groups,
+            input.group_starts.len().saturating_sub(1),
+        );
         ensure!(
             input.redirect_targets.len() == section_count
                 && input.discarded.len() == section_count
-                && input.is_comdat.len() == section_count,
+                && input.is_comdat.len() == section_count
+                && input.group_by_section.len() == section_count,
             "production GC dense array cardinality mismatch"
         );
         let mut redirects = Vec::new();
@@ -378,47 +383,13 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             );
         }
 
-        let mut group_by_section = vec![u32::MAX; section_count];
-        for (group_index, group) in input.groups.iter().enumerate() {
-            let start = group.member_start as usize;
-            let end = start
-                .checked_add(group.member_len as usize)
-                .context("COMDAT member range overflow")?;
-            for &member in input
-                .group_members
-                .get(start..end)
-                .context("COMDAT member range is out of bounds")?
-            {
-                let slot = group_by_section
-                    .get_mut(member.index())
-                    .context("invalid COMDAT group member")?;
-                ensure!(
-                    *slot == u32::MAX,
-                    "section belongs to multiple COMDAT groups"
-                );
-                *slot = group_index as u32;
-            }
-        }
-
-        let mut associative_heads = vec![u32::MAX; section_count];
-        let mut associative_tails = vec![u32::MAX; section_count];
-        let mut associative_next = vec![u32::MAX; section_count];
-        for (child, section) in self.ir.sections.iter().enumerate() {
-            if let Some(parent) = section.associative_section.get() {
-                ensure!(
-                    parent.index() < section_count,
-                    "invalid associative COMDAT parent"
-                );
-                let child = child as u32;
-                let tail = &mut associative_tails[parent.index()];
-                if *tail == u32::MAX {
-                    associative_heads[parent.index()] = child;
-                } else {
-                    associative_next[*tail as usize] = child;
-                }
-                *tail = child;
-            }
-        }
+        ensure!(
+            input
+                .group_starts
+                .last()
+                .is_some_and(|&end| end as usize == input.group_members.len()),
+            "production GC group CSR is malformed"
+        );
 
         let mut live_bits = vec![0u64; section_count.div_ceil(64)];
         let mut pending = VecDeque::new();
@@ -487,18 +458,14 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                         let mut import_names = Vec::new();
                         let mut scanned_relocations = 0usize;
                         for &section in sections {
-                            let group = group_by_section[section.index()];
-                            if group != u32::MAX {
-                                let group = &input.groups[group as usize];
-                                let start = group.member_start as usize;
-                                let end = start + group.member_len as usize;
-                                section_targets.extend_from_slice(&input.group_members[start..end]);
-                            }
-                            let mut child = associative_heads[section.index()];
-                            while child != u32::MAX {
-                                section_targets.push(SectionId::from_u32(child));
-                                child = associative_next[child as usize];
-                            }
+                            let group = input.group_by_section[section.index()];
+                            let start = input.group_starts[group] as usize;
+                            let end = input.group_starts[group + 1] as usize;
+                            section_targets.extend(
+                                input.group_members[start..end]
+                                    .iter()
+                                    .map(|&member| SectionId::from_u32(member as u32)),
+                            );
                             let relocations = self
                                 .ir
                                 .relocations
@@ -534,24 +501,16 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             let section = pending
                 .pop_front()
                 .expect("non-empty PE GC frontier has a section");
-            let group = group_by_section[section.index()];
-            if group != u32::MAX {
-                let group = &input.groups[group as usize];
-                let start = group.member_start as usize;
-                let end = start + group.member_len as usize;
-                for &member in &input.group_members[start..end] {
-                    mark(member, &mut live_bits, &mut pending, &mut visited_sections)?;
-                }
-            }
-            let mut child = associative_heads[section.index()];
-            while child != u32::MAX {
+            let group = input.group_by_section[section.index()];
+            let start = input.group_starts[group] as usize;
+            let end = input.group_starts[group + 1] as usize;
+            for &member in &input.group_members[start..end] {
                 mark(
-                    SectionId::from_u32(child),
+                    SectionId::from_u32(member as u32),
                     &mut live_bits,
                     &mut pending,
                     &mut visited_sections,
                 )?;
-                child = associative_next[child as usize];
             }
             let relocations = self
                 .ir
@@ -1099,6 +1058,9 @@ mod tests {
         let resolved = ir.resolve_symbol_targets(&database, &[]).unwrap();
         let collector = DenseEventGc::new_resolved(&ir, &[], &resolved);
         let is_comdat = vec![false; SECTION_COUNT];
+        let group_starts = (0..=u32::try_from(SECTION_COUNT).unwrap()).collect::<Vec<_>>();
+        let group_members = (0..SECTION_COUNT).collect::<Vec<_>>();
+        let group_by_section = group_members.clone();
         let output = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -1111,8 +1073,9 @@ mod tests {
                     discarded: vec![false; SECTION_COUNT],
                     is_comdat: &is_comdat,
                     root_names: &[],
-                    groups: &[],
-                    group_members: &[],
+                    group_starts: &group_starts,
+                    group_members: &group_members,
+                    group_by_section: &group_by_section,
                 })
             })
             .unwrap();
