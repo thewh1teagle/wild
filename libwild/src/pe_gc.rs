@@ -17,6 +17,7 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
+use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
@@ -461,7 +462,69 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         let mut traversal_phase = crate::pe_timing_guard!("PE dense GC: Traverse resolved CSR");
         let instrumentation_enabled = traversal_phase.0.enabled();
         let mut relocation_count = 0usize;
-        while let Some(section) = pending.pop_front() {
+        const PARALLEL_FRONTIER_MIN: usize = 8192;
+        while !pending.is_empty() {
+            if rayon::current_num_threads() > 1 && pending.len() >= PARALLEL_FRONTIER_MIN {
+                let frontier = pending.drain(..).collect::<Vec<_>>();
+                let chunk_size = frontier
+                    .len()
+                    .div_ceil(rayon::current_num_threads().saturating_mul(2))
+                    .max(1024);
+                let chunks = frontier
+                    .par_chunks(chunk_size)
+                    .map(|sections| {
+                        let mut section_targets = Vec::new();
+                        let mut import_names = Vec::new();
+                        let mut scanned_relocations = 0usize;
+                        for &section in sections {
+                            let group = group_by_section[section.index()];
+                            if group != u32::MAX {
+                                let group = &input.groups[group as usize];
+                                let start = group.member_start as usize;
+                                let end = start + group.member_len as usize;
+                                section_targets.extend_from_slice(&input.group_members[start..end]);
+                            }
+                            let mut child = associative_heads[section.index()];
+                            while child != u32::MAX {
+                                section_targets.push(SectionId::from_u32(child));
+                                child = associative_next[child as usize];
+                            }
+                            let relocations = self
+                                .ir
+                                .relocations
+                                .for_section(section)
+                                .context("live section has no relocation CSR row")?;
+                            scanned_relocations += relocations.len();
+                            for relocation in relocations {
+                                let target =
+                                    Self::unpack_symbol_target(resolved, relocation.target)?;
+                                if let Some(name) = target.import_name {
+                                    import_names.push(name);
+                                }
+                                if let Some(section) = target.section {
+                                    section_targets.push(section);
+                                }
+                            }
+                        }
+                        Ok((section_targets, import_names, scanned_relocations))
+                    })
+                    .collect::<Vec<Result<_>>>();
+                for chunk in chunks {
+                    let (section_targets, import_names, scanned_relocations) = chunk?;
+                    if instrumentation_enabled {
+                        relocation_count += scanned_relocations;
+                    }
+                    referenced_import_names.extend(import_names);
+                    for section in section_targets {
+                        mark(section, &mut live_bits, &mut pending, &mut visited_sections)?;
+                    }
+                }
+                continue;
+            }
+
+            let section = pending
+                .pop_front()
+                .expect("non-empty PE GC frontier has a section");
             let group = group_by_section[section.index()];
             if group != u32::MAX {
                 let group = &input.groups[group as usize];
@@ -943,6 +1006,116 @@ mod tests {
             Some(SectionId::from_u32(3))
         );
         assert!(output.canonical(SectionId::from_u32(4)).is_none());
+    }
+
+    #[test]
+    fn production_gc_parallel_frontier_matches_dense_root_set() {
+        const SECTION_COUNT: usize = 9000;
+        let sections = (0..SECTION_COUNT)
+            .map(|index| SectionRecord {
+                object: ObjectId::from_u32(0),
+                raw_index: u32::try_from(index).unwrap() + 1,
+                name: NameId::from_u32(0),
+                data: None,
+                size: 1,
+                alignment: 1,
+                characteristics: 0,
+                contents: SectionContents::Data,
+                comdat_selection: 0,
+                associative_section: OptionalSectionId::NONE,
+                comdat_leader: OptionalSymbolId::NONE,
+                comdat_order: u32::MAX,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let symbols = (0..SECTION_COUNT)
+            .map(|index| SymbolRecord {
+                object: ObjectId::from_u32(0),
+                raw_index: u32::try_from(index).unwrap(),
+                name: NameId::from_u32(0),
+                section: OptionalSectionId::some(SectionId::from_u32(
+                    u32::try_from((index + 1) % SECTION_COUNT).unwrap(),
+                )),
+                value: 0,
+                size: 0,
+                flags: 0,
+                storage_class: 0,
+                typ: 0,
+                weak_default: OptionalSymbolId::NONE,
+                diagnostic: SymbolDiagnostic::None,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let ir = PeIr {
+            sources: SourceFiles::new(vec![b""]),
+            names: vec![NameRecord {
+                source: Some(SourceRange {
+                    file: FileId::from_u32(0),
+                    start: 0,
+                    len: 0,
+                }),
+                hash: 0,
+            }]
+            .into_boxed_slice(),
+            objects: vec![ObjectRecord {
+                file: FileId::from_u32(0),
+                sections: DenseRange::new(0, u32::try_from(SECTION_COUNT).unwrap()),
+                symbols: DenseRange::new(0, u32::try_from(SECTION_COUNT).unwrap()),
+                input_ordinal: 0,
+            }]
+            .into_boxed_slice(),
+            sections,
+            symbols,
+            global_symbols: Box::new([]),
+            relocations: RelocationCsr {
+                starts: (0..=u32::try_from(SECTION_COUNT).unwrap())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                records: (0..SECTION_COUNT)
+                    .map(|index| RelocationRecord {
+                        offset: 0,
+                        target: SymbolId::from_u32(u32::try_from(index).unwrap()),
+                        typ: 4,
+                        flags: 0,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            },
+        };
+        let database = SymbolDb {
+            entries: Box::new([]),
+            providers: Box::new([]),
+            absolute_values: Box::new([]),
+        };
+        let resolved = ir.resolve_symbol_targets(&database, &[]);
+        let collector = DenseEventGc::new_resolved(&ir, &[], &resolved);
+        let is_comdat = vec![false; SECTION_COUNT];
+        let output = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                collector.collect_production(ProductionGcInput {
+                    redirect_targets: (0..u32::try_from(SECTION_COUNT).unwrap())
+                        .map(SectionId::from_u32)
+                        .collect(),
+                    discarded: vec![false; SECTION_COUNT],
+                    is_comdat: &is_comdat,
+                    root_names: &[],
+                    groups: &[],
+                    group_members: &[],
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            output
+                .live_bits
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>(),
+            SECTION_COUNT
+        );
+        assert!(output.referenced_import_names.is_empty());
     }
 
     #[test]
