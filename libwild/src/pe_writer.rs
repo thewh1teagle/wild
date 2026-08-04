@@ -2836,7 +2836,7 @@ fn collect_contributions_with_roots_metadata(
     let mut comdats = discarded_comdat_sections_with_metadata(objects, metadata)?;
     let dense_gc = if opt_ref_enabled(args) {
         if let Some(dense) = metadata.dense {
-            Some(collect_dense_gc(dense, &comdats, roots)?)
+            Some(collect_dense_gc(dense, &mut comdats, roots)?)
         } else {
             #[cfg(test)]
             comdats.discarded.extend(unreferenced_comdat_sections(
@@ -2984,9 +2984,6 @@ fn materialize_object_contributions_into(
         {
             continue;
         }
-        if comdats.discarded.contains(&(object_index, section.index())) {
-            continue;
-        }
         let dense_section = if let Some((ir, gc)) = dense_view {
             let dense = ir
                 .section_by_raw(
@@ -2997,11 +2994,24 @@ fn materialize_object_contributions_into(
                         .context("raw COFF section index exceeds u32")?,
                 )
                 .context("COFF contribution has no dense section")?;
-            if gc.is_some_and(|gc| !gc.is_live(dense)) {
+            let discarded = if let Some(gc) = gc {
+                !gc.is_live(dense)
+            } else {
+                *comdats
+                    .dense_discarded
+                    .as_ref()
+                    .context("production COMDAT resolution has no dense discard decisions")?
+                    .get(dense.index())
+                    .context("dense COMDAT discard decision is out of bounds")?
+            };
+            if discarded {
                 continue;
             }
             Some(dense)
         } else {
+            if comdats.discarded.contains(&(object_index, section.index())) {
+                continue;
+            }
             None
         };
         let name = merged_name(raw_name, args)?;
@@ -3401,6 +3411,8 @@ struct CompactComdatAnalysis {
     nodes_by_object: Vec<Vec<Option<SectionNode>>>,
     is_comdat: Vec<bool>,
     groups: Vec<Vec<SectionNode>>,
+    dense_group_starts: Vec<u32>,
+    dense_group_members: Vec<SectionNode>,
     group_by_node: Vec<ComdatGroupId>,
 }
 
@@ -3476,55 +3488,36 @@ impl CompactComdatAnalysis {
     }
 
     fn new_dense(dense: &DenseProductionState<'_>) -> Result<Self> {
+        let section_count = dense.ir.sections.len();
         let mut analysis = Self {
-            keys: Vec::with_capacity(dense.ir.sections.len()),
-            nodes_by_object: Vec::with_capacity(dense.ir.objects.len()),
-            is_comdat: Vec::with_capacity(dense.ir.sections.len()),
+            is_comdat: Vec::with_capacity(section_count),
             ..Self::default()
         };
-        for (object_index, object) in dense.ir.objects.iter().enumerate() {
-            let start = object.sections.start() as usize;
-            let end = object
-                .sections
-                .end()
-                .context("dense object section range overflow")? as usize;
-            let object_sections = dense
-                .ir
-                .sections
-                .get(start..end)
-                .context("dense object section range is invalid")?;
-            let max_raw = object_sections
-                .iter()
-                .map(|section| section.raw_index as usize)
-                .max()
-                .unwrap_or(0);
-            let mut nodes = vec![None; max_raw.saturating_add(1)];
-            for section in object_sections {
-                let node = analysis.keys.len();
-                let raw = object::SectionIndex(section.raw_index as usize);
-                nodes[raw.0] = Some(node);
-                analysis.keys.push((object_index, raw));
-                analysis
-                    .is_comdat
-                    .push(section.characteristics & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0);
-            }
-            analysis.nodes_by_object.push(nodes);
+        for section in &dense.ir.sections {
+            analysis
+                .is_comdat
+                .push(section.characteristics & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0);
         }
-        analysis.group_by_node = vec![usize::MAX; analysis.keys.len()];
+        analysis.group_by_node = vec![usize::MAX; section_count];
 
         // Resolve every associative section to its ultimate non-associative leader using direct
         // SectionIds. `comdat_order` preserves the raw auxiliary-symbol encounter order used by
         // the previous object::Comdat iterator, including nested associative children.
-        let mut leader_by_node = vec![None; dense.ir.sections.len()];
+        let no_leader = u32::MAX;
+        let mut leader_by_node = vec![no_leader; section_count];
+        let mut member_counts = vec![0u32; section_count];
         for (node, section) in dense.ir.sections.iter().enumerate() {
             if section.comdat_selection == 0 {
                 continue;
             }
             let mut leader = pe_ir::SectionId::from_u32(node as u32);
-            for _ in 0..=dense.ir.sections.len() {
+            for _ in 0..=section_count {
                 let record = &dense.ir.sections[leader.index()];
                 if record.comdat_selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0 {
-                    leader_by_node[node] = Some(leader.index());
+                    leader_by_node[node] = leader.get();
+                    member_counts[leader.index()] = member_counts[leader.index()]
+                        .checked_add(1)
+                        .context("too many members in dense COMDAT group")?;
                     break;
                 }
                 leader = record
@@ -3533,41 +3526,93 @@ impl CompactComdatAnalysis {
                     .context("associative COMDAT refers to a missing parent")?;
             }
             ensure!(
-                leader_by_node[node].is_some(),
+                leader_by_node[node] != no_leader,
                 "cycle in associative COMDAT parent chain"
             );
         }
-        let mut members_by_leader = vec![Vec::<(u32, SectionNode)>::new(); dense.ir.sections.len()];
-        for (node, leader) in leader_by_node.iter().copied().enumerate() {
-            if let Some(leader) = leader {
-                members_by_leader[leader].push((dense.ir.sections[node].comdat_order, node));
-            }
-        }
-        for (leader, members) in members_by_leader.iter_mut().enumerate() {
-            if members.is_empty() {
+
+        // Build dense groups as CSR. A Vec header per potential leader and another Vec allocation
+        // per actual group cost more memory than the member IDs themselves on large Rust links.
+        let mut group_by_leader = vec![usize::MAX; section_count];
+        let mut group_leaders = Vec::new();
+        let mut member_count = 0usize;
+        for (leader, &count) in member_counts.iter().enumerate() {
+            if count == 0 {
                 continue;
             }
-            members.sort_unstable_by_key(|&(order, node)| (node != leader, order));
-            let group_id = analysis.groups.len();
-            let group = members.iter().map(|&(_, node)| node).collect::<Vec<_>>();
-            for &member in &group {
+            group_by_leader[leader] = group_leaders.len();
+            group_leaders.push(leader);
+            analysis
+                .dense_group_starts
+                .push(u32::try_from(member_count).context("too many dense COMDAT group members")?);
+            member_count = member_count
+                .checked_add(count as usize)
+                .context("dense COMDAT member count overflow")?;
+        }
+        analysis.dense_group_members = vec![usize::MAX; member_count];
+        let mut cursors = analysis
+            .dense_group_starts
+            .iter()
+            .map(|&start| start as usize)
+            .collect::<Vec<_>>();
+        for (node, &leader) in leader_by_node.iter().enumerate() {
+            if leader == no_leader {
+                continue;
+            }
+            let group = group_by_leader[leader as usize];
+            let position = cursors[group];
+            analysis.dense_group_members[position] = node;
+            cursors[group] += 1;
+        }
+        for (group, &leader) in group_leaders.iter().enumerate() {
+            let start = analysis.dense_group_starts[group] as usize;
+            let end = start + member_counts[leader] as usize;
+            let members = &mut analysis.dense_group_members[start..end];
+            members.sort_unstable_by_key(|&node| {
+                (node != leader, dense.ir.sections[node].comdat_order)
+            });
+            for &member in members.iter() {
                 ensure!(
                     analysis.group_by_node[member] == usize::MAX,
                     "COFF section belongs to multiple COMDAT groups"
                 );
-                analysis.group_by_node[member] = group_id;
+                analysis.group_by_node[member] = group;
             }
-            analysis.groups.push(group);
         }
-        for node in 0..analysis.keys.len() {
+        for node in 0..section_count {
             if analysis.group_by_node[node] != usize::MAX {
                 continue;
             }
-            let group_id = analysis.groups.len();
+            let group_id = analysis.dense_group_starts.len();
+            analysis.dense_group_starts.push(
+                u32::try_from(analysis.dense_group_members.len())
+                    .context("too many dense COMDAT group members")?,
+            );
             analysis.group_by_node[node] = group_id;
-            analysis.groups.push(vec![node]);
+            analysis.dense_group_members.push(node);
         }
+        analysis.dense_group_starts.push(
+            u32::try_from(analysis.dense_group_members.len())
+                .context("too many dense COMDAT group members")?,
+        );
         Ok(analysis)
+    }
+
+    fn group_count(&self) -> usize {
+        if self.dense_group_starts.is_empty() {
+            self.groups.len()
+        } else {
+            self.dense_group_starts.len() - 1
+        }
+    }
+
+    fn group(&self, group: ComdatGroupId) -> Option<&[SectionNode]> {
+        if self.dense_group_starts.is_empty() {
+            return self.groups.get(group).map(Vec::as_slice);
+        }
+        let start = *self.dense_group_starts.get(group)? as usize;
+        let end = *self.dense_group_starts.get(group + 1)? as usize;
+        self.dense_group_members.get(start..end)
     }
 
     fn node(&self, (object, section): ObjectSectionKey) -> Option<SectionNode> {
@@ -3584,6 +3629,11 @@ struct ComdatResolution {
     discarded: HashSet<ObjectSectionKey>,
     redirects: SectionRedirects,
     analysis: CompactComdatAnalysis,
+    /// Production-only dense decisions. Legacy differential tests deliberately retain the
+    /// object/raw-section maps above; the PE hot path must not round-trip every SectionId through
+    /// those hashes merely to feed dense GC and contribution filtering.
+    dense_discarded: Option<Vec<bool>>,
+    dense_redirect_targets: Option<Vec<pe_ir::SectionId>>,
 }
 
 /// Convert COMDAT analysis directly into dense arrays. CompactComdatAnalysis and PeIr are both
@@ -3591,7 +3641,7 @@ struct ComdatResolution {
 /// analysis node as its SectionId, so a future ordering change fails safely rather than mislinks.
 fn collect_dense_gc(
     dense: &DenseProductionState<'_>,
-    comdats: &ComdatResolution,
+    comdats: &mut ComdatResolution,
     roots: &[Vec<u8>],
 ) -> Result<pe_gc::GcOutput> {
     let mut input_phase = crate::pe_timing_guard!("PE dense GC: Construct direct input");
@@ -3600,7 +3650,7 @@ fn collect_dense_gc(
         .add(crate::timing::PeMetric::Sections, dense.ir.sections.len());
     input_phase.0.add(
         crate::timing::PeMetric::Groups,
-        comdats.analysis.groups.len(),
+        comdats.analysis.group_count(),
     );
     input_phase
         .0
@@ -3611,35 +3661,29 @@ fn collect_dense_gc(
     );
 
     ensure!(
-        comdats.analysis.keys.len() == dense.ir.sections.len(),
+        comdats.analysis.is_comdat.len() == dense.ir.sections.len()
+            && comdats.analysis.group_by_node.len() == dense.ir.sections.len(),
         "COMDAT analysis/dense section cardinality mismatch"
     );
-    let mut redirect_targets = (0..dense.ir.sections.len())
-        .map(|index| pe_ir::SectionId::from_u32(index as u32))
-        .collect::<Vec<_>>();
-    let mut discarded = vec![false; dense.ir.sections.len()];
-    for (node, (&key, section)) in comdats
-        .analysis
-        .keys
-        .iter()
-        .zip(dense.ir.sections.iter())
-        .enumerate()
-    {
-        ensure!(
-            key.0 == section.object.index() && key.1.0 == section.raw_index as usize,
-            "COMDAT analysis node order differs from dense SectionId order"
-        );
-        discarded[node] = comdats.discarded.contains(&key);
-        if let Some(&target) = comdats.redirects.get(&key) {
-            let target_node = comdats
-                .analysis
-                .node(target)
-                .context("COMDAT redirect target has no analysis node")?;
-            redirect_targets[node] = pe_ir::SectionId::from_u32(
-                u32::try_from(target_node).context("redirect target exceeds dense ID range")?,
-            );
-        }
-    }
+    let redirect_targets = comdats
+        .dense_redirect_targets
+        .take()
+        .context("production COMDAT resolution has no dense redirect targets")?;
+    let discarded = comdats
+        .dense_discarded
+        .take()
+        .context("production COMDAT resolution has no dense discard decisions")?;
+    ensure!(
+        redirect_targets.len() == dense.ir.sections.len()
+            && discarded.len() == dense.ir.sections.len(),
+        "COMDAT dense decision cardinality mismatch"
+    );
+    ensure!(
+        redirect_targets
+            .iter()
+            .all(|target| target.index() < dense.ir.sections.len()),
+        "COMDAT dense redirect target is invalid"
+    );
 
     let mut root_names = Vec::with_capacity(roots.len());
     for root in roots {
@@ -3649,9 +3693,13 @@ fn collect_dense_gc(
         }
     }
 
-    let mut groups = Vec::with_capacity(comdats.analysis.groups.len());
+    let mut groups = Vec::with_capacity(comdats.analysis.group_count());
     let mut group_members = Vec::new();
-    for group in &comdats.analysis.groups {
+    for group_id in 0..comdats.analysis.group_count() {
+        let group = comdats
+            .analysis
+            .group(group_id)
+            .context("missing dense COMDAT reachability group")?;
         let start = u32::try_from(group_members.len()).context("too many COMDAT group members")?;
         for &node in group {
             group_members.push(pe_ir::SectionId::from_u32(
@@ -3672,9 +3720,14 @@ fn collect_dense_gc(
         &dense.alternate_targets,
         &dense.resolved_targets,
     );
-    input_phase
-        .0
-        .add(crate::timing::PeMetric::Events, comdats.redirects.len());
+    input_phase.0.add(
+        crate::timing::PeMetric::Events,
+        redirect_targets
+            .iter()
+            .enumerate()
+            .filter(|&(index, target)| index != target.index())
+            .count(),
+    );
     collector.collect_production(pe_gc::ProductionGcInput {
         redirect_targets,
         discarded,
@@ -3773,12 +3826,17 @@ fn dense_comdat_group(
     object: usize,
     primary: object::SectionIndex,
 ) -> Result<CachedComdatGroup> {
-    let leader = analysis
-        .node((object, primary))
+    let leader = dense
+        .ir
+        .section_by_raw(
+            pe_ir::ObjectId::from_u32(
+                u32::try_from(object).context("PE object index exceeds dense ID range")?,
+            ),
+            u32::try_from(primary.0).context("raw section index exceeds dense ID range")?,
+        )
         .context("dense COMDAT leader refers to an invalid section")?;
     let group = analysis
-        .groups
-        .get(analysis.group_by_node[leader])
+        .group(analysis.group_by_node[leader.index()])
         .context("dense COMDAT leader has no reachability group")?;
     let mut sections = Vec::with_capacity(group.len());
     let mut parents = HashMap::with_capacity(group.len());
@@ -3817,6 +3875,17 @@ struct DenseSelectedComdat {
     group: ComdatGroupId,
     selection: linker_utils::coff_symbols::ComdatSelection,
     timestamp: u32,
+}
+
+fn dense_object_section_key(
+    dense: &DenseProductionState<'_>,
+    section: SectionNode,
+) -> ObjectSectionKey {
+    let record = dense.ir.sections[section];
+    (
+        record.object.index(),
+        object::SectionIndex(record.raw_index as usize),
+    )
 }
 
 fn dense_comdat_selection(
@@ -3880,47 +3949,85 @@ fn dense_exact_match_signature(
 fn discard_dense_comdat_group(
     analysis: &CompactComdatAnalysis,
     group: ComdatGroupId,
-    discarded: &mut HashSet<ObjectSectionKey>,
+    discarded: &mut [bool],
 ) {
-    discarded.extend(
-        analysis.groups[group]
-            .iter()
-            .map(|&node| analysis.keys[node]),
-    );
+    for &node in analysis.group(group).unwrap() {
+        discarded[node] = true;
+    }
 }
 
 fn record_dense_comdat_redirects(
-    objects: &[crate::coff::CoffObject<'_>],
     dense: &DenseProductionState<'_>,
     analysis: &CompactComdatAnalysis,
     loser: DenseSelectedComdat,
     winner: DenseSelectedComdat,
     redirects: &mut SectionRedirects,
+    redirect_targets: &mut [pe_ir::SectionId],
 ) -> Result<()> {
-    let loser_record = dense.ir.sections[loser.primary.index()];
-    let winner_record = dense.ir.sections[winner.primary.index()];
-    let loser_group = dense_comdat_group(
-        dense,
-        analysis,
-        loser_record.object.index(),
-        object::SectionIndex(loser_record.raw_index as usize),
-    )?;
-    let winner_group = dense_comdat_group(
-        dense,
-        analysis,
-        winner_record.object.index(),
-        object::SectionIndex(winner_record.raw_index as usize),
-    )?;
-    record_comdat_redirects(
-        objects,
-        loser_record.object.index(),
-        &loser_group.sections,
-        &loser_group.parents,
-        winner_record.object.index(),
-        &winner_group.sections,
-        &winner_group.parents,
-        redirects,
+    let loser_group = analysis
+        .group(loser.group)
+        .context("missing losing dense COMDAT group")?;
+    let winner_group = analysis
+        .group(winner.group)
+        .context("missing winning dense COMDAT group")?;
+    let Some((&loser_primary, loser_children)) = loser_group.split_first() else {
+        return Err(error!("empty losing COMDAT group"));
+    };
+    let Some((&winner_primary, winner_children)) = winner_group.split_first() else {
+        return Err(error!("empty winning COMDAT group"));
+    };
+    ensure!(
+        loser_primary == loser.primary.index() && winner_primary == winner.primary.index(),
+        "dense COMDAT group leader order is inconsistent"
     );
+    let winner_primary = pe_ir::SectionId::from_u32(
+        u32::try_from(winner_primary).context("winning COMDAT section exceeds dense ID range")?,
+    );
+    redirect_targets[loser_primary] = winner_primary;
+    redirects.insert(
+        dense_object_section_key(dense, loser_primary),
+        dense_object_section_key(dense, winner_primary.index()),
+    );
+
+    // Match associative children by canonical section name and already-mapped direct parent.
+    // Processing parents before children preserves nested topology, while unmatched loser-only
+    // associates remain discarded without acquiring a redirect, matching link.exe/lld-link.
+    let mut winner_used = vec![false; winner_children.len()];
+    let mut pending = loser_children.to_vec();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|&loser_node| {
+            let Some(loser_parent) = dense.ir.sections[loser_node].associative_section.get() else {
+                return false;
+            };
+            let mapped_parent = redirect_targets[loser_parent.index()];
+            let loser_name = dense.ir.sections[loser_node].name;
+            let Some((position, &winner_node)) =
+                winner_children
+                    .iter()
+                    .enumerate()
+                    .find(|&(position, &winner_node)| {
+                        !winner_used[position]
+                            && dense.ir.sections[winner_node].associative_section.get()
+                                == Some(mapped_parent)
+                            && dense.ir.sections[winner_node].name == loser_name
+                    })
+            else {
+                return false;
+            };
+            winner_used[position] = true;
+            let winner_section = pe_ir::SectionId::from_u32(winner_node as u32);
+            redirect_targets[loser_node] = winner_section;
+            redirects.insert(
+                dense_object_section_key(dense, loser_node),
+                dense_object_section_key(dense, winner_node),
+            );
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -3952,10 +4059,10 @@ fn discarded_dense_comdat_sections(
     }
     classify_phase
         .0
-        .add(crate::timing::PeMetric::Sections, analysis.keys.len());
+        .add(crate::timing::PeMetric::Sections, analysis.is_comdat.len());
     classify_phase
         .0
-        .add(crate::timing::PeMetric::Groups, analysis.groups.len());
+        .add(crate::timing::PeMetric::Groups, analysis.group_count());
     classify_phase.0.add(
         crate::timing::PeMetric::Symbols,
         dense.ir.global_symbols.len(),
@@ -3964,8 +4071,15 @@ fn discarded_dense_comdat_sections(
 
     let mut selection_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_SELECT);
     let mut selected = vec![None::<DenseSelectedComdat>; dense.names.len()];
+    let section_count = analysis.is_comdat.len();
     let mut resolution = ComdatResolution {
         analysis,
+        dense_discarded: Some(vec![false; section_count]),
+        dense_redirect_targets: Some(
+            (0..section_count)
+                .map(|index| pe_ir::SectionId::from_u32(index as u32))
+                .collect(),
+        ),
         ..ComdatResolution::default()
     };
     for (node, section) in dense.ir.sections.iter().enumerate() {
@@ -3988,7 +4102,11 @@ fn discarded_dense_comdat_sections(
             .context("global COMDAT leader has no canonical bytes")?;
         let group = resolution.analysis.group_by_node[node];
         if strong_definitions[leader.name.index()] {
-            discard_dense_comdat_group(&resolution.analysis, group, &mut resolution.discarded);
+            discard_dense_comdat_group(
+                &resolution.analysis,
+                group,
+                resolution.dense_discarded.as_mut().unwrap(),
+            );
             continue;
         }
         let selection = dense_comdat_selection(section.comdat_selection, name)?;
@@ -4043,30 +4161,30 @@ fn discarded_dense_comdat_sections(
                 discard_dense_comdat_group(
                     &resolution.analysis,
                     candidate.group,
-                    &mut resolution.discarded,
+                    resolution.dense_discarded.as_mut().unwrap(),
                 );
                 record_dense_comdat_redirects(
-                    objects,
                     dense,
                     &resolution.analysis,
                     candidate,
                     existing,
                     &mut resolution.redirects,
+                    resolution.dense_redirect_targets.as_mut().unwrap(),
                 )?;
             }
             ComdatDecision::ReplaceExisting => {
                 discard_dense_comdat_group(
                     &resolution.analysis,
                     existing.group,
-                    &mut resolution.discarded,
+                    resolution.dense_discarded.as_mut().unwrap(),
                 );
                 record_dense_comdat_redirects(
-                    objects,
                     dense,
                     &resolution.analysis,
                     existing,
                     candidate,
                     &mut resolution.redirects,
+                    resolution.dense_redirect_targets.as_mut().unwrap(),
                 )?;
                 selected[leader.name.index()] = Some(candidate);
             }
@@ -4078,7 +4196,13 @@ fn discarded_dense_comdat_sections(
     );
     selection_phase.0.add(
         crate::timing::PeMetric::Sections,
-        resolution.discarded.len(),
+        resolution
+            .dense_discarded
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|&&discarded| discarded)
+            .count(),
     );
     selection_phase
         .0
