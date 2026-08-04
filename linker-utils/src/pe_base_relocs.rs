@@ -6,8 +6,7 @@
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use rayon::prelude::*;
 
 const PAGE_SIZE: u32 = 0x1000;
 const BLOCK_HEADER_SIZE: usize = 8;
@@ -29,19 +28,27 @@ pub fn build_amd64_base_relocation_table(
     dir64_rvas: impl IntoIterator<Item = u32>,
     size_of_image: u32,
 ) -> Result<Vec<u8>> {
-    let mut pages = BTreeMap::<u32, BTreeSet<u16>>::new();
-
+    let mut rvas = Vec::new();
     for rva in dir64_rvas {
         validate_dir64_bounds(rva, size_of_image)?;
-        let page_rva = rva & !(PAGE_SIZE - 1);
-        let page_offset = u16::try_from(rva - page_rva)
-            .map_err(|_| anyhow::anyhow!("base relocation page offset does not fit in u16"))?;
-        debug_assert!(page_offset < PAGE_SIZE as u16);
-        pages.entry(page_rva).or_default().insert(page_offset);
+        rvas.push(rva);
     }
+    if rvas.len() >= 8192 && rayon::current_num_threads() > 1 {
+        rvas.par_sort_unstable();
+    } else {
+        rvas.sort_unstable();
+    }
+    rvas.dedup();
 
-    let mut output = Vec::new();
-    for (page_rva, offsets) in &pages {
+    let mut output = Vec::with_capacity(rvas.len().saturating_mul(ENTRY_SIZE));
+    let mut start = 0usize;
+    while start < rvas.len() {
+        let page_rva = rvas[start] & !(PAGE_SIZE - 1);
+        let mut end = start + 1;
+        while end < rvas.len() && rvas[end] & !(PAGE_SIZE - 1) == page_rva {
+            end += 1;
+        }
+        let offsets = &rvas[start..end];
         let needs_padding = offsets.len() % 2 != 0;
         let entry_count = offsets
             .len()
@@ -59,13 +66,17 @@ pub fn build_amd64_base_relocation_table(
 
         output.extend_from_slice(&page_rva.to_le_bytes());
         output.extend_from_slice(&block_size.to_le_bytes());
-        for offset in offsets.iter().copied() {
+        for rva in offsets.iter().copied() {
+            let offset = u16::try_from(rva - page_rva)
+                .map_err(|_| anyhow::anyhow!("base relocation page offset does not fit in u16"))?;
+            debug_assert!(offset < PAGE_SIZE as u16);
             let entry = (IMAGE_REL_BASED_DIR64 << 12) | offset;
             output.extend_from_slice(&entry.to_le_bytes());
         }
         if needs_padding {
             output.extend_from_slice(&IMAGE_REL_BASED_ABSOLUTE.to_le_bytes());
         }
+        start = end;
     }
 
     Ok(output)
