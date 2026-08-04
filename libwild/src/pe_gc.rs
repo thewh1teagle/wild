@@ -410,12 +410,12 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         }
 
         let mut live_bits = vec![0u64; section_count.div_ceil(64)];
-        let mut visitation_order = Vec::new();
         let mut pending = VecDeque::new();
+        let mut visited_sections = 0usize;
         let mark = |section: SectionId,
                     live_bits: &mut [u64],
                     pending: &mut VecDeque<SectionId>,
-                    visitation_order: &mut Vec<SectionId>|
+                    visited_sections: &mut usize|
          -> Result<()> {
             let canonical = *input
                 .redirect_targets
@@ -429,11 +429,10 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             if live_bits[word] & mask == 0 {
                 live_bits[word] |= mask;
                 pending.push_back(canonical);
-                visitation_order.push(canonical);
+                *visited_sections += 1;
             }
             Ok(())
         };
-        let mut referenced_imports = BTreeSet::new();
         let mut referenced_import_names = BTreeSet::new();
         for (index, &is_comdat) in input.is_comdat.iter().enumerate() {
             if !is_comdat {
@@ -441,7 +440,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     SectionId::from_u32(index as u32),
                     &mut live_bits,
                     &mut pending,
-                    &mut visitation_order,
+                    &mut visited_sections,
                 )?;
             }
         }
@@ -451,19 +450,17 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     .name(name)
                     .context("GC root name is outside resolved namespace")?,
             )?;
-            if let Some(import) = target.import {
-                referenced_imports.insert(import);
-            }
             if let Some(name) = target.import_name {
                 referenced_import_names.insert(name);
             }
             if let Some(section) = target.section {
-                mark(section, &mut live_bits, &mut pending, &mut visitation_order)?;
+                mark(section, &mut live_bits, &mut pending, &mut visited_sections)?;
             }
         }
 
         let mut traversal_phase = crate::pe_timing_guard!("PE dense GC: Traverse resolved CSR");
-        let mut dir64_needs = Vec::new();
+        let instrumentation_enabled = traversal_phase.0.enabled();
+        let mut relocation_count = 0usize;
         while let Some(section) = pending.pop_front() {
             let group = group_by_section[section.index()];
             if group != u32::MAX {
@@ -471,7 +468,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                 let start = group.member_start as usize;
                 let end = start + group.member_len as usize;
                 for &member in &input.group_members[start..end] {
-                    mark(member, &mut live_bits, &mut pending, &mut visitation_order)?;
+                    mark(member, &mut live_bits, &mut pending, &mut visited_sections)?;
                 }
             }
             let mut child = associative_heads[section.index()];
@@ -480,49 +477,38 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     SectionId::from_u32(child),
                     &mut live_bits,
                     &mut pending,
-                    &mut visitation_order,
+                    &mut visited_sections,
                 )?;
                 child = associative_next[child as usize];
             }
-            for relocation in self
+            let relocations = self
                 .ir
                 .relocations
                 .for_section(section)
-                .context("live section has no relocation CSR row")?
-            {
+                .context("live section has no relocation CSR row")?;
+            if instrumentation_enabled {
+                relocation_count += relocations.len();
+            }
+            for relocation in relocations {
                 let target = Self::unpack_symbol_target(resolved, relocation.target)?;
-                if relocation.typ == 1 && !target.absolute {
-                    dir64_needs.push(Dir64Need {
-                        section,
-                        offset: relocation.offset,
-                    });
-                }
-                if let Some(import) = target.import {
-                    referenced_imports.insert(import);
-                }
                 if let Some(name) = target.import_name {
                     referenced_import_names.insert(name);
                 }
                 if let Some(target) = target.section {
-                    mark(target, &mut live_bits, &mut pending, &mut visitation_order)?;
+                    mark(target, &mut live_bits, &mut pending, &mut visited_sections)?;
                 }
             }
         }
-        if traversal_phase.0.enabled() {
-            let relocation_count = visitation_order
-                .iter()
-                .filter_map(|&section| self.ir.relocations.for_section(section))
-                .map(<[RelocationRecord]>::len)
-                .sum();
+        if instrumentation_enabled {
             traversal_phase
                 .0
-                .add(crate::timing::PeMetric::Sections, visitation_order.len());
+                .add(crate::timing::PeMetric::Sections, visited_sections);
             traversal_phase
                 .0
                 .add(crate::timing::PeMetric::Relocations, relocation_count);
             traversal_phase
                 .0
-                .add(crate::timing::PeMetric::QueuePushes, visitation_order.len());
+                .add(crate::timing::PeMetric::QueuePushes, visited_sections);
             traversal_phase.0.add(
                 crate::timing::PeMetric::Imports,
                 referenced_import_names.len(),
@@ -532,10 +518,12 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             live_bits: live_bits.into_boxed_slice(),
             canonical_sections: input.redirect_targets.into_boxed_slice(),
             redirects: redirects.into_boxed_slice(),
-            visitation_order: visitation_order.into_boxed_slice(),
-            referenced_imports: referenced_imports.into_iter().collect(),
+            // Production consumers use only dense liveness and canonical import names. These
+            // compatibility snapshots remain populated by the general event collector below.
+            visitation_order: Box::new([]),
+            referenced_imports: Box::new([]),
             referenced_import_names: referenced_import_names.into_iter().collect(),
-            dir64_needs: dir64_needs.into_boxed_slice(),
+            dir64_needs: Box::new([]),
         })
     }
 }
