@@ -551,6 +551,53 @@ fn parsed_archives<'session, 'data>(
         .collect()
 }
 
+/// Parse and summarize regular archive members with archive-wide parallelism before the ordered
+/// extraction loop starts. Selection remains lazy and deterministic: failures are retained in
+/// their member slot and are reported only if that member is actually selected. The cache grows
+/// incrementally when a later default-library wave appends archives.
+#[inline(never)]
+fn prepare_archive_objects<'data>(
+    archives: &[&CoffArchive<'data>],
+    prepared: &mut Vec<Vec<Option<Result<crate::coff::CoffObject<'data>>>>>,
+) {
+    let first = prepared.len();
+    if first == archives.len() {
+        return;
+    }
+    let mut phase = crate::pe_timing_guard!("PE archive: Precompute resolver summaries");
+    phase
+        .0
+        .add(crate::timing::PeMetric::Archives, archives.len() - first);
+    let chunks = archives[first..]
+        .par_iter()
+        .map(|archive| {
+            archive
+                .members()
+                .par_iter()
+                .map(|member| match member.kind() {
+                    CoffArchiveMemberKind::CoffObject { .. } => Some(
+                        crate::coff::CoffObject::parse(member.data()).and_then(|object| {
+                            object.resolver_summary()?;
+                            Ok(object)
+                        }),
+                    ),
+                    CoffArchiveMemberKind::ShortImport(_) | CoffArchiveMemberKind::Opaque => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if phase.0.enabled() {
+        phase.0.add(
+            crate::timing::PeMetric::Objects,
+            chunks
+                .iter()
+                .map(|members| members.iter().filter(|member| member.is_some()).count())
+                .sum(),
+        );
+    }
+    prepared.extend(chunks);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArchiveProvider {
     archive: ArchiveId,
@@ -659,6 +706,7 @@ impl ArchiveProviderCache {
 
 pub(super) struct ResolverSession<'data> {
     archives: Vec<LazyArchive<'data>>,
+    prepared_archive_objects: Vec<Vec<Option<Result<crate::coff::CoffObject<'data>>>>>,
     whole_archive: Vec<bool>,
     extracted: HashSet<(usize, usize)>,
     import_definitions: BTreeSet<Vec<u8>>,
@@ -673,6 +721,7 @@ impl<'data> ResolverSession<'data> {
     pub(super) fn new() -> Self {
         Self {
             archives: Vec::new(),
+            prepared_archive_objects: Vec::new(),
             whole_archive: Vec::new(),
             extracted: HashSet::new(),
             import_definitions: BTreeSet::new(),
@@ -775,6 +824,13 @@ impl<'data> ResolverSession<'data> {
             .0
             .add(crate::timing::PeMetric::Names, roots.len());
         let archives = parsed_archives(&self.archives)?;
+        // Full-set speculation pays only when many independent libraries provide enough parallel
+        // selection work. Keep smaller links on the original lazy member path, including inside
+        // the extraction loop, rather than making every selected member probe an empty cache.
+        const EAGER_ARCHIVE_SUMMARY_MIN_ARCHIVES: usize = 128;
+        if archives.len() >= EAGER_ARCHIVE_SUMMARY_MIN_ARCHIVES {
+            prepare_archive_objects(&archives, &mut self.prepared_archive_objects);
+        }
         self.symbol_state.add_roots(roots);
         for (index, object) in objects.iter().enumerate().skip(self.scanned_objects) {
             let absorb_phase = crate::timing_guard!(super::PE_DETAIL_ABSORB_SELECTED_SYMBOLS);
@@ -811,6 +867,7 @@ impl<'data> ResolverSession<'data> {
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
                 &mut self.archive_providers,
+                &mut self.prepared_archive_objects,
                 false,
             )?;
             self.scanned_objects = objects.len();
@@ -829,6 +886,7 @@ impl<'data> ResolverSession<'data> {
                 &mut self.symbol_state,
                 &mut self.selected_aliases,
                 &mut self.archive_providers,
+                &mut self.prepared_archive_objects,
                 true,
             )?;
             self.scanned_objects = objects.len();
@@ -902,6 +960,7 @@ fn extract_pass<'data>(
     symbol_state: &mut IncrementalSymbolState<'data>,
     selected_aliases: &mut Vec<(usize, usize)>,
     archive_providers: &mut ArchiveProviderCache,
+    prepared_archive_objects: &mut [Vec<Option<Result<crate::coff::CoffObject<'data>>>>],
     use_alternates: bool,
 ) -> Result<bool> {
     let mut pass_phase = crate::pe_timing_guard!("PE archive: Extraction pass");
@@ -932,6 +991,7 @@ fn extract_pass<'data>(
                 selected_imports,
                 symbol_state,
                 selected_aliases,
+                prepared_archive_objects,
             )?;
         }
         pass_phase
@@ -1015,6 +1075,7 @@ fn extract_pass<'data>(
             selected_imports,
             symbol_state,
             selected_aliases,
+            prepared_archive_objects,
         )?;
     }
     pass_phase
@@ -1045,6 +1106,7 @@ fn process_selected_members<'data>(
     selected_imports: &mut Vec<ShortImportObject<'data>>,
     symbol_state: &mut IncrementalSymbolState<'data>,
     selected_aliases: &mut Vec<(usize, usize)>,
+    prepared_archive_objects: &mut [Vec<Option<Result<crate::coff::CoffObject<'data>>>>],
 ) -> Result<bool> {
     let mut changed = false;
     for member in selected {
@@ -1057,7 +1119,16 @@ fn process_selected_members<'data>(
         crate::perf::removal_counters::increment_selected_members();
         match member.kind() {
             CoffArchiveMemberKind::CoffObject { .. } => {
-                let object = crate::coff::CoffObject::parse(member.data()).with_context(|| {
+                let object = if prepared_archive_objects.is_empty() {
+                    crate::coff::CoffObject::parse(member.data())
+                } else {
+                    prepared_archive_objects
+                        .get_mut(archive_index)
+                        .and_then(|members| members.get_mut(member.index()))
+                        .and_then(Option::take)
+                        .unwrap_or_else(|| crate::coff::CoffObject::parse(member.data()))
+                }
+                .with_context(|| {
                     format!(
                         "invalid COFF archive member `{}`",
                         String::from_utf8_lossy(member.name())
@@ -2153,12 +2224,15 @@ mod tests {
     }
 
     fn extraction_signature(threads: usize) -> (Vec<Vec<Vec<u8>>>, BTreeSet<Vec<u8>>) {
+        // Keep this at the production eager-preparation threshold so the parallel cache path,
+        // not only the small-link lazy path, is covered by the thread-count determinism check.
+        const ARCHIVE_COUNT: usize = 128;
         let root = coff_object(&[], &["sym0"]);
-        let libraries = (0..8)
+        let libraries = (0..ARCHIVE_COUNT)
             .rev()
             .map(|index| {
                 let definition = format!("sym{index}");
-                let undefined = (index < 7).then(|| format!("sym{}", index + 1));
+                let undefined = (index + 1 < ARCHIVE_COUNT).then(|| format!("sym{}", index + 1));
                 archive(&[(
                     "member.o",
                     coff_object(
