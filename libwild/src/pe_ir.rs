@@ -17,6 +17,7 @@ use crate::coff::CoffObject;
 use crate::error::Result;
 use rayon::prelude::*;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Range;
 
 macro_rules! dense_id {
@@ -439,13 +440,20 @@ struct DenseObjectOffsets {
     relocation: u32,
 }
 
-struct DenseObjectChunk {
+struct DenseObjectResult {
     object: ObjectRecord,
-    sections: Vec<SectionRecord>,
-    symbols: Vec<SymbolRecord>,
     globals: Vec<SymbolId>,
-    relocation_starts: Vec<u32>,
-    relocations: Vec<RelocationRecord>,
+}
+
+struct DenseObjectDestination<'a> {
+    object_index: usize,
+    object: &'a CoffObject<'a>,
+    offsets: DenseObjectOffsets,
+    local_names: &'a [NameId],
+    sections: &'a mut [MaybeUninit<SectionRecord>],
+    symbols: &'a mut [MaybeUninit<SymbolRecord>],
+    relocation_starts: &'a mut [MaybeUninit<u32>],
+    relocations: &'a mut [MaybeUninit<RelocationRecord>],
 }
 
 impl<'data> PeIr<'data> {
@@ -667,34 +675,83 @@ impl<'data> PeIr<'data> {
             name_end == occurrence_names.len(),
             "Selected COFF name prefix does not match canonical occurrences"
         );
-        let chunks = objects
-            .par_iter()
-            .zip(offsets.par_iter().copied())
-            .enumerate()
-            .map(|(object_index, (object, offsets))| {
-                build_dense_object_chunk(object_index, object, offsets, &occurrence_names)
-            })
+        // Allocate the final flat arrays once. Deterministic prefix ranges are disjoint, so each
+        // object can populate its final slots directly instead of allocating a local chunk and
+        // copying that chunk again during the ordered merge.
+        let mut sections = Box::<[SectionRecord]>::new_uninit_slice(section_count);
+        let mut symbols = Box::<[SymbolRecord]>::new_uninit_slice(symbol_count);
+        let mut starts = Box::<[u32]>::new_uninit_slice(section_count.saturating_add(1));
+        starts[0].write(0);
+        let mut relocations = Box::<[RelocationRecord]>::new_uninit_slice(relocation_end as usize);
+        let mut destinations = Vec::with_capacity(objects.len());
+        let mut section_tail = &mut sections[..];
+        let mut symbol_tail = &mut symbols[..];
+        let mut start_tail = &mut starts[1..];
+        let mut relocation_tail = &mut relocations[..];
+        for (object_index, (object, offsets)) in
+            objects.iter().zip(offsets.iter().copied()).enumerate()
+        {
+            let index = object.index();
+            let section_len = index.sections().len();
+            let symbol_len = index.symbols().len();
+            let relocation_len = index
+                .sections()
+                .iter()
+                .map(|section| index.relocations(section).len())
+                .sum();
+            let (object_sections, remaining_sections) = section_tail.split_at_mut(section_len);
+            section_tail = remaining_sections;
+            let (object_symbols, remaining_symbols) = symbol_tail.split_at_mut(symbol_len);
+            symbol_tail = remaining_symbols;
+            let (object_starts, remaining_starts) = start_tail.split_at_mut(section_len);
+            start_tail = remaining_starts;
+            let (object_relocations, remaining_relocations) =
+                relocation_tail.split_at_mut(relocation_len);
+            relocation_tail = remaining_relocations;
+            let local_names = occurrence_names
+                .get(offsets.name..offsets.name + index.names().len())
+                .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
+            destinations.push(DenseObjectDestination {
+                object_index,
+                object,
+                offsets,
+                local_names,
+                sections: object_sections,
+                symbols: object_symbols,
+                relocation_starts: object_starts,
+                relocations: object_relocations,
+            });
+        }
+        crate::ensure!(
+            section_tail.is_empty()
+                && symbol_tail.is_empty()
+                && start_tail.is_empty()
+                && relocation_tail.is_empty(),
+            "Selected COFF dense destination prefix mismatch"
+        );
+        let results = destinations
+            .into_par_iter()
+            .map(build_dense_object_direct)
             .collect::<Vec<_>>();
         let mut object_records = Vec::with_capacity(objects.len());
-        let mut sections = Vec::with_capacity(section_count);
-        let mut symbols = Vec::with_capacity(symbol_count);
         let mut global_symbols = Vec::with_capacity(globals.len());
-        let mut starts = Vec::with_capacity(section_count.saturating_add(1));
-        starts.push(0);
-        let mut relocations = Vec::with_capacity(relocation_end as usize);
-        for chunk in chunks {
-            let mut chunk = chunk?;
-            object_records.push(chunk.object);
-            sections.append(&mut chunk.sections);
-            symbols.append(&mut chunk.symbols);
-            global_symbols.append(&mut chunk.globals);
-            starts.append(&mut chunk.relocation_starts);
-            relocations.append(&mut chunk.relocations);
+        for result in results {
+            let mut result = result?;
+            object_records.push(result.object);
+            global_symbols.append(&mut result.globals);
         }
 
+        // Every final slot belongs to exactly one destination above, and successful workers have
+        // written every slot in their ranges. If any worker failed, `?` returned before reaching
+        // these conversions and dropping the remaining `MaybeUninit` storage was harmless.
+        let sections = unsafe { sections.assume_init() };
+        let symbols = unsafe { symbols.assume_init() };
+        let starts = unsafe { starts.assume_init() };
+        let relocations = unsafe { relocations.assume_init() };
+
         let relocations = RelocationCsr {
-            starts: starts.into_boxed_slice(),
-            records: relocations.into_boxed_slice(),
+            starts,
+            records: relocations,
         };
         records_phase.0.add(
             crate::timing::PeMetric::Relocations,
@@ -715,8 +772,8 @@ impl<'data> PeIr<'data> {
             sources,
             names: names.into_boxed_slice(),
             objects: object_records.into_boxed_slice(),
-            sections: sections.into_boxed_slice(),
-            symbols: symbols.into_boxed_slice(),
+            sections,
+            symbols,
             global_symbols: global_symbols.into_boxed_slice(),
             relocations,
         };
@@ -759,23 +816,25 @@ impl<'data> PeIr<'data> {
     }
 }
 
-fn build_dense_object_chunk(
-    object_index: usize,
-    object: &CoffObject<'_>,
-    offsets: DenseObjectOffsets,
-    occurrence_names: &[NameId],
-) -> Result<DenseObjectChunk> {
+fn build_dense_object_direct(destination: DenseObjectDestination<'_>) -> Result<DenseObjectResult> {
+    let DenseObjectDestination {
+        object_index,
+        object,
+        offsets,
+        local_names,
+        sections,
+        symbols,
+        relocation_starts,
+        relocations,
+    } = destination;
     let object_id = ObjectId::from_u32(as_u32(object_index, "selected object")?);
     let index = object.index();
-    let local_names = occurrence_names
-        .get(offsets.name..offsets.name + index.names().len())
-        .ok_or_else(|| crate::error!("Missing selected COFF name occurrence mapping"))?;
-    let mut sections = Vec::with_capacity(index.sections().len());
-    let mut symbols = Vec::with_capacity(index.symbols().len());
     let mut globals = Vec::new();
-    let mut relocation_starts = Vec::with_capacity(index.sections().len());
-    let mut relocations = Vec::new();
-    for section in index.sections() {
+    let mut relocation_position = 0usize;
+    for (section_slot, (start_slot, section)) in sections
+        .iter_mut()
+        .zip(relocation_starts.iter_mut().zip(index.sections()))
+    {
         let data = section.data_range.map(|range| SourceRange {
             file: FileId::from_u32(object_id.get()),
             start: range.start,
@@ -800,7 +859,7 @@ fn build_dense_object_chunk(
                     .ok_or_else(|| crate::error!("Selected COFF COMDAT leader ID overflow"))?,
             )
         };
-        sections.push(SectionRecord {
+        section_slot.write(SectionRecord {
             object: object_id,
             raw_index: as_u32(section.index.0, "raw COFF section")?,
             name: local_names[section.name.0 as usize],
@@ -817,7 +876,10 @@ fn build_dense_object_chunk(
             comdat_order: section.comdat_order,
         });
         for relocation in index.relocations(section) {
-            relocations.push(RelocationRecord {
+            let slot = relocations
+                .get_mut(relocation_position)
+                .ok_or_else(|| crate::error!("Selected COFF relocation destination overflow"))?;
+            slot.write(RelocationRecord {
                 offset: relocation.offset,
                 target: SymbolId::from_u32(
                     offsets
@@ -830,15 +892,21 @@ fn build_dense_object_chunk(
                 typ: relocation.typ,
                 flags: 0,
             });
+            relocation_position += 1;
         }
-        relocation_starts.push(
+        start_slot.write(
             offsets
                 .relocation
-                .checked_add(as_u32(relocations.len(), "selected relocation")?)
+                .checked_add(as_u32(relocation_position, "selected relocation")?)
                 .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?,
         );
     }
-    for (local_symbol, symbol) in index.symbols().iter().enumerate() {
+    crate::ensure!(
+        relocation_position == relocations.len(),
+        "Selected COFF relocation destination underflow"
+    );
+    for (local_symbol, (symbol_slot, symbol)) in symbols.iter_mut().zip(index.symbols()).enumerate()
+    {
         let section = symbol
             .shape
             .as_ref()
@@ -872,7 +940,7 @@ fn build_dense_object_chunk(
                     .ok_or_else(|| crate::error!("Selected global symbol ID overflow"))?,
             ));
         }
-        symbols.push(SymbolRecord {
+        symbol_slot.write(SymbolRecord {
             object: object_id,
             raw_index: symbol.raw_index,
             name: symbol
@@ -893,18 +961,14 @@ fn build_dense_object_chunk(
             },
         });
     }
-    Ok(DenseObjectChunk {
+    Ok(DenseObjectResult {
         object: ObjectRecord {
             file: FileId::from_u32(as_u32(object_index, "source file")?),
             sections: DenseRange::new(offsets.section, as_u32(sections.len(), "selected section")?),
             symbols: DenseRange::new(offsets.symbol, as_u32(symbols.len(), "selected symbol")?),
             input_ordinal: as_u32(object_index, "input ordinal")?,
         },
-        sections,
-        symbols,
         globals,
-        relocation_starts,
-        relocations,
     })
 }
 
