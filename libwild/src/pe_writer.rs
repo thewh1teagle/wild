@@ -103,7 +103,7 @@ const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
 const LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK: usize = 64;
 #[cfg(test)]
 const LIVE_IMPORT_CHUNKS_PER_THREAD: usize = 4;
-const DIRECT_OUTPUT_MIN_SIZE: usize = 1024 * 1024;
+#[cfg(test)]
 const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
 
 #[inline]
@@ -230,8 +230,35 @@ struct Dir64Site {
     offset: u32,
 }
 
-struct BuiltImage {
-    bytes: Vec<u8>,
+trait ImageBytes {
+    fn bytes(&self) -> &[u8];
+    fn bytes_mut(&mut self) -> &mut [u8];
+}
+
+impl ImageBytes for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+struct OutputImage<O: OutputFileData>(O);
+
+impl<O: OutputFileData> ImageBytes for OutputImage<O> {
+    fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.0.bytes_mut()
+    }
+}
+
+struct BuiltImage<B = Vec<u8>> {
+    bytes: B,
     exports: Vec<ResolvedExport>,
     pending_repro_build_id: Option<PendingReproBuildId>,
 }
@@ -283,19 +310,22 @@ impl PendingReproBuildId {
     }
 }
 
-impl BuiltImage {
+impl<B: ImageBytes> BuiltImage<B> {
     fn finalize_repro_build_id(&mut self) -> Result<()> {
         let Some(pending) = self.pending_repro_build_id.as_ref() else {
             return Ok(());
         };
         let build_id_phase = crate::timing_guard!(PE_DETAIL_DEBUG_BUILD_ID);
-        let build_id = pending.compute(&self.bytes)?;
-        pending.patch(&mut self.bytes, &build_id);
+        let build_id = pending.compute(self.bytes.bytes())?;
+        pending.patch(self.bytes.bytes_mut(), &build_id);
         drop(build_id_phase);
         self.pending_repro_build_id = None;
         Ok(())
     }
+}
 
+#[cfg(test)]
+impl BuiltImage<Vec<u8>> {
     fn copy_to(&mut self, output: &mut [u8]) -> Result<()> {
         ensure!(
             output.len() == self.bytes.len(),
@@ -418,6 +448,12 @@ pub(crate) fn link<F: FileSystem>(
             .and_then(|name| name.to_str())
             .context("PE output file name is not valid UTF-8")?
     };
+    let output_path = args.common.output.clone();
+    let output_replacement_mode = args
+        .common
+        .file_replacement_mode
+        .unwrap_or(FileReplacementMode::UnlinkAndReplace);
+    let output_write_mode = args.common.file_write_mode;
     let mut image = build_image_with_delay_loads(
         &objects,
         Some(&dense),
@@ -432,38 +468,42 @@ pub(crate) fn link<F: FileSystem>(
         &runtime_resolution,
         &delay_load_dlls,
         &roots,
+        |size| {
+            let mut output = fs.create_output(
+                output_path,
+                OutputOptions {
+                    size: size as u64,
+                    file_replacement_mode: output_replacement_mode,
+                    write_mode: output_write_mode,
+                },
+            )?;
+            if !matches!(
+                output_replacement_mode,
+                FileReplacementMode::UnlinkAndReplace
+            ) {
+                output.bytes_mut().fill(0);
+            }
+            Ok(OutputImage(output))
+        },
     )?;
     {
         let mut write_phase = crate::pe_timing_guard!(PE_PHASE_WRITE_OUTPUT);
         write_phase
             .0
-            .add(crate::timing::PeMetric::Bytes, image.bytes.len());
+            .add(crate::timing::PeMetric::Bytes, image.bytes.bytes().len());
         write_phase
             .0
             .add(crate::timing::PeMetric::Events, image.exports.len());
-        let output_options = OutputOptions {
-            size: image.bytes.len() as u64,
-            file_replacement_mode: args
-                .common
-                .file_replacement_mode
-                .unwrap_or(FileReplacementMode::UnlinkAndReplace),
-            write_mode: args.common.file_write_mode,
-        };
-        if image.bytes.len() >= DIRECT_OUTPUT_MIN_SIZE
-            && !matches!(
-                args.common.file_write_mode,
-                Some(crate::fs::FileWriteMode::Mmap)
-            )
-        {
-            image.finalize_repro_build_id()?;
-            fs.write_output_bytes(args.common.output.clone(), output_options, &image.bytes)?;
-        } else {
-            let mut output = fs.create_output(args.common.output.clone(), output_options)?;
-            image.copy_to(output.bytes_mut())?;
-            output.finish()?;
-        }
-        if !image.exports.is_empty() {
-            write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
+        image.finalize_repro_build_id()?;
+        let BuiltImage {
+            bytes: OutputImage(output),
+            exports: resolved_exports,
+            pending_repro_build_id,
+        } = image;
+        debug_assert!(pending_repro_build_id.is_none());
+        output.finish()?;
+        if !resolved_exports.is_empty() {
+            write_import_library(fs, args, dll_name.as_bytes(), &exports, &resolved_exports)?;
         }
     }
     Ok(crate::LinkerOutput { layout: None })
@@ -1872,12 +1912,13 @@ fn build_image(
         runtime_resolution,
         &args.delay_load_dlls,
         &[],
+        |size| Ok(vec![0; size]),
     )?;
     image.finalize_repro_build_id()?;
     Ok(image)
 }
 
-fn build_image_with_delay_loads(
+fn build_image_with_delay_loads<B: ImageBytes>(
     objects: &[crate::coff::CoffObject<'_>],
     dense: Option<&DenseProductionState<'_>>,
     symbol_metadata: &SelectedObjectMetadata,
@@ -1891,7 +1932,8 @@ fn build_image_with_delay_loads(
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
     delay_load_dlls: &[String],
     selected_roots: &[Vec<u8>],
-) -> Result<BuiltImage> {
+    allocate_image: impl FnOnce(usize) -> Result<B>,
+) -> Result<BuiltImage<B>> {
     let (mut imports, mut delay_imports) =
         pe_imports::partition_delay_imports(imports.to_vec(), delay_load_dlls);
     // Retained only for the cfg(test) legacy differential path; production import liveness comes
@@ -2382,7 +2424,12 @@ fn build_image_with_delay_loads(
         .0
         .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
     count_pe_hot_allocation();
-    let mut image = vec![0; layout.file_size as usize];
+    let mut image_storage = allocate_image(layout.file_size as usize)?;
+    ensure!(
+        image_storage.bytes().len() == layout.file_size as usize,
+        "allocated PE image has an unexpected size"
+    );
+    let image = image_storage.bytes_mut();
     drop(image_allocate_phase);
     let mut image_copy_phase = crate::pe_timing_guard!(PE_DETAIL_IMAGE_COPY);
     image_copy_phase
@@ -2448,7 +2495,7 @@ fn build_image_with_delay_loads(
         &definitions,
         &absolute_symbols,
         config.image_base,
-        &mut image,
+        image,
     )?;
     drop(relocations_phase);
 
@@ -2463,11 +2510,11 @@ fn build_image_with_delay_loads(
         config.image_base,
         dynamic_base,
         has_tls_inputs,
-        &mut image,
+        image,
     )?;
     drop(tls_phase);
     let exception_phase = crate::timing_guard!(PE_DETAIL_EXCEPTION_DIRECTORY);
-    let exception_directory = canonicalize_exception_directory(&mut image, &layout, args)?;
+    let exception_directory = canonicalize_exception_directory(image, &layout, args)?;
     drop(exception_phase);
     let debug_directory_phase = crate::timing_guard!(PE_DETAIL_DEBUG_DIRECTORY);
     let debug_directory = if let Some(id) = debug_id {
@@ -2490,7 +2537,7 @@ fn build_image_with_delay_loads(
     drop(debug_directory_phase);
     let headers_phase = crate::timing_guard!(PE_DETAIL_WRITE_HEADERS);
     write_headers(
-        &mut image,
+        image,
         &layout,
         args,
         config,
@@ -2520,16 +2567,13 @@ fn build_image_with_delay_loads(
         let payload_end = payload_start
             .checked_add(linker_utils::pe_debug::REPRO_BUILD_ID_SIZE)
             .context("REPRO build-id payload range overflow")?;
-        Some(PendingReproBuildId::new(
-            &image,
-            payload_start..payload_end,
-        )?)
+        Some(PendingReproBuildId::new(image, payload_start..payload_end)?)
     } else {
         None
     };
     drop(final_image_phase);
     Ok(BuiltImage {
-        bytes: image,
+        bytes: image_storage,
         exports: export_directory.map_or_else(Vec::new, |directory| directory.exports),
         pending_repro_build_id,
     })
