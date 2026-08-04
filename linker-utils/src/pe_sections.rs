@@ -3,9 +3,10 @@
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+use foldhash::HashMap;
+use foldhash::HashMapExt;
 use object::pe;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Index;
 
@@ -237,7 +238,7 @@ pub fn layout_sections_borrowed<'a>(
     // common case, but lazily reconstruct the general sparse set at the first mismatch so the
     // public API retains duplicate detection for arbitrary caller-assigned IDs.
     let mut ids = None::<BTreeSet<ContributionId>>;
-    let mut groups = BTreeMap::<Vec<u8>, Group<'_>>::new();
+    let mut groups = HashMap::<Vec<u8>, Group<'_>>::new();
     let mut contribution_count = 0usize;
     for (input_index, contribution) in contributions.into_iter().enumerate() {
         if let Some(ids) = &mut ids {
