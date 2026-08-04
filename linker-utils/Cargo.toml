@@ -13,6 +13,7 @@ foldhash.workspace = true
 leb128.workspace = true
 object.workspace = true
 paste.workspace = true
+rayon.workspace = true
 sha2.workspace = true
 
 [lints]

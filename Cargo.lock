@@ -942,6 +942,7 @@ dependencies = [
  "leb128",
  "object 0.40.0",
  "paste",
+ "rayon",
  "sha2",
 ]
 

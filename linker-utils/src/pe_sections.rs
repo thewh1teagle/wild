@@ -4,6 +4,7 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use object::pe;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Index;
@@ -17,6 +18,7 @@ const LINK_ONLY_MASK: u32 = pe::IMAGE_SCN_LNK_OTHER.0
     | pe::IMAGE_SCN_LNK_REMOVE.0
     | pe::IMAGE_SCN_LNK_COMDAT.0
     | pe::IMAGE_SCN_LNK_NRELOC_OVFL.0;
+const PARALLEL_SUBSECTION_SORT_MIN: usize = 4096;
 
 /// Stable caller-assigned identity for an input section contribution.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -305,15 +307,13 @@ pub fn layout_sections_borrowed<'a>(
     };
 
     for mut group in groups {
-        group.contributions.sort_unstable_by(|left, right| {
-            left.suffix
-                .cmp(right.suffix)
-                // An exact base name sorts before a `$` subsection with an
-                // empty suffix. This distinction is significant for the
-                // CRT's `.tls` sentinel versus compiler-emitted `.tls$`.
-                .then_with(|| left.has_separator.cmp(&right.has_separator))
-                .then_with(|| left.input_index.cmp(&right.input_index))
-        });
+        if group.contributions.len() >= PARALLEL_SUBSECTION_SORT_MIN
+            && rayon::current_num_threads() > 1
+        {
+            parallel_sort_subsections(&mut group.contributions);
+        } else {
+            group.contributions.sort_unstable_by(compare_subsections);
+        }
         let characteristics = merged_characteristics(&group)?;
         let section_index = sections.len();
         let section_rva = next_rva;
@@ -402,6 +402,25 @@ pub fn layout_sections_borrowed<'a>(
         file_size: next_file,
         size_of_image: next_rva,
     })
+}
+
+#[inline]
+fn compare_subsections(
+    left: &GroupedContribution<'_>,
+    right: &GroupedContribution<'_>,
+) -> std::cmp::Ordering {
+    left.suffix
+        .cmp(right.suffix)
+        // An exact base name sorts before a `$` subsection with an empty suffix. This distinction
+        // is significant for the CRT's `.tls` sentinel versus compiler-emitted `.tls$`.
+        .then_with(|| left.has_separator.cmp(&right.has_separator))
+        .then_with(|| left.input_index.cmp(&right.input_index))
+}
+
+#[inline(never)]
+#[cold]
+fn parallel_sort_subsections(contributions: &mut [GroupedContribution<'_>]) {
+    contributions.par_sort_unstable_by(compare_subsections);
 }
 
 /// Tries to insert one new synthetic `.reloc` contribution into an existing
