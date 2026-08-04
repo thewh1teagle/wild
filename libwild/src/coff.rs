@@ -666,17 +666,12 @@ impl CoffRelocationIndex {
         for (section_ordinal, section) in file.sections().enumerate() {
             let name = push_name_occurrence(&mut names, bytes, section.name_bytes(), true)?;
             let relocation_start = dense_u32(relocations.len(), "COFF relocation")?;
-            for (offset, relocation) in section.relocations() {
-                // Both standard and bigobj COFF readers always expose a raw COFF relocation as a
-                // symbol target with COFF flags. CoffObject::parse has already excluded every
-                // other format, so retaining these compact raw fields performs no policy or kind
-                // validation.
-                let object::RelocationTarget::Symbol(raw_index) = relocation.target() else {
-                    return Err(crate::error!("COFF relocation has a non-symbol target"));
-                };
-                let object::RelocationFlags::Coff { typ } = relocation.flags() else {
-                    return Err(crate::error!("COFF relocation has non-COFF flags"));
-                };
+            for relocation in section.coff_relocations().unwrap_or(&[]) {
+                // The input was already restricted to standard/bigobj COFF. Decode the compact
+                // raw record directly instead of constructing an architecture-neutral object::
+                // Relocation for every edge; overflow relocation tables are normalized by
+                // `coff_relocations` before this slice is returned.
+                let raw_index = object::SymbolIndex(relocation.symbol_table_index.get(LE) as usize);
                 count_relocation_decode();
                 let symbol = if let Some(symbol) = raw_to_dense.get(raw_index.0).copied().flatten()
                 {
@@ -699,9 +694,8 @@ impl CoffRelocationIndex {
                     id
                 };
                 relocations.push(CoffRelocationRecord {
-                    offset: u32::try_from(offset)
-                        .map_err(|_| crate::error!("COFF relocation offset exceeds u32"))?,
-                    typ: typ.0,
+                    offset: relocation.virtual_address.get(LE),
+                    typ: relocation.typ.get(LE).0,
                     symbol,
                 });
             }
