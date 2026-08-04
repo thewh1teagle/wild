@@ -25,6 +25,8 @@ use object::read::coff::Symbol as _;
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
+use std::hash::BuildHasher;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -259,13 +261,29 @@ impl<'archive, 'data> CoffArchivePlan<'archive, 'data> {
 #[derive(Clone, Debug)]
 pub struct CoffArchive<'data> {
     members: Vec<CoffArchiveMember<'data>>,
-    definition_members: HashMap<Cow<'data, [u8]>, DefinitionMember>,
+    definition_members: Vec<DefinitionMember<'data>>,
+    definition_heads: HashMap<u64, u32>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DefinitionMember {
+#[derive(Clone, Debug)]
+struct DefinitionMember<'data> {
+    name: Cow<'data, [u8]>,
     first: usize,
     has_object: bool,
+    hash: u64,
+    collision_next: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct CoffArchiveDefinitionId(u32);
+
+const NO_DEFINITION: u32 = u32::MAX;
+
+fn definition_hash(name: &[u8]) -> u64 {
+    let mut hasher = foldhash::fast::FixedState::default().build_hasher();
+    hasher.write(name);
+    hasher.finish()
 }
 
 impl<'data> CoffArchive<'data> {
@@ -365,25 +383,46 @@ impl<'data> CoffArchive<'data> {
         }
         let members = finalize_members(members, indexed_definitions)?;
 
-        let mut definition_members = HashMap::<Cow<'data, [u8]>, DefinitionMember>::new();
+        let mut definition_members = Vec::<DefinitionMember<'data>>::new();
+        let mut definition_heads = HashMap::<u64, u32>::new();
         for member in &members {
             for definition in member.definitions.as_slice() {
-                definition_members
-                    .entry(definition.clone())
-                    .and_modify(|entry| {
-                        entry.has_object |=
-                            matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. });
-                    })
-                    .or_insert(DefinitionMember {
+                let hash = definition_hash(definition);
+                let mut current = definition_heads.get(&hash).copied();
+                let mut existing = None;
+                while let Some(index) = current {
+                    let entry = &definition_members[index as usize];
+                    if entry.name.as_ref() == definition.as_ref() {
+                        existing = Some(index as usize);
+                        break;
+                    }
+                    current =
+                        (entry.collision_next != NO_DEFINITION).then_some(entry.collision_next);
+                }
+                if let Some(index) = existing {
+                    definition_members[index].has_object |=
+                        matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. });
+                } else {
+                    let index = u32::try_from(definition_members.len())
+                        .expect("COFF archive definition count exceeds u32");
+                    let collision_next = definition_heads
+                        .insert(hash, index)
+                        .unwrap_or(NO_DEFINITION);
+                    definition_members.push(DefinitionMember {
+                        name: definition.clone(),
                         first: member.index,
                         has_object: matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. }),
+                        hash,
+                        collision_next,
                     });
+                }
             }
         }
 
         Ok(Self {
             members,
             definition_members,
+            definition_heads,
         })
     }
 
@@ -414,9 +453,8 @@ impl<'data> CoffArchive<'data> {
     /// Returns whether the archive index associates `name` with a regular COFF object.
     #[must_use]
     pub fn has_object_definition(&self, name: &[u8]) -> bool {
-        self.definition_members
-            .get(name)
-            .is_some_and(|entry| entry.has_object)
+        self.find_definition(name)
+            .is_some_and(|(_, entry)| entry.has_object)
     }
 
     /// Returns the first member associated with `name` by this archive's definition index.
@@ -426,7 +464,7 @@ impl<'data> CoffArchive<'data> {
     /// pass.
     #[must_use]
     pub fn first_definition_member_index(&self, name: &[u8]) -> Option<usize> {
-        self.definition_members.get(name).map(|entry| entry.first)
+        self.find_definition(name).map(|(_, entry)| entry.first)
     }
 
     /// Iterates the first indexed provider for every definition name.
@@ -436,7 +474,53 @@ impl<'data> CoffArchive<'data> {
     pub fn definition_member_indices(&self) -> impl Iterator<Item = (&[u8], usize)> {
         self.definition_members
             .iter()
-            .map(|(name, provider)| (name.as_ref(), provider.first))
+            .map(|provider| (provider.name.as_ref(), provider.first))
+    }
+
+    pub fn definition_rows(
+        &self,
+    ) -> impl Iterator<Item = (CoffArchiveDefinitionId, &[u8], usize, u64)> {
+        self.definition_members
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                (
+                    CoffArchiveDefinitionId(index as u32),
+                    provider.name.as_ref(),
+                    provider.first,
+                    provider.hash,
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn definition_name(&self, id: CoffArchiveDefinitionId) -> Option<&[u8]> {
+        self.definition_members
+            .get(id.0 as usize)
+            .map(|entry| entry.name.as_ref())
+    }
+
+    #[must_use]
+    pub fn definition_member_index(&self, id: CoffArchiveDefinitionId) -> Option<usize> {
+        self.definition_members
+            .get(id.0 as usize)
+            .map(|entry| entry.first)
+    }
+
+    fn find_definition(
+        &self,
+        name: &[u8],
+    ) -> Option<(CoffArchiveDefinitionId, &DefinitionMember<'data>)> {
+        let hash = definition_hash(name);
+        let mut current = self.definition_heads.get(&hash).copied();
+        while let Some(index) = current {
+            let entry = &self.definition_members[index as usize];
+            if entry.name.as_ref() == name {
+                return Some((CoffArchiveDefinitionId(index), entry));
+            }
+            current = (entry.collision_next != NO_DEFINITION).then_some(entry.collision_next);
+        }
+        None
     }
 
     /// Selects members to a fixpoint.
@@ -512,10 +596,9 @@ impl<'data> CoffArchive<'data> {
         for demand in demands {
             let name = demand.name;
             let Some(member_index) = self
-                .definition_members
-                .get(name)
+                .find_definition(name)
                 .filter(|_| !is_defined(name))
-                .map(|entry| entry.first)
+                .map(|(_, entry)| entry.first)
             else {
                 continue;
             };
@@ -601,9 +684,8 @@ impl<'data> CoffArchive<'data> {
         } else {
             loop {
                 let candidate = unresolved.iter().find_map(|demand| {
-                    self.definition_members
-                        .get(demand.name())
-                        .map(|entry| entry.first)
+                    self.find_definition(demand.name())
+                        .map(|(_, entry)| entry.first)
                         .filter(|index| !was_selected[*index])
                         .map(|index| &self.members[index])
                         .map(|member| (member, demand.clone()))
@@ -1532,11 +1614,8 @@ mod tests {
 
         // Model an index candidate later than a definition already carried by the first member.
         // Selecting `trigger` must suppress the later `local` candidate before member 1 is read.
-        parsed
-            .definition_members
-            .get_mut(b"local".as_slice())
-            .unwrap()
-            .first = 1;
+        let local = parsed.find_definition(b"local").unwrap().0;
+        parsed.definition_members[local.0 as usize].first = 1;
         let demands = [
             ArchiveDemand {
                 name: b"trigger",
@@ -1567,7 +1646,7 @@ mod tests {
         push_archive_record(&mut archive, b"foo.obj/", &data);
         let parsed = CoffArchive::parse(&archive).unwrap();
         assert!(parsed.members()[0].demands.get().is_some());
-        assert!(parsed.definition_members.contains_key(b"foo".as_slice()));
+        assert!(parsed.find_definition(b"foo").is_some());
         let plan = parsed.plan(
             &[ArchiveDemand {
                 name: b"foo",

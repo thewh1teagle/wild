@@ -10,6 +10,7 @@ use foldhash::HashMapExt;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
 use linker_utils::coff_archives::CoffArchive;
+use linker_utils::coff_archives::CoffArchiveDefinitionId;
 use linker_utils::coff_archives::CoffArchiveMember;
 use linker_utils::coff_archives::CoffArchiveMemberKind;
 use linker_utils::coff_imports::ShortImportObject;
@@ -601,13 +602,13 @@ fn prepare_archive_objects<'data>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArchiveProvider {
     archive: ArchiveId,
-    member: ArchiveMemberId,
+    definition: CoffArchiveDefinitionId,
 }
 
 #[derive(Default)]
 struct CachedArchiveProviders {
     archives_scanned: usize,
-    providers: Vec<ArchiveProvider>,
+    providers: SmallVec<[ArchiveProvider; 1]>,
 }
 
 struct ArchiveProviderCache {
@@ -636,19 +637,16 @@ impl ArchiveProviderCache {
             .map(|(offset, archive)| {
                 let archive_index = first_archive + offset;
                 archive
-                    .definition_member_indices()
-                    .map(|(name, member_index)| {
+                    .definition_rows()
+                    .map(|(definition, _name, _member_index, hash)| {
                         (
-                            crate::hash::hash_bytes(name),
+                            hash,
                             ArchiveProvider {
                                 archive: ArchiveId::from_u32(
                                     u32::try_from(archive_index)
                                         .expect("PE archive count exceeds u32"),
                                 ),
-                                member: ArchiveMemberId::from_u32(
-                                    u32::try_from(member_index)
-                                        .expect("PE archive member count exceeds u32"),
-                                ),
+                                definition,
                             },
                         )
                     })
@@ -691,10 +689,10 @@ impl ArchiveProviderCache {
                 // Hash rows are collision candidates, not an equality claim. Verify through the
                 // authoritative archive index before exposing the provider.
                 crate::perf::removal_counters::increment_archive_member_probes();
-                if archives[archive_index].first_definition_member_index(name)
-                    == Some(provider.member.index())
-                {
-                    note_vec_push(&cached.providers);
+                if archives[archive_index].definition_name(provider.definition) == Some(name) {
+                    if cached.providers.len() == cached.providers.capacity() {
+                        crate::perf::removal_counters::increment_hot_phase_allocations();
+                    }
                     cached.providers.push(provider);
                 }
             }
@@ -1239,7 +1237,10 @@ impl PrimaryArchiveScheduler {
             event_cursor: symbols.archive_demand_events.len(),
             lookups: 0,
         };
-        for name in symbols.unresolved_in_byte_order() {
+        // `next` sorts active unresolved demands by bytes within each archive before selection.
+        // Sorting the entire unresolved namespace here first therefore cannot affect semantics and
+        // only adds an O(n log n) pass over the largest demand wave.
+        for name in symbols.unresolved_names.iter().copied() {
             scheduler.add(
                 archives,
                 &symbols.names,
@@ -1279,11 +1280,10 @@ impl PrimaryArchiveScheduler {
         for &provider in providers.providers(name, bytes, archives) {
             let archive = provider.archive.index();
             if archive >= self.next_archive {
-                self.by_archive[archive].push(ScheduledArchiveDemand {
-                    name,
-                    member: provider.member.index(),
-                    kind,
-                });
+                let member = archives[archive]
+                    .definition_member_index(provider.definition)
+                    .expect("cached PE archive definition remains valid");
+                self.by_archive[archive].push(ScheduledArchiveDemand { name, member, kind });
             }
         }
     }
@@ -1384,7 +1384,9 @@ fn next_archive_selection<'archive, 'data>(
             .expect("archive demands use canonical NameIds");
         for &provider in archive_providers.providers(demand.name, name, archives) {
             let archive_index = provider.archive.index();
-            let member_index = provider.member.index();
+            let member_index = archives[archive_index]
+                .definition_member_index(provider.definition)
+                .expect("cached PE archive definition remains valid");
             if archive_index < start {
                 continue;
             }
@@ -2156,13 +2158,18 @@ mod tests {
         ];
         let mut cache = ArchiveProviderCache::new();
         let name = NameId::from_u32(0);
+        let target_definition = parsed[1]
+            .definition_rows()
+            .find(|(_, definition, _, _)| *definition == b"target")
+            .unwrap()
+            .0;
 
         assert!(cache.providers(name, b"target", &[&parsed[0]]).is_empty());
         assert_eq!(
             cache.providers(name, b"target", &[&parsed[0], &parsed[1]]),
             [ArchiveProvider {
                 archive: ArchiveId::from_u32(1),
-                member: ArchiveMemberId::from_u32(0),
+                definition: target_definition,
             }]
         );
     }
