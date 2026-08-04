@@ -298,6 +298,19 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Creates the sized random-access output.
     fn create_output(&self, path: Arc<Path>, options: OutputOptions) -> Result<Self::Output>;
 
+    /// Writes an output that has already been assembled contiguously. Backends may avoid creating
+    /// a second random-access buffer; the default preserves the general create/copy behavior.
+    fn write_output_bytes(&self, path: Arc<Path>, options: OutputOptions, bytes: &[u8]) -> Result {
+        if options.size != bytes.len() as u64 {
+            return Err(crate::error!(
+                "output byte count differs from declared size"
+            ));
+        }
+        let mut output = self.create_output(path, options)?;
+        output.bytes_mut().copy_from_slice(bytes);
+        output.finish()
+    }
+
     /// Writes a complete auxiliary output.
     fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result;
 }
@@ -500,37 +513,7 @@ impl FileSystem for OsFileSystem {
     }
 
     fn create_output(&self, path: Arc<Path>, options: OutputOptions) -> Result<Self::Output> {
-        let mut open_options = std::fs::OpenOptions::new();
-
-        match options.file_replacement_mode {
-            FileReplacementMode::UnlinkAndReplace => {
-                open_options.truncate(true);
-            }
-            FileReplacementMode::UpdateInPlace | FileReplacementMode::UpdateInPlaceWithFallback => {
-                open_options.truncate(false);
-            }
-        }
-
-        let file = match open_options.read(true).write(true).create(true).open(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                // Retry open operation with UnlinkAndReplace if it's an ETXTBSY error and
-                // falllback is permitted.
-                if error.kind() == ErrorKind::ExecutableFileBusy
-                    && matches!(
-                        options.file_replacement_mode,
-                        FileReplacementMode::UpdateInPlaceWithFallback
-                    )
-                {
-                    // If the file is being executed, we can't modify it, but we can delete it.
-                    std::fs::remove_file(&path)?;
-                    open_options.create(true).open(&path)?
-                } else {
-                    return Err(error)
-                        .with_context(|| format!("Failed to open `{}`", path.display()));
-                }
-            }
-        };
+        let file = open_output_file(&path, options.file_replacement_mode)?;
 
         let file_write_mode = options
             .write_mode
@@ -562,10 +545,56 @@ impl FileSystem for OsFileSystem {
         Ok(OsOutputFile { file, buffer, path })
     }
 
+    fn write_output_bytes(&self, path: Arc<Path>, options: OutputOptions, bytes: &[u8]) -> Result {
+        if options.size != bytes.len() as u64 {
+            return Err(crate::error!(
+                "output byte count differs from declared size"
+            ));
+        }
+        if matches!(options.write_mode, Some(FileWriteMode::Mmap)) {
+            let mut output = self.create_output(path, options)?;
+            output.bytes_mut().copy_from_slice(bytes);
+            return output.finish();
+        }
+        let mut file = open_output_file(&path, options.file_replacement_mode)?;
+        file.set_len(options.size)
+            .with_context(|| format!("Failed to size {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to write to {}", path.display()))?;
+        let _ = make_executable(&file);
+        Ok(())
+    }
+
     fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result {
         let file = File::create(path)?;
         (&file).write_all(bytes)?;
         Ok(())
+    }
+}
+
+fn open_output_file(path: &Path, replacement_mode: FileReplacementMode) -> Result<File> {
+    let mut open_options = std::fs::OpenOptions::new();
+    match replacement_mode {
+        FileReplacementMode::UnlinkAndReplace => {
+            open_options.truncate(true);
+        }
+        FileReplacementMode::UpdateInPlace | FileReplacementMode::UpdateInPlaceWithFallback => {
+            open_options.truncate(false);
+        }
+    }
+    match open_options.read(true).write(true).create(true).open(path) {
+        Ok(file) => Ok(file),
+        Err(error)
+            if error.kind() == ErrorKind::ExecutableFileBusy
+                && matches!(
+                    replacement_mode,
+                    FileReplacementMode::UpdateInPlaceWithFallback
+                ) =>
+        {
+            std::fs::remove_file(path)?;
+            open_options.create(true).open(path).map_err(Into::into)
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to open `{}`", path.display())),
     }
 }
 
@@ -624,5 +653,48 @@ pub(crate) fn path_from_bytes(bytes: &[u8]) -> PathBuf {
             let path = std::str::from_utf8(bytes).expect("Invalid UTF-8 in archive path name");
             PathBuf::from(path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_output_write_replaces_and_resizes_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.exe");
+        std::fs::write(&path, b"a longer previous output").unwrap();
+        let bytes = b"new output";
+        OsFileSystem
+            .write_output_bytes(
+                Arc::<Path>::from(path.as_path()),
+                OutputOptions {
+                    size: bytes.len() as u64,
+                    file_replacement_mode: FileReplacementMode::UpdateInPlace,
+                    write_mode: Some(FileWriteMode::BufferThenWrite),
+                },
+                bytes,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn contiguous_output_write_rejects_a_mismatched_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.exe");
+        let error = OsFileSystem
+            .write_output_bytes(
+                Arc::<Path>::from(path.as_path()),
+                OutputOptions {
+                    size: 1,
+                    file_replacement_mode: FileReplacementMode::UnlinkAndReplace,
+                    write_mode: Some(FileWriteMode::BufferThenWrite),
+                },
+                b"two bytes",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("differs from declared size"));
     }
 }

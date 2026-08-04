@@ -103,6 +103,7 @@ const DIR64_DISCOVERY_CHUNK_SIZE: usize = 256;
 const LIVE_IMPORT_MIN_CONTRIBUTIONS_PER_CHUNK: usize = 64;
 #[cfg(test)]
 const LIVE_IMPORT_CHUNKS_PER_THREAD: usize = 4;
+const DIRECT_OUTPUT_MIN_SIZE: usize = 1024 * 1024;
 const PARALLEL_REPRO_COPY_MIN_SIZE: usize = 1024 * 1024;
 
 #[inline]
@@ -440,19 +441,27 @@ pub(crate) fn link<F: FileSystem>(
         write_phase
             .0
             .add(crate::timing::PeMetric::Events, image.exports.len());
-        let mut output = fs.create_output(
-            args.common.output.clone(),
-            OutputOptions {
-                size: image.bytes.len() as u64,
-                file_replacement_mode: args
-                    .common
-                    .file_replacement_mode
-                    .unwrap_or(FileReplacementMode::UnlinkAndReplace),
-                write_mode: args.common.file_write_mode,
-            },
-        )?;
-        image.copy_to(output.bytes_mut())?;
-        output.finish()?;
+        let output_options = OutputOptions {
+            size: image.bytes.len() as u64,
+            file_replacement_mode: args
+                .common
+                .file_replacement_mode
+                .unwrap_or(FileReplacementMode::UnlinkAndReplace),
+            write_mode: args.common.file_write_mode,
+        };
+        if image.bytes.len() >= DIRECT_OUTPUT_MIN_SIZE
+            && !matches!(
+                args.common.file_write_mode,
+                Some(crate::fs::FileWriteMode::Mmap)
+            )
+        {
+            image.finalize_repro_build_id()?;
+            fs.write_output_bytes(args.common.output.clone(), output_options, &image.bytes)?;
+        } else {
+            let mut output = fs.create_output(args.common.output.clone(), output_options)?;
+            image.copy_to(output.bytes_mut())?;
+            output.finish()?;
+        }
         if !image.exports.is_empty() {
             write_import_library(fs, args, dll_name.as_bytes(), &exports, &image.exports)?;
         }
