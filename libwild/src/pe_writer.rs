@@ -1328,8 +1328,11 @@ impl<'data> DenseProductionState<'data> {
         } = pe_ir::PeIr::finalize_selected_objects_with_globals(
             objects,
             names,
-            &symbol_snapshot.globals,
+            &symbol_snapshot.global_names,
         )?;
+        finalize_phase
+            .0
+            .add(crate::timing::PeMetric::Symbols, ir.global_symbols.len());
 
         let mut resolver_states = states.into_vec();
         // Object-local names appended during finalization were never resolver demands. Their
@@ -1484,10 +1487,25 @@ impl<'data> DenseProductionState<'data> {
 }
 
 struct SelectedObjectMetadata<'a, 'data> {
-    globals: &'a [pe_resolver::SelectedGlobalSymbol],
+    #[cfg(test)]
+    legacy_globals: &'a [pe_resolver::SelectedGlobalSymbol],
     weak: &'a linker_utils::coff_runtime::WeakExternalResolution,
     definition_names: HashSet<&'a [u8]>,
     dense: Option<&'a DenseProductionState<'data>>,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedGlobalView<'a> {
+    name: &'a [u8],
+    object: usize,
+    section: Option<object::SectionIndex>,
+    address: u64,
+    size: u64,
+    is_definition: bool,
+    is_common: bool,
+    is_undefined: bool,
+    is_weak: bool,
+    is_absolute: bool,
 }
 
 impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
@@ -1496,30 +1514,41 @@ impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
         roots: &[Vec<u8>],
         dense: Option<&'a DenseProductionState<'data>>,
     ) -> (Self, HashSet<Vec<u8>>) {
+        let mut metadata_phase = crate::pe_timing_guard!("PE symbols: Build selected metadata");
+        metadata_phase.0.add(
+            crate::timing::PeMetric::Symbols,
+            dense.map_or_else(
+                || {
+                    #[cfg(test)]
+                    {
+                        snapshot.globals.len()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        0
+                    }
+                },
+                |dense| dense.ir.global_symbols.len(),
+            ),
+        );
         let mut undefined = roots.iter().cloned().collect::<HashSet<_>>();
         let mut definitions = HashSet::new();
-        for symbol in &snapshot.globals {
-            let name = match dense {
-                Some(dense) => dense
-                    .names
-                    .bytes(symbol.name_id)
-                    .expect("resolver global NameId remains canonical"),
-                #[cfg(test)]
-                None => symbol.name.as_slice(),
-                #[cfg(not(test))]
-                None => unreachable!("production metadata requires dense canonical names"),
-            };
+        for_each_selected_global(snapshot, dense, |symbol| {
+            let name = symbol.name;
             if symbol.is_definition || symbol.is_common {
                 // Keep empty global definitions, matching object_definition_names.
                 definitions.insert(name);
             } else if !name.is_empty() && symbol.is_undefined && !symbol.is_weak {
                 undefined.insert(name.to_vec());
             }
-        }
+            Ok(())
+        })
+        .expect("selected globals were validated during dense finalization");
         undefined.retain(|name| !definitions.contains(name.as_slice()));
         (
             Self {
-                globals: &snapshot.globals,
+                #[cfg(test)]
+                legacy_globals: &snapshot.globals,
                 weak: &snapshot.weak_resolution,
                 definition_names: definitions,
                 dense,
@@ -1536,21 +1565,109 @@ impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
         self.weak
     }
 
-    fn symbol_name<'symbol>(
-        &'symbol self,
-        symbol: &'symbol pe_resolver::SelectedGlobalSymbol,
-    ) -> &'symbol [u8] {
-        match self.dense {
-            Some(dense) => dense
-                .names
-                .bytes(symbol.name_id)
-                .expect("resolver global NameId remains canonical"),
-            #[cfg(test)]
-            None => symbol.name.as_slice(),
-            #[cfg(not(test))]
-            None => unreachable!("production metadata requires dense canonical names"),
-        }
+    fn global_count(&self) -> usize {
+        self.dense.map_or_else(
+            || {
+                #[cfg(test)]
+                {
+                    self.legacy_globals.len()
+                }
+                #[cfg(not(test))]
+                {
+                    0
+                }
+            },
+            |dense| dense.ir.global_symbols.len(),
+        )
     }
+
+    fn for_each_global(
+        &self,
+        visit: impl FnMut(SelectedGlobalView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        for_each_selected_global_parts(
+            self.dense,
+            #[cfg(test)]
+            self.legacy_globals,
+            visit,
+        )
+    }
+}
+
+fn for_each_selected_global<'a, 'data>(
+    _snapshot: &'a pe_resolver::SelectedSymbolSnapshot,
+    dense: Option<&'a DenseProductionState<'data>>,
+    visit: impl FnMut(SelectedGlobalView<'a>) -> Result<()>,
+) -> Result<()> {
+    for_each_selected_global_parts(
+        dense,
+        #[cfg(test)]
+        &_snapshot.globals,
+        visit,
+    )
+}
+
+fn for_each_selected_global_parts<'a, 'data>(
+    dense: Option<&'a DenseProductionState<'data>>,
+    #[cfg(test)] legacy: &'a [pe_resolver::SelectedGlobalSymbol],
+    mut visit: impl FnMut(SelectedGlobalView<'a>) -> Result<()>,
+) -> Result<()> {
+    if let Some(dense) = dense {
+        for &id in &dense.ir.global_symbols {
+            let symbol = *dense
+                .ir
+                .symbols
+                .get(id.index())
+                .context("global SymbolId is outside dense symbol records")?;
+            let section = symbol
+                .section
+                .get()
+                .map(|section| {
+                    dense
+                        .ir
+                        .sections
+                        .get(section.index())
+                        .map(|record| object::SectionIndex(record.raw_index as usize))
+                        .context("global symbol section is outside dense section records")
+                })
+                .transpose()?;
+            visit(SelectedGlobalView {
+                name: dense
+                    .names
+                    .bytes(symbol.name)
+                    .context("global symbol has no canonical name")?,
+                object: symbol.object.index(),
+                section,
+                address: symbol.value,
+                size: u64::from(symbol.size),
+                is_definition: symbol.is_definition(),
+                is_common: symbol.is_common(),
+                is_undefined: symbol.is_undefined(),
+                is_weak: symbol.is_weak(),
+                is_absolute: symbol.is_absolute(),
+            })?;
+        }
+        return Ok(());
+    }
+    #[cfg(test)]
+    for symbol in legacy {
+        visit(SelectedGlobalView {
+            name: &symbol.name,
+            object: symbol.object,
+            section: symbol.section,
+            address: symbol.address,
+            size: symbol.size,
+            is_definition: symbol.is_definition,
+            is_common: symbol.is_common,
+            is_undefined: symbol.is_undefined,
+            is_weak: symbol.is_weak,
+            is_absolute: symbol.section_kind == object::SymbolSection::Absolute,
+        })?;
+    }
+    #[cfg(not(test))]
+    unreachable!("production metadata requires dense canonical names");
+    #[cfg(test)]
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1579,12 +1696,12 @@ fn selected_symbol_snapshot(
                 is_common: symbol.is_common(),
                 is_undefined: symbol.is_undefined(),
                 is_weak: symbol.is_weak(),
-                name_id: pe_ir::NameId::from_u32(u32::MAX),
                 name: name.to_vec(),
             });
         }
     }
     Ok(pe_resolver::SelectedSymbolSnapshot {
+        global_names: Vec::new(),
         globals,
         weak_resolution,
     })
@@ -1621,14 +1738,15 @@ fn absolute_symbol_values(
 ) -> Result<HashMap<Vec<u8>, u64>> {
     let definitions = metadata.definition_names();
     let mut absolute = HashMap::new();
-    for symbol in metadata.globals {
-        if symbol.section_kind == object::SymbolSection::Absolute {
-            let name = metadata.symbol_name(symbol);
+    metadata.for_each_global(|symbol| {
+        if symbol.is_absolute {
+            let name = symbol.name;
             if !name.is_empty() {
                 absolute.insert(name.to_vec(), symbol.address);
             }
         }
-    }
+        Ok(())
+    })?;
     for symbol in LINKER_ABSOLUTE_ZERO_SYMBOLS {
         if !definitions.contains(*symbol) {
             absolute.insert(symbol.to_vec(), 0);
@@ -2062,7 +2180,11 @@ fn build_image_with_delay_loads(
     drop(resources_phase);
     drop(assemble_synthetic_phase);
 
-    let definitions_phase = crate::timing_guard!(PE_PHASE_DEFINE_SYMBOLS);
+    let mut definitions_phase = crate::pe_timing_guard!(PE_PHASE_DEFINE_SYMBOLS);
+    definitions_phase.0.add(
+        crate::timing::PeMetric::Symbols,
+        symbol_metadata.global_count(),
+    );
     let (locations, mut definitions) = definitions(
         objects,
         symbol_metadata,
@@ -3501,20 +3623,24 @@ fn discarded_comdat_sections_with_metadata(
     classify_phase
         .0
         .add(crate::timing::PeMetric::Groups, analysis.groups.len());
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Symbols, metadata.global_count());
     let mut strong_definitions = HashSet::<Vec<u8>>::new();
-    for symbol in metadata.globals {
+    metadata.for_each_global(|symbol| {
         if !symbol.is_definition {
-            continue;
+            return Ok(());
         }
         if symbol
             .section
             .and_then(|section| analysis.node((symbol.object, section)))
             .is_some_and(|node| analysis.is_comdat[node])
         {
-            continue;
+            return Ok(());
         }
-        strong_definitions.insert(metadata.symbol_name(symbol).to_vec());
-    }
+        strong_definitions.insert(symbol.name.to_vec());
+        Ok(())
+    })?;
     drop(classify_phase);
 
     let mut selection_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_SELECT);
@@ -3773,24 +3899,23 @@ fn unreferenced_comdat_sections(
     // symbol's own section below.
     let definitions_phase = crate::timing_guard!(PE_DETAIL_REF_DEFINITIONS);
     let mut definitions = HashMap::<Vec<u8>, ComdatGroupId>::new();
-    for symbol in metadata.globals {
+    metadata.for_each_global(|symbol| {
         if !symbol.is_definition {
-            continue;
+            return Ok(());
         }
         let Some(section) = symbol.section else {
-            continue;
+            return Ok(());
         };
         let node = comdats
             .analysis
             .node((symbol.object, section))
             .context("definition refers to an invalid COFF section")?;
         let Some(group) = resolved_groups[node] else {
-            continue;
+            return Ok(());
         };
-        definitions
-            .entry(metadata.symbol_name(symbol).to_vec())
-            .or_insert(group);
-    }
+        definitions.entry(symbol.name.to_vec()).or_insert(group);
+        Ok(())
+    })?;
     let weak_resolution = metadata.weak();
     let resolve_definition = |name: &[u8]| -> Result<Option<ComdatGroupId>> {
         if let Some(&group) = definitions.get(name) {
@@ -3968,12 +4093,15 @@ fn add_common_symbols(
     contributions: &mut Vec<Contribution>,
 ) -> Result<HashMap<Vec<u8>, (u32, ContributionId)>> {
     let mut commons = BTreeMap::<Vec<u8>, u64>::new();
-    for symbol in metadata.globals.iter().filter(|symbol| symbol.is_common) {
-        commons
-            .entry(metadata.symbol_name(symbol).to_vec())
-            .and_modify(|size| *size = (*size).max(symbol.size))
-            .or_insert(symbol.size);
-    }
+    metadata.for_each_global(|symbol| {
+        if symbol.is_common {
+            commons
+                .entry(symbol.name.to_vec())
+                .and_modify(|size| *size = (*size).max(symbol.size))
+                .or_insert(symbol.size);
+        }
+        Ok(())
+    })?;
     if commons.is_empty() {
         return Ok(HashMap::new());
     }
@@ -4293,17 +4421,20 @@ fn definitions(
 ) -> Result<(LocationMap, HashMap<Vec<u8>, u64>)> {
     let locations = source_locations(contributions);
     let mut definitions = HashMap::new();
-    for symbol in metadata.globals.iter().filter(|symbol| !symbol.is_common) {
-        let name = metadata.symbol_name(symbol).to_vec();
+    metadata.for_each_global(|symbol| {
+        if symbol.is_common {
+            return Ok(());
+        }
+        let name = symbol.name.to_vec();
         let address = if let Some(section) = symbol.section {
             let Some(id) = locations.get(&(symbol.object, section)) else {
-                continue;
+                return Ok(());
             };
             image_base + u64::from(layout.placements[id].rva) + symbol.address
         } else if symbol.is_definition {
             symbol.address
         } else {
-            continue;
+            return Ok(());
         };
         if let Some(old) = definitions.insert(name.clone(), address) {
             ensure!(
@@ -4315,7 +4446,8 @@ fn definitions(
                 definitions.insert(name, old);
             }
         }
-    }
+        Ok(())
+    })?;
     Ok((locations, definitions))
 }
 
@@ -5699,11 +5831,11 @@ mod tests {
                 is_common: common,
                 is_undefined: undefined,
                 is_weak: weak,
-                name_id: pe_ir::NameId::from_u32(u32::MAX),
                 name: name.to_vec(),
             }
         };
         let snapshot = pe_resolver::SelectedSymbolSnapshot {
+            global_names: Vec::new(),
             globals: vec![
                 symbol(0, b"defined", true, false, false, false),
                 symbol(1, b"common", false, true, true, false),

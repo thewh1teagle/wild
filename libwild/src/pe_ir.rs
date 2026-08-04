@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use super::pe_resolver::SelectedGlobalSymbol;
+use super::pe_resolver::ResolverGlobalName;
 use super::pe_symbol_db::DeferredInvalidName;
 use super::pe_symbol_db::OrderedNameInterner;
 use super::pe_symbol_db::ProviderKind;
@@ -203,6 +203,39 @@ pub(super) struct SymbolRecord {
     pub(super) diagnostic: SymbolDiagnostic,
 }
 
+impl SymbolRecord {
+    const GLOBAL: u16 = 1 << 0;
+    const COMMON: u16 = 1 << 1;
+    const WEAK: u16 = 1 << 2;
+    const DEFINITION: u16 = 1 << 3;
+    const UNDEFINED: u16 = 1 << 4;
+    const ABSOLUTE: u16 = 1 << 5;
+
+    pub(super) const fn is_global(self) -> bool {
+        self.flags & Self::GLOBAL != 0
+    }
+
+    pub(super) const fn is_common(self) -> bool {
+        self.flags & Self::COMMON != 0
+    }
+
+    pub(super) const fn is_weak(self) -> bool {
+        self.flags & Self::WEAK != 0
+    }
+
+    pub(super) const fn is_definition(self) -> bool {
+        self.flags & Self::DEFINITION != 0
+    }
+
+    pub(super) const fn is_undefined(self) -> bool {
+        self.flags & Self::UNDEFINED != 0
+    }
+
+    pub(super) const fn is_absolute(self) -> bool {
+        self.flags & Self::ABSOLUTE != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub(super) struct OptionalSymbolId(u32);
@@ -383,6 +416,7 @@ pub(super) struct PeIr<'data> {
     pub(super) objects: Box<[ObjectRecord]>,
     pub(super) sections: Box<[SectionRecord]>,
     pub(super) symbols: Box<[SymbolRecord]>,
+    pub(super) global_symbols: Box<[SymbolId]>,
     pub(super) relocations: RelocationCsr,
 }
 
@@ -529,7 +563,7 @@ impl<'data> PeIr<'data> {
     pub(super) fn finalize_selected_objects_with_globals(
         objects: &[CoffObject<'data>],
         seed: OrderedNameInterner<'data>,
-        globals: &[SelectedGlobalSymbol],
+        globals: &[ResolverGlobalName],
     ) -> Result<SelectedObjectFinalization<'data>> {
         let mut index_phase = crate::pe_timing_guard!("PE index: Finalize selected COFF objects");
         index_phase
@@ -550,7 +584,7 @@ impl<'data> PeIr<'data> {
             .add(crate::timing::PeMetric::Names, occurrence_names.len());
         names_phase
             .0
-            .add(crate::timing::PeMetric::Lookups, globals.len());
+            .add(crate::timing::PeMetric::Symbols, globals.len());
         drop(names_phase);
         let section_count = objects
             .iter()
@@ -579,6 +613,7 @@ impl<'data> PeIr<'data> {
         let mut object_records = Vec::with_capacity(objects.len());
         let mut sections = Vec::with_capacity(section_count);
         let mut symbols = Vec::with_capacity(symbol_count);
+        let mut global_symbols = Vec::with_capacity(globals.len());
         let mut starts = Vec::with_capacity(section_count.saturating_add(1));
         let mut relocations = Vec::new();
         starts.push(0);
@@ -660,7 +695,16 @@ impl<'data> PeIr<'data> {
                 let shape = symbol.shape.as_ref();
                 let flags = u16::from(shape.is_some_and(|shape| shape.is_global))
                     | (u16::from(shape.is_some_and(|shape| shape.is_common)) << 1)
-                    | (u16::from(shape.is_some_and(|shape| shape.is_weak)) << 2);
+                    | (u16::from(shape.is_some_and(|shape| shape.is_weak)) << 2)
+                    | (u16::from(shape.is_some_and(|shape| shape.is_definition)) << 3)
+                    | (u16::from(shape.is_some_and(|shape| shape.is_undefined)) << 4)
+                    | (u16::from(shape.is_some_and(|shape| shape.is_absolute)) << 5);
+                if flags & SymbolRecord::GLOBAL != 0 {
+                    global_symbols.push(SymbolId::from_u32(as_u32(
+                        symbols.len(),
+                        "selected global symbol",
+                    )?));
+                }
                 symbols.push(SymbolRecord {
                     object: object_id,
                     raw_index: symbol.raw_index,
@@ -719,6 +763,7 @@ impl<'data> PeIr<'data> {
             objects: object_records.into_boxed_slice(),
             sections: sections.into_boxed_slice(),
             symbols: symbols.into_boxed_slice(),
+            global_symbols: global_symbols.into_boxed_slice(),
             relocations,
         };
         Ok(SelectedObjectFinalization {
@@ -763,7 +808,7 @@ impl<'data> PeIr<'data> {
 fn finalize_selected_names<'data>(
     objects: &[CoffObject<'data>],
     mut names: OrderedNameInterner<'data>,
-    globals: &[SelectedGlobalSymbol],
+    globals: &[ResolverGlobalName],
 ) -> Result<(OrderedNameInterner<'data>, Box<[NameId]>)> {
     let occurrence_count = objects
         .iter()
@@ -778,18 +823,16 @@ fn finalize_selected_names<'data>(
         let index = object.index();
         known.clear();
         while let Some(global) = globals.get(global_position) {
-            if global.object != object_index {
+            if global.object as usize != object_index {
                 break;
             }
-            let raw_symbol = u32::try_from(global.index.0)
-                .map_err(|_| crate::error!("Raw COFF symbol index exceeds u32"))?;
-            let symbol = index
-                .symbols()
-                .binary_search_by_key(&raw_symbol, |symbol| symbol.raw_index)
-                .ok()
-                .and_then(|position| index.symbols().get(position))
-                .ok_or_else(|| crate::error!("Resolver global has no indexed COFF symbol"))?;
-            known.push((symbol.name.0 as usize, global.name_id));
+            let occurrence = usize::try_from(global.name_occurrence)
+                .map_err(|_| crate::error!("Resolver name occurrence exceeds usize"))?;
+            crate::ensure!(
+                occurrence < index.names().len(),
+                "Resolver global has no indexed COFF name occurrence"
+            );
+            known.push((occurrence, global.name));
             global_position += 1;
         }
         let mut known = known.iter().copied().peekable();
@@ -962,6 +1005,7 @@ mod tests {
     fn dense_ids_and_relocation_csr_have_the_frozen_shape() {
         assert_eq!(std::mem::size_of::<SectionId>(), 4);
         assert_eq!(std::mem::size_of::<RelocationRecord>(), 12);
+        assert_eq!(std::mem::size_of::<super::ResolverGlobalName>(), 12);
         let csr = RelocationCsr {
             starts: vec![0, 1, 1].into_boxed_slice(),
             records: vec![RelocationRecord {
@@ -989,6 +1033,18 @@ mod tests {
         let finalized =
             PeIr::finalize_selected_objects(&objects, OrderedNameInterner::new()).unwrap();
         let ir = &finalized.ir;
+        assert!(
+            ir.global_symbols
+                .iter()
+                .all(|&id| ir.symbols[id.index()].is_global())
+        );
+        assert_eq!(
+            ir.global_symbols.len(),
+            ir.symbols
+                .iter()
+                .filter(|symbol| symbol.is_global())
+                .count()
+        );
         assert_eq!(ir.objects.len(), 2);
         assert_eq!(ir.sections.len(), 2);
         assert_eq!(ir.symbols.len(), 4);

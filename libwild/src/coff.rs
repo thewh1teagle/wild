@@ -114,6 +114,9 @@ pub(crate) struct CoffRelocationSymbolShape {
     pub(crate) is_global: bool,
     pub(crate) is_common: bool,
     pub(crate) is_weak: bool,
+    pub(crate) is_definition: bool,
+    pub(crate) is_undefined: bool,
+    pub(crate) is_absolute: bool,
 }
 
 impl<'data> CoffObject<'data> {
@@ -232,6 +235,7 @@ impl CoffRelocationIndex {
             };
             let storage_class = raw_symbol.storage_class();
             let section_number = raw_symbol.section_number();
+            let parsed_symbol = file.symbol_by_index(raw_index).ok();
             let is_global = matches!(
                 storage_class,
                 object::pe::IMAGE_SYM_CLASS_EXTERNAL | object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
@@ -250,11 +254,18 @@ impl CoffRelocationIndex {
                         && section_number == object::pe::IMAGE_SYM_UNDEFINED
                         && raw_symbol.value() != 0,
                     is_weak: storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+                    is_definition: parsed_symbol
+                        .as_ref()
+                        .is_some_and(|symbol| symbol.is_definition()),
+                    is_undefined: parsed_symbol
+                        .as_ref()
+                        .is_some_and(|symbol| symbol.is_undefined()),
+                    is_absolute: parsed_symbol
+                        .as_ref()
+                        .is_some_and(|symbol| symbol.section() == object::SymbolSection::Absolute),
                 }),
                 value: raw_symbol.value(),
-                size: file
-                    .symbol_by_index(raw_index)
-                    .ok()
+                size: parsed_symbol
                     .and_then(|symbol| u32::try_from(symbol.size()).ok())
                     .unwrap_or(0),
                 typ: raw_symbol.typ().0,

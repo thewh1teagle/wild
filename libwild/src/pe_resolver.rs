@@ -33,7 +33,7 @@ type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 /// Compatibility deletion sites after Workstream 1 publishes `PeIr` occurrences:
 ///
-/// - the fixed-width `SelectedGlobalSymbol` snapshot (legacy COMDAT/layout metadata),
+/// - the test-only `SelectedGlobalSymbol` snapshot (legacy COMDAT/layout metadata),
 /// - `WeakExternalResolution` raw-name records (replace with the SymbolDb fallback column), and
 /// - the returned `BTreeSet<Vec<u8>>` import-definition snapshot (legacy import writer input).
 ///
@@ -180,10 +180,20 @@ struct IncrementalSymbolState<'data> {
     weak_names: Vec<ResolverWeakFallback>,
     alternate_names: Vec<ResolverAlternateFallback>,
     providers: Vec<ResolverProviderOccurrence>,
+    global_names: Vec<ResolverGlobalName>,
+    #[cfg(test)]
     globals: Vec<SelectedGlobalSymbol>,
     absorbed_objects: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolverGlobalName {
+    pub(super) object: u32,
+    pub(super) name_occurrence: u32,
+    pub(super) name: NameId,
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct SelectedGlobalSymbol {
     pub(super) object: usize,
@@ -197,13 +207,14 @@ pub(super) struct SelectedGlobalSymbol {
     pub(super) is_common: bool,
     pub(super) is_undefined: bool,
     pub(super) is_weak: bool,
-    pub(super) name_id: NameId,
     #[cfg(test)]
     pub(super) name: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub(super) struct SelectedSymbolSnapshot {
+    pub(super) global_names: Vec<ResolverGlobalName>,
+    #[cfg(test)]
     pub(super) globals: Vec<SelectedGlobalSymbol>,
     pub(super) weak_resolution: WeakExternalResolution,
 }
@@ -238,6 +249,8 @@ impl<'data> IncrementalSymbolState<'data> {
             weak_names: Vec::new(),
             alternate_names: Vec::new(),
             providers: Vec::new(),
+            global_names: Vec::new(),
+            #[cfg(test)]
             globals: Vec::new(),
             absorbed_objects: 0,
         }
@@ -288,35 +301,44 @@ impl<'data> IncrementalSymbolState<'data> {
                 self.weak_names.push(fallback);
             }
         }
-        for symbol in object.file().symbols() {
+        for (symbol_occurrence, symbol) in object.file().symbols().enumerate() {
             let name = symbol.name_bytes().context("invalid COFF symbol name")?;
             if !symbol.is_global() {
                 continue;
             }
             let name_id = self.intern_borrowed(name);
-            note_vec_push(&self.globals);
-            self.globals.push(SelectedGlobalSymbol {
-                object: index,
-                index: symbol.index(),
-                section: symbol.section_index(),
-                section_kind: symbol.section(),
-                address: symbol.address(),
-                size: symbol.size(),
-                is_definition: symbol.is_definition(),
-                is_common: symbol.is_common(),
-                is_undefined: symbol.is_undefined(),
-                is_weak: symbol.is_weak(),
-                name_id,
-                #[cfg(test)]
-                name: name.to_vec(),
+            let object = u32::try_from(index).context("PE object index exceeds u32")?;
+            note_vec_push(&self.global_names);
+            self.global_names.push(ResolverGlobalName {
+                object,
+                name_occurrence: u32::try_from(symbol_occurrence)
+                    .context("COFF symbol occurrence exceeds u32")?,
+                name: name_id,
             });
+            #[cfg(test)]
+            {
+                note_vec_push(&self.globals);
+                self.globals.push(SelectedGlobalSymbol {
+                    object: index,
+                    index: symbol.index(),
+                    section: symbol.section_index(),
+                    section_kind: symbol.section(),
+                    address: symbol.address(),
+                    size: symbol.size(),
+                    is_definition: symbol.is_definition(),
+                    is_common: symbol.is_common(),
+                    is_undefined: symbol.is_undefined(),
+                    is_weak: symbol.is_weak(),
+                    #[cfg(test)]
+                    name: name.to_vec(),
+                });
+            }
             if name.is_empty() {
                 continue;
             }
             if symbol.is_undefined() && !symbol.is_common() && !symbol.is_weak() {
                 self.mark_unresolved(name_id);
             } else if symbol.is_definition() || symbol.is_common() {
-                let object = u32::try_from(index).context("PE object index exceeds u32")?;
                 let raw_symbol =
                     u32::try_from(symbol.index().0).context("raw COFF symbol index exceeds u32")?;
                 let strength = if symbol.is_common() {
@@ -614,6 +636,8 @@ impl<'data> ResolverSession<'data> {
             weak_names,
             alternate_names,
             providers,
+            global_names,
+            #[cfg(test)]
             globals,
             absorbed_objects: _object_scans,
         } = self.symbol_state;
@@ -627,6 +651,8 @@ impl<'data> ResolverSession<'data> {
             },
             selected_imports: self.selected_imports,
             symbols: SelectedSymbolSnapshot {
+                global_names,
+                #[cfg(test)]
                 globals,
                 weak_resolution,
             },
@@ -734,6 +760,10 @@ impl<'data> ResolverSession<'data> {
                 resolve_phase.0.add(
                     crate::timing::PeMetric::Imports,
                     self.selected_imports.len(),
+                );
+                resolve_phase.0.add(
+                    crate::timing::PeMetric::Symbols,
+                    self.symbol_state.global_names.len(),
                 );
                 return Ok(import_definitions);
             }

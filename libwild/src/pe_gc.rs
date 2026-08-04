@@ -1066,6 +1066,7 @@ mod tests {
             .into_boxed_slice(),
             sections,
             symbols,
+            global_symbols: Box::new([]),
             relocations,
         };
         let database = SymbolDb {
@@ -1199,6 +1200,7 @@ mod tests {
             .into_boxed_slice(),
             sections,
             symbols: Box::new([]),
+            global_symbols: Box::new([]),
             relocations: RelocationCsr {
                 starts: vec![0, 0, 0, 0, 0].into_boxed_slice(),
                 records: Box::new([]),
@@ -1300,6 +1302,7 @@ mod tests {
                 diagnostic: SymbolDiagnostic::InvalidRelocationTarget,
             }]
             .into_boxed_slice(),
+            global_symbols: Box::new([]),
             relocations: RelocationCsr {
                 // Section 0 has no edges; section 1 owns the malformed edge.
                 starts: vec![0, 0, 1].into_boxed_slice(),

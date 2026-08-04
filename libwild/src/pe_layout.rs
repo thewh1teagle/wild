@@ -243,6 +243,7 @@ mod tests {
             }]
             .into_boxed_slice(),
             symbols: Box::new([]),
+            global_symbols: Box::new([]),
             relocations: RelocationCsr {
                 starts: vec![0, 0].into_boxed_slice(),
                 records: Box::new([]),
