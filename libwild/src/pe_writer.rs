@@ -3811,10 +3811,289 @@ fn dense_comdat_group(
     Ok(CachedComdatGroup { sections, parents })
 }
 
+#[derive(Clone, Copy)]
+struct DenseSelectedComdat {
+    primary: pe_ir::SectionId,
+    group: ComdatGroupId,
+    selection: linker_utils::coff_symbols::ComdatSelection,
+    timestamp: u32,
+}
+
+fn dense_comdat_selection(
+    selection: u8,
+    name: &[u8],
+) -> Result<linker_utils::coff_symbols::ComdatSelection> {
+    use linker_utils::coff_symbols::ComdatSelection;
+    Ok(match object::pe::ComdatSelection(selection) {
+        object::pe::IMAGE_COMDAT_SELECT_NODUPLICATES => ComdatSelection::NoDuplicates,
+        object::pe::IMAGE_COMDAT_SELECT_ANY => ComdatSelection::Any,
+        object::pe::IMAGE_COMDAT_SELECT_SAME_SIZE => ComdatSelection::SameSize,
+        object::pe::IMAGE_COMDAT_SELECT_EXACT_MATCH => ComdatSelection::ExactMatch,
+        object::pe::IMAGE_COMDAT_SELECT_LARGEST => ComdatSelection::Largest,
+        object::pe::IMAGE_COMDAT_SELECT_NEWEST => ComdatSelection::Newest,
+        _ => {
+            return Err(error!(
+                "COMDAT `{}` has an unsupported selection",
+                String::from_utf8_lossy(name)
+            ));
+        }
+    })
+}
+
+fn dense_comdat_contents<'a>(
+    dense: &'a DenseProductionState<'a>,
+    section: pe_ir::SectionId,
+) -> Result<&'a [u8]> {
+    let section = dense
+        .ir
+        .sections
+        .get(section.index())
+        .context("selected dense COMDAT section is invalid")?;
+    match section.data {
+        Some(source) => dense
+            .ir
+            .sources
+            .bytes(source)
+            .context("invalid selected dense COMDAT contents"),
+        None if section.size == 0 => Ok(&[]),
+        None => Err(error!("selected COMDAT has no initialized contents")),
+    }
+}
+
+fn dense_exact_match_signature(
+    objects: &[crate::coff::CoffObject<'_>],
+    dense: &DenseProductionState<'_>,
+    section: pe_ir::SectionId,
+) -> Result<Vec<u8>> {
+    let section = dense
+        .ir
+        .sections
+        .get(section.index())
+        .context("exact-match dense COMDAT section is invalid")?;
+    let section = objects[section.object.index()]
+        .file()
+        .section_by_index(object::SectionIndex(section.raw_index as usize))
+        .context("exact-match COMDAT has an invalid raw section")?;
+    Ok(format!("{:?}", section.relocations().collect::<Vec<_>>()).into_bytes())
+}
+
+fn discard_dense_comdat_group(
+    analysis: &CompactComdatAnalysis,
+    group: ComdatGroupId,
+    discarded: &mut HashSet<ObjectSectionKey>,
+) {
+    discarded.extend(
+        analysis.groups[group]
+            .iter()
+            .map(|&node| analysis.keys[node]),
+    );
+}
+
+fn record_dense_comdat_redirects(
+    objects: &[crate::coff::CoffObject<'_>],
+    dense: &DenseProductionState<'_>,
+    analysis: &CompactComdatAnalysis,
+    loser: DenseSelectedComdat,
+    winner: DenseSelectedComdat,
+    redirects: &mut SectionRedirects,
+) -> Result<()> {
+    let loser_record = dense.ir.sections[loser.primary.index()];
+    let winner_record = dense.ir.sections[winner.primary.index()];
+    let loser_group = dense_comdat_group(
+        dense,
+        analysis,
+        loser_record.object.index(),
+        object::SectionIndex(loser_record.raw_index as usize),
+    )?;
+    let winner_group = dense_comdat_group(
+        dense,
+        analysis,
+        winner_record.object.index(),
+        object::SectionIndex(winner_record.raw_index as usize),
+    )?;
+    record_comdat_redirects(
+        objects,
+        loser_record.object.index(),
+        &loser_group.sections,
+        &loser_group.parents,
+        winner_record.object.index(),
+        &winner_group.sections,
+        &winner_group.parents,
+        redirects,
+    );
+    Ok(())
+}
+
+fn discarded_dense_comdat_sections(
+    objects: &[crate::coff::CoffObject<'_>],
+    dense: &DenseProductionState<'_>,
+) -> Result<ComdatResolution> {
+    use linker_utils::coff_symbols::ComdatCandidate;
+    use linker_utils::coff_symbols::ComdatDecision;
+    use linker_utils::coff_symbols::ComdatSelection;
+    use linker_utils::coff_symbols::select_comdat;
+
+    let mut classify_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_CLASSIFY);
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Objects, objects.len());
+    let analysis = CompactComdatAnalysis::new_dense(dense)?;
+    let mut strong_definitions = vec![false; dense.names.len()];
+    for &symbol_id in &dense.ir.global_symbols {
+        let symbol = dense.ir.symbols[symbol_id.index()];
+        if symbol.is_definition()
+            && !symbol
+                .section
+                .get()
+                .is_some_and(|section| analysis.is_comdat[section.index()])
+        {
+            strong_definitions[symbol.name.index()] = true;
+        }
+    }
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Sections, analysis.keys.len());
+    classify_phase
+        .0
+        .add(crate::timing::PeMetric::Groups, analysis.groups.len());
+    classify_phase.0.add(
+        crate::timing::PeMetric::Symbols,
+        dense.ir.global_symbols.len(),
+    );
+    drop(classify_phase);
+
+    let mut selection_phase = crate::pe_timing_guard!(PE_DETAIL_COMDAT_SELECT);
+    let mut selected = vec![None::<DenseSelectedComdat>; dense.names.len()];
+    let mut resolution = ComdatResolution {
+        analysis,
+        ..ComdatResolution::default()
+    };
+    for (node, section) in dense.ir.sections.iter().enumerate() {
+        if section.comdat_selection == 0
+            || section.comdat_selection == object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0
+        {
+            continue;
+        }
+        let leader = section
+            .comdat_leader
+            .get()
+            .and_then(|leader| dense.ir.symbols.get(leader.index()))
+            .context("COMDAT has no indexed leader symbol")?;
+        if !leader.is_global() {
+            continue;
+        }
+        let name = dense
+            .names
+            .bytes(leader.name)
+            .context("global COMDAT leader has no canonical bytes")?;
+        let group = resolution.analysis.group_by_node[node];
+        if strong_definitions[leader.name.index()] {
+            discard_dense_comdat_group(&resolution.analysis, group, &mut resolution.discarded);
+            continue;
+        }
+        let selection = dense_comdat_selection(section.comdat_selection, name)?;
+        let candidate = DenseSelectedComdat {
+            primary: pe_ir::SectionId::from_u32(node as u32),
+            group,
+            selection,
+            timestamp: coff_timestamp(objects[section.object.index()].file()),
+        };
+        let Some(existing) = selected[leader.name.index()] else {
+            selected[leader.name.index()] = Some(candidate);
+            continue;
+        };
+        ensure!(
+            existing.selection == selection,
+            "COMDAT `{}` has conflicting selection kinds {:?} and {:?}",
+            String::from_utf8_lossy(name),
+            existing.selection,
+            selection
+        );
+        let (existing_contents, contents) = match selection {
+            ComdatSelection::SameSize | ComdatSelection::ExactMatch | ComdatSelection::Largest => (
+                dense_comdat_contents(dense, existing.primary)?,
+                dense_comdat_contents(dense, candidate.primary)?,
+            ),
+            _ => (&[][..], &[][..]),
+        };
+        let (existing_signature, signature) = if selection == ComdatSelection::ExactMatch {
+            (
+                dense_exact_match_signature(objects, dense, existing.primary)?,
+                dense_exact_match_signature(objects, dense, candidate.primary)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let decision = select_comdat(
+            selection,
+            ComdatCandidate {
+                contents: existing_contents,
+                relocation_signature: &existing_signature,
+                timestamp: existing.timestamp,
+            },
+            ComdatCandidate {
+                contents,
+                relocation_signature: &signature,
+                timestamp: candidate.timestamp,
+            },
+        )
+        .with_context(|| format!("while selecting COMDAT `{}`", String::from_utf8_lossy(name)))?;
+        match decision {
+            ComdatDecision::KeepExisting => {
+                discard_dense_comdat_group(
+                    &resolution.analysis,
+                    candidate.group,
+                    &mut resolution.discarded,
+                );
+                record_dense_comdat_redirects(
+                    objects,
+                    dense,
+                    &resolution.analysis,
+                    candidate,
+                    existing,
+                    &mut resolution.redirects,
+                )?;
+            }
+            ComdatDecision::ReplaceExisting => {
+                discard_dense_comdat_group(
+                    &resolution.analysis,
+                    existing.group,
+                    &mut resolution.discarded,
+                );
+                record_dense_comdat_redirects(
+                    objects,
+                    dense,
+                    &resolution.analysis,
+                    existing,
+                    candidate,
+                    &mut resolution.redirects,
+                )?;
+                selected[leader.name.index()] = Some(candidate);
+            }
+        }
+    }
+    selection_phase.0.add(
+        crate::timing::PeMetric::Groups,
+        selected.iter().filter(|entry| entry.is_some()).count(),
+    );
+    selection_phase.0.add(
+        crate::timing::PeMetric::Sections,
+        resolution.discarded.len(),
+    );
+    selection_phase
+        .0
+        .add(crate::timing::PeMetric::Events, resolution.redirects.len());
+    drop(selection_phase);
+    Ok(resolution)
+}
+
 fn discarded_comdat_sections_with_metadata(
     objects: &[crate::coff::CoffObject<'_>],
     metadata: &SelectedObjectMetadata,
 ) -> Result<ComdatResolution> {
+    if let Some(dense) = metadata.dense {
+        return discarded_dense_comdat_sections(objects, dense);
+    }
     use linker_utils::coff_symbols::ComdatCandidate;
     use linker_utils::coff_symbols::ComdatDecision;
     use linker_utils::coff_symbols::ComdatSelection;
