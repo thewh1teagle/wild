@@ -5,6 +5,8 @@ use crate::ensure;
 use crate::error;
 use crate::error::Context;
 use crate::error::Result;
+use foldhash::HashMap;
+use foldhash::HashMapExt;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
 use linker_utils::coff_archives::CoffArchive;
@@ -23,6 +25,7 @@ use object::Object;
 #[cfg(test)]
 use object::ObjectSymbol;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -533,13 +536,55 @@ struct CachedArchiveProviders {
 
 struct ArchiveProviderCache {
     by_name: Vec<Option<CachedArchiveProviders>>,
+    by_hash: HashMap<u64, SmallVec<[ArchiveProvider; 1]>>,
+    indexed_archives: usize,
 }
 
 impl ArchiveProviderCache {
     fn new() -> Self {
         Self {
             by_name: Vec::new(),
+            by_hash: HashMap::new(),
+            indexed_archives: 0,
         }
+    }
+
+    fn extend_index<'data>(&mut self, archives: &[&CoffArchive<'data>]) {
+        if self.indexed_archives == archives.len() {
+            return;
+        }
+        let first_archive = self.indexed_archives;
+        let chunks = archives[first_archive..]
+            .par_iter()
+            .enumerate()
+            .map(|(offset, archive)| {
+                let archive_index = first_archive + offset;
+                archive
+                    .definition_member_indices()
+                    .map(|(name, member_index)| {
+                        (
+                            crate::hash::hash_bytes(name),
+                            ArchiveProvider {
+                                archive: ArchiveId::from_u32(
+                                    u32::try_from(archive_index)
+                                        .expect("PE archive count exceeds u32"),
+                                ),
+                                member: ArchiveMemberId::from_u32(
+                                    u32::try_from(member_index)
+                                        .expect("PE archive member count exceeds u32"),
+                                ),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for chunk in chunks {
+            for (hash, provider) in chunk {
+                self.by_hash.entry(hash).or_default().push(provider);
+            }
+        }
+        self.indexed_archives = archives.len();
     }
 
     fn providers<'cache, 'data>(
@@ -548,6 +593,7 @@ impl ArchiveProviderCache {
         name: &[u8],
         archives: &[&CoffArchive<'data>],
     ) -> &'cache [ArchiveProvider] {
+        self.extend_index(archives);
         if self.by_name.len() <= name_id.index() {
             if name_id.index() + 1 > self.by_name.capacity() {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
@@ -556,20 +602,25 @@ impl ArchiveProviderCache {
         }
         let cached =
             self.by_name[name_id.index()].get_or_insert_with(CachedArchiveProviders::default);
-        for (archive_index, archive) in archives.iter().enumerate().skip(cached.archives_scanned) {
-            // One indexed archive query for this canonical name and archive. The cached scan
-            // cursor ensures appended /defaultlib archives extend both positive and negative rows.
-            crate::perf::removal_counters::increment_archive_member_probes();
-            if let Some(member_index) = archive.first_definition_member_index(name) {
-                note_vec_push(&cached.providers);
-                cached.providers.push(ArchiveProvider {
-                    archive: ArchiveId::from_u32(
-                        u32::try_from(archive_index).expect("PE archive count exceeds u32"),
-                    ),
-                    member: ArchiveMemberId::from_u32(
-                        u32::try_from(member_index).expect("PE archive member count exceeds u32"),
-                    ),
-                });
+        if cached.archives_scanned == archives.len() {
+            return &cached.providers;
+        }
+        let hash = crate::hash::hash_bytes(name);
+        if let Some(candidates) = self.by_hash.get(&hash) {
+            for &provider in candidates {
+                let archive_index = provider.archive.index();
+                if archive_index < cached.archives_scanned {
+                    continue;
+                }
+                // Hash rows are collision candidates, not an equality claim. Verify through the
+                // authoritative archive index before exposing the provider.
+                crate::perf::removal_counters::increment_archive_member_probes();
+                if archives[archive_index].first_definition_member_index(name)
+                    == Some(provider.member.index())
+                {
+                    note_vec_push(&cached.providers);
+                    cached.providers.push(provider);
+                }
             }
         }
         cached.archives_scanned = archives.len();

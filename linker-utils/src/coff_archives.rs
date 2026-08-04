@@ -429,6 +429,16 @@ impl<'data> CoffArchive<'data> {
         self.definition_members.get(name).map(|entry| entry.first)
     }
 
+    /// Iterates the first indexed provider for every definition name.
+    ///
+    /// Linkers may use this to build one cross-archive provider index instead of probing every
+    /// archive hash table independently for each unresolved symbol.
+    pub fn definition_member_indices(&self) -> impl Iterator<Item = (&[u8], usize)> {
+        self.definition_members
+            .iter()
+            .map(|(name, provider)| (name.as_ref(), provider.first))
+    }
+
     /// Selects members to a fixpoint.
     ///
     /// `defined` contains definitions supplied by objects seen before this
