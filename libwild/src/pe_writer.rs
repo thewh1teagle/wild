@@ -2863,7 +2863,9 @@ fn collect_contributions_with_roots_metadata(
     contributions_phase
         .0
         .add(crate::timing::PeMetric::Objects, objects.len());
-    if rayon::current_num_threads() == 1 {
+    if let Some(dense) = metadata.dense {
+        output = materialize_dense_contributions(dense, &comdats, args, dense_gc.as_ref())?;
+    } else if rayon::current_num_threads() == 1 {
         // Avoid Rayon and retaining every per-object descriptor vector at once for the required
         // single-thread baseline. IDs are assigned authoritatively after empty-group filtering.
         for (object_index, input) in objects.iter().enumerate() {
@@ -2934,6 +2936,115 @@ fn collect_contributions_with_roots_metadata(
         .add(crate::timing::PeMetric::Sections, output.len());
     drop(contributions_phase);
     Ok((output, comdats.redirects, dense_gc))
+}
+
+fn materialize_dense_contributions(
+    dense: &DenseProductionState<'_>,
+    comdats: &ComdatResolution,
+    args: &crate::args::coff::CoffArgs,
+    gc: Option<&pe_gc::GcOutput>,
+) -> Result<Vec<Contribution>> {
+    let section_count = dense.ir.sections.len();
+    let discarded = if gc.is_none() {
+        Some(
+            comdats
+                .dense_discarded
+                .as_deref()
+                .context("production COMDAT resolution has no dense discard decisions")?,
+        )
+    } else {
+        None
+    };
+    let thread_count = rayon::current_num_threads();
+    let chunk_size = if thread_count == 1 {
+        section_count.max(1)
+    } else {
+        section_count
+            .div_ceil(thread_count.saturating_mul(4))
+            .max(4096)
+    };
+    let chunks = dense
+        .ir
+        .sections
+        .par_chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk, sections)| {
+            let first = chunk * chunk_size;
+            let mut output = Vec::new();
+            for (offset, section) in sections.iter().enumerate() {
+                let index = first + offset;
+                let dense_section = pe_ir::SectionId::from_u32(
+                    u32::try_from(index).context("PE section index exceeds dense ID range")?,
+                );
+                if gc.map_or_else(
+                    || discarded.unwrap()[index],
+                    |gc| !gc.is_live(dense_section),
+                ) {
+                    continue;
+                }
+                let raw_name = dense
+                    .names
+                    .bytes(section.name)
+                    .context("dense COFF section has no canonical name bytes")?;
+                if guard_metadata_policy(raw_name, args.guard.control_flow)?
+                    == GuardMetadataPolicy::Discard
+                {
+                    continue;
+                }
+                let flags = section.characteristics;
+                let class = linker_utils::coff_symbols::classify_section(flags)
+                    .context("invalid COFF section flags")?;
+                if class.discardable
+                    || flags & object::pe::IMAGE_SCN_LNK_REMOVE.0 != 0
+                    || section.contents == pe_ir::SectionContents::Metadata
+                {
+                    continue;
+                }
+                let kind = if section.contents == pe_ir::SectionContents::Uninitialized {
+                    ContributionKind::Bss
+                } else {
+                    ContributionKind::Data
+                };
+                if kind != ContributionKind::Bss {
+                    let data = match section.data {
+                        Some(source) => dense
+                            .ir
+                            .sources
+                            .bytes(source)
+                            .context("invalid dense COFF section contents")?,
+                        None if section.size == 0 => &[],
+                        None => return Err(error!("initialized dense COFF section has no data")),
+                    };
+                    ensure!(
+                        data.len() == section.size as usize,
+                        "COFF section contents differ from section size"
+                    );
+                }
+                output.push(Contribution {
+                    source: Source::Object {
+                        object: section.object.index(),
+                        section: object::SectionIndex(section.raw_index as usize),
+                    },
+                    dense_section: Some(dense_section),
+                    spec: SectionContribution {
+                        id: ContributionId(index as u32),
+                        name: merged_name(raw_name, args)?,
+                        characteristics: output_characteristics(flags),
+                        alignment: section.alignment.max(1),
+                        size: section.size,
+                        kind,
+                    },
+                    synthetic_data: Vec::new(),
+                });
+            }
+            Ok(output)
+        })
+        .collect::<Vec<Result<Vec<_>>>>();
+    let mut output = Vec::new();
+    for chunk in chunks {
+        output.extend(chunk?);
+    }
+    Ok(output)
 }
 
 fn materialize_object_contributions(
