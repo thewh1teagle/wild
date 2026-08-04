@@ -231,14 +231,34 @@ pub fn layout_sections_borrowed<'a>(
     options: SectionLayoutOptions,
 ) -> Result<SectionLayout> {
     validate_options(options)?;
-    let mut ids = BTreeSet::new();
+    // Production assigns contribution IDs densely in input order. Stay allocation-free for that
+    // common case, but lazily reconstruct the general sparse set at the first mismatch so the
+    // public API retains duplicate detection for arbitrary caller-assigned IDs.
+    let mut ids = None::<BTreeSet<ContributionId>>;
     let mut groups = BTreeMap::<Vec<u8>, Group<'_>>::new();
+    let mut contribution_count = 0usize;
     for (input_index, contribution) in contributions.into_iter().enumerate() {
-        ensure!(
-            ids.insert(contribution.id),
-            "duplicate contribution id {}",
-            contribution.id.0
-        );
+        if let Some(ids) = &mut ids {
+            ensure!(
+                ids.insert(contribution.id),
+                "duplicate contribution id {}",
+                contribution.id.0
+            );
+        } else if u32::try_from(input_index).ok() != Some(contribution.id.0) {
+            let mut sparse_ids = (0..input_index)
+                .map(|index| {
+                    u32::try_from(index)
+                        .map(ContributionId)
+                        .map_err(|_| anyhow::anyhow!("contribution ID range overflow"))
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            ensure!(
+                sparse_ids.insert(contribution.id),
+                "duplicate contribution id {}",
+                contribution.id.0
+            );
+            ids = Some(sparse_ids);
+        }
         validate_contribution(contribution)?;
         let (base, suffix) = split_name(&contribution.name);
         ensure!(
@@ -246,19 +266,24 @@ pub fn layout_sections_borrowed<'a>(
             "contribution {} has an empty canonical section name",
             contribution.id.0
         );
-        groups
-            .entry(base.to_vec())
-            .or_insert_with(|| Group {
-                name: base.to_vec(),
-                contributions: Vec::new(),
-            })
-            .contributions
-            .push(GroupedContribution {
-                input_index,
-                contribution,
-                suffix,
-                has_separator: base.len() != contribution.name.len(),
-            });
+        let grouped = GroupedContribution {
+            input_index,
+            contribution,
+            suffix,
+            has_separator: base.len() != contribution.name.len(),
+        };
+        if let Some(group) = groups.get_mut(base) {
+            group.contributions.push(grouped);
+        } else {
+            groups.insert(
+                base.to_vec(),
+                Group {
+                    name: base.to_vec(),
+                    contributions: vec![grouped],
+                },
+            );
+        }
+        contribution_count += 1;
     }
 
     let mut groups = groups.into_values().collect::<Vec<_>>();
@@ -275,7 +300,9 @@ pub fn layout_sections_borrowed<'a>(
         "first section file offset",
     )?;
     let mut sections = Vec::with_capacity(groups.len());
-    let mut placements = ContributionPlacements::default();
+    let mut placements = ContributionPlacements {
+        entries: Vec::with_capacity(contribution_count),
+    };
 
     for mut group in groups {
         group.contributions.sort_unstable_by(|left, right| {
