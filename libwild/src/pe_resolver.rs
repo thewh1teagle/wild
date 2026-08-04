@@ -112,8 +112,7 @@ pub(super) struct ResolverAlternateFallback {
 pub(super) enum ResolverProviderOccurrence {
     Object {
         name: NameId,
-        object: u32,
-        raw_symbol: u32,
+        global_symbol: u32,
         strength: BindingStrength,
     },
     Import {
@@ -344,6 +343,8 @@ impl<'data> IncrementalSymbolState<'data> {
         }
         let object_id = u32::try_from(index).context("PE object index exceeds u32")?;
         for symbol in summary.globals() {
+            let global_symbol = u32::try_from(self.global_names.len())
+                .context("PE global symbol count exceeds u32")?;
             let name_occurrence = symbol.name();
             let source = name_occurrence
                 .source()
@@ -396,8 +397,7 @@ impl<'data> IncrementalSymbolState<'data> {
                 note_vec_push(&self.providers);
                 self.providers.push(ResolverProviderOccurrence::Object {
                     name: name_id,
-                    object: object_id,
-                    raw_symbol: symbol.raw_index,
+                    global_symbol,
                     strength,
                 });
                 self.define_id(name_id);
@@ -1574,19 +1574,18 @@ mod tests {
             .map(|provider| match *provider {
                 ResolverProviderOccurrence::Object {
                     name,
-                    object,
-                    raw_symbol,
+                    global_symbol,
                     ..
-                } => (output.seed.names.bytes(name).unwrap(), object, raw_symbol),
+                } => (output.seed.names.bytes(name).unwrap(), global_symbol),
                 _ => panic!("fixture only selects object providers"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             provider_signature,
             [
-                (b"direct".as_slice(), 0, 0),
-                (b"arc_sym".as_slice(), 1, 0),
-                (b"second".as_slice(), 1, 1),
+                (b"direct".as_slice(), 0),
+                (b"arc_sym".as_slice(), 2),
+                (b"second".as_slice(), 3),
             ]
         );
     }
@@ -1678,8 +1677,7 @@ mod tests {
                 provider,
                 ResolverProviderOccurrence::Object {
                     name,
-                    object: 1,
-                    raw_symbol: 0,
+                    global_symbol: 1,
                     ..
                 } if *name == target_after
             )

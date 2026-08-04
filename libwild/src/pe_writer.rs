@@ -1359,16 +1359,18 @@ impl<'data> DenseProductionState<'data> {
             let (name, record) = match provider {
                 pe_resolver::ResolverProviderOccurrence::Object {
                     name,
-                    object,
-                    raw_symbol,
+                    global_symbol,
                     strength,
                 } => {
-                    let object = pe_ir::ObjectId::from_u32(object);
-                    let symbol = ir.symbol_by_raw(object, raw_symbol).ok_or_else(|| {
-                        error!(
-                            "resolver object provider {object:?}:{raw_symbol} has no dense symbol"
-                        )
-                    })?;
+                    let symbol =
+                        *ir.global_symbols
+                            .get(global_symbol as usize)
+                            .ok_or_else(|| {
+                                error!(
+                                    "resolver object provider {global_symbol} has no dense symbol"
+                                )
+                            })?;
+                    let object = ir.symbols[symbol.index()].object;
                     (
                         name,
                         pe_symbol_db::ProviderRecord::object(object, symbol, strength),
