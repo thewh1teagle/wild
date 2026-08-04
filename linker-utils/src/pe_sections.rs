@@ -9,6 +9,7 @@ use object::pe;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::ops::Index;
+use std::sync::Arc;
 
 const MAX_COFF_ALIGNMENT: u32 = 8192;
 const CONTENT_MASK: u32 = pe::IMAGE_SCN_CNT_CODE.0
@@ -39,7 +40,7 @@ pub enum ContributionKind {
 pub struct SectionContribution {
     pub id: ContributionId,
     /// Original COFF name, including an optional `$` subsection suffix.
-    pub name: Vec<u8>,
+    pub name: Arc<[u8]>,
     pub characteristics: u32,
     /// Required placement alignment in bytes.
     pub alignment: u32,
@@ -449,7 +450,7 @@ pub fn try_insert_relocation_section(
     validate_options(options)?;
     validate_contribution(contribution)?;
     ensure!(
-        contribution.name == b".reloc",
+        contribution.name.as_ref() == b".reloc",
         "incremental relocation contribution must be named `.reloc`"
     );
     ensure!(
@@ -606,7 +607,7 @@ pub fn try_insert_relocation_section(
     layout.sections.insert(
         output_section,
         OutputSection {
-            name: contribution.name.clone(),
+            name: contribution.name.to_vec(),
             characteristics,
             rva: first_shifted_rva,
             virtual_size: contribution.size,
@@ -837,7 +838,7 @@ mod tests {
         };
         SectionContribution {
             id: ContributionId(id),
-            name: name.to_vec(),
+            name: name.to_vec().into(),
             characteristics,
             alignment,
             size,
@@ -856,7 +857,7 @@ mod tests {
     fn relocation_contribution(id: u32, size: u32) -> SectionContribution {
         SectionContribution {
             id: ContributionId(id),
-            name: b".reloc".to_vec(),
+            name: b".reloc".to_vec().into(),
             characteristics: (pe::IMAGE_SCN_CNT_INITIALIZED_DATA
                 | pe::IMAGE_SCN_MEM_READ
                 | pe::IMAGE_SCN_MEM_DISCARDABLE)
@@ -1121,7 +1122,7 @@ mod tests {
 
         let mut wrong_name_layout = layout.clone();
         let mut wrong_name = relocation_contribution(2, 12);
-        wrong_name.name = b".not-reloc".to_vec();
+        wrong_name.name = b".not-reloc".to_vec().into();
         assert!(
             try_insert_relocation_section(&mut wrong_name_layout, &wrong_name, options).is_err()
         );

@@ -38,6 +38,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const LOAD_CONFIG_SYMBOL: &[u8] = b"_load_config_used";
 const PE_PHASE_LOAD_DEFINITION: &str = "PE: Load definition";
@@ -2956,19 +2957,21 @@ fn collect_contributions_with_roots_metadata(
     }
     // lld-link gives an empty input contribution a boundary location only when its merged
     // output section exists for some non-empty input. Entirely empty groups are omitted.
-    let non_empty_groups = output
+    let mut non_empty_groups = HashSet::new();
+    for contribution in output
         .iter()
         .filter(|contribution| contribution.spec.size != 0)
-        .map(|contribution| {
-            contribution
-                .spec
-                .name
-                .split(|byte| *byte == b'$')
-                .next()
-                .unwrap()
-                .to_vec()
-        })
-        .collect::<HashSet<_>>();
+    {
+        let name = contribution
+            .spec
+            .name
+            .split(|byte| *byte == b'$')
+            .next()
+            .unwrap();
+        if !non_empty_groups.contains(name) {
+            non_empty_groups.insert(name.to_vec());
+        }
+    }
     output.retain(|contribution| {
         contribution.spec.size != 0
             || non_empty_groups.contains(
@@ -3000,6 +3003,17 @@ fn materialize_dense_contributions(
     gc: Option<&pe_gc::GcOutput>,
 ) -> Result<Vec<Contribution>> {
     let section_count = dense.ir.sections.len();
+    let mut merged_names = vec![None::<Arc<[u8]>>; dense.names.len()];
+    for section in &dense.ir.sections {
+        let slot = &mut merged_names[section.name.index()];
+        if slot.is_none() {
+            let raw_name = dense
+                .names
+                .bytes(section.name)
+                .context("dense COFF section has no canonical name bytes")?;
+            *slot = Some(merged_name(raw_name, args)?.into());
+        }
+    }
     let discarded = if gc.is_none() {
         Some(
             comdats
@@ -3083,7 +3097,10 @@ fn materialize_dense_contributions(
                     dense_section: Some(dense_section),
                     spec: SectionContribution {
                         id: ContributionId(index as u32),
-                        name: merged_name(raw_name, args)?,
+                        name: merged_names[section.name.index()]
+                            .as_ref()
+                            .expect("selected section name was precomputed")
+                            .clone(),
                         characteristics: output_characteristics(flags),
                         alignment: section.alignment.max(1),
                         size: section.size,
@@ -3210,7 +3227,7 @@ fn materialize_object_contributions_into(
                 // filtering below assigns compact, globally ordered IDs before any downstream
                 // consumer observes the contributions.
                 id: ContributionId(output.len() as u32),
-                name,
+                name: name.into(),
                 characteristics: output_characteristics(flags),
                 alignment,
                 size,
@@ -4943,7 +4960,7 @@ fn add_common_symbols(
         dense_section: None,
         spec: SectionContribution {
             id,
-            name: b".bss$common".to_vec(),
+            name: b".bss$common".to_vec().into(),
             characteristics: bss_characteristics(),
             alignment: 16,
             size: cursor,
@@ -4970,7 +4987,7 @@ fn add_synthetic(
         dense_section: None,
         spec: SectionContribution {
             id,
-            name: name.to_vec(),
+            name: name.to_vec().into(),
             characteristics,
             alignment: if name.starts_with(b".text") {
                 16
@@ -6916,7 +6933,7 @@ mod tests {
             dense_section: None,
             spec: SectionContribution {
                 id: ContributionId(id),
-                name: name.to_vec(),
+                name: name.to_vec().into(),
                 characteristics: readonly_data_characteristics(),
                 alignment: 1,
                 size,
@@ -6936,7 +6953,7 @@ mod tests {
             dense_section: None,
             spec: SectionContribution {
                 id: ContributionId(id),
-                name: b".text".to_vec(),
+                name: b".text".to_vec().into(),
                 characteristics: text_characteristics(),
                 alignment: 1,
                 size: 5,
@@ -7041,7 +7058,7 @@ mod tests {
                 dense_section: None,
                 spec: SectionContribution {
                     id: ContributionId(index as u32),
-                    name: b".rdata".to_vec(),
+                    name: b".rdata".to_vec().into(),
                     characteristics: readonly_data_characteristics(),
                     alignment: 8,
                     size: 8,
@@ -8642,7 +8659,7 @@ mod tests {
                 .all(|(index, contribution)| { contribution.1 == ContributionId(index as u32) })
         );
         assert!(signature.iter().any(|contribution| {
-            contribution.2 == b".bss"
+            contribution.2.as_ref() == b".bss"
                 && contribution.6 == ContributionKind::Bss
                 && contribution.7.is_empty()
         }));
@@ -8656,12 +8673,12 @@ mod tests {
         assert!(
             signature
                 .iter()
-                .any(|contribution| contribution.2 == b".data$x")
+                .any(|contribution| contribution.2.as_ref() == b".data$x")
         );
         assert!(
-            signature
-                .iter()
-                .any(|contribution| contribution.2 == b".rdata$z" && contribution.5 == 0)
+            signature.iter().any(|contribution| {
+                contribution.2.as_ref() == b".rdata$z" && contribution.5 == 0
+            })
         );
         for omitted in [
             b".empty$z".as_slice(),
@@ -8673,7 +8690,7 @@ mod tests {
             assert!(
                 signature
                     .iter()
-                    .all(|contribution| contribution.2 != omitted),
+                    .all(|contribution| contribution.2.as_ref() != omitted),
                 "section {} must be filtered",
                 String::from_utf8_lossy(omitted)
             );
@@ -9944,7 +9961,7 @@ mod tests {
         assert_eq!(
             contributions
                 .iter()
-                .map(|contribution| contribution.spec.name.as_slice())
+                .map(|contribution| contribution.spec.name.as_ref())
                 .collect::<Vec<_>>(),
             [b".text".as_slice()]
         );
@@ -9965,7 +9982,7 @@ mod tests {
         assert_eq!(
             contributions
                 .iter()
-                .map(|contribution| contribution.spec.name.as_slice())
+                .map(|contribution| contribution.spec.name.as_ref())
                 .collect::<Vec<_>>(),
             [b".text".as_slice()]
         );
