@@ -1490,6 +1490,7 @@ struct SelectedObjectMetadata<'a, 'data> {
     #[cfg(test)]
     legacy_globals: &'a [pe_resolver::SelectedGlobalSymbol],
     weak: &'a linker_utils::coff_runtime::WeakExternalResolution,
+    #[cfg(test)]
     definition_names: HashSet<&'a [u8]>,
     dense: Option<&'a DenseProductionState<'data>>,
 }
@@ -1503,7 +1504,9 @@ struct SelectedGlobalView<'a> {
     size: u64,
     is_definition: bool,
     is_common: bool,
+    #[cfg(test)]
     is_undefined: bool,
+    #[cfg(test)]
     is_weak: bool,
     is_absolute: bool,
 }
@@ -1514,51 +1517,87 @@ impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
         roots: &[Vec<u8>],
         dense: Option<&'a DenseProductionState<'data>>,
     ) -> (Self, HashSet<Vec<u8>>) {
-        let mut metadata_phase = crate::pe_timing_guard!("PE symbols: Build selected metadata");
-        metadata_phase.0.add(
-            crate::timing::PeMetric::Symbols,
-            dense.map_or_else(
-                || {
-                    #[cfg(test)]
-                    {
-                        snapshot.globals.len()
-                    }
-                    #[cfg(not(test))]
-                    {
-                        0
-                    }
+        #[cfg(not(test))]
+        {
+            debug_assert!(roots.is_empty());
+            (
+                Self {
+                    weak: &snapshot.weak_resolution,
+                    dense,
                 },
-                |dense| dense.ir.global_symbols.len(),
-            ),
-        );
-        let mut undefined = roots.iter().cloned().collect::<HashSet<_>>();
-        let mut definitions = HashSet::new();
-        for_each_selected_global(snapshot, dense, |symbol| {
-            let name = symbol.name;
-            if symbol.is_definition || symbol.is_common {
-                // Keep empty global definitions, matching object_definition_names.
-                definitions.insert(name);
-            } else if !name.is_empty() && symbol.is_undefined && !symbol.is_weak {
-                undefined.insert(name.to_vec());
-            }
-            Ok(())
-        })
-        .expect("selected globals were validated during dense finalization");
-        undefined.retain(|name| !definitions.contains(name.as_slice()));
-        (
-            Self {
-                #[cfg(test)]
-                legacy_globals: &snapshot.globals,
-                weak: &snapshot.weak_resolution,
-                definition_names: definitions,
-                dense,
-            },
-            undefined,
-        )
+                HashSet::new(),
+            )
+        }
+        #[cfg(test)]
+        {
+            let mut metadata_phase = crate::pe_timing_guard!("PE symbols: Build selected metadata");
+            metadata_phase.0.add(
+                crate::timing::PeMetric::Symbols,
+                dense.map_or_else(
+                    || {
+                        #[cfg(test)]
+                        {
+                            snapshot.globals.len()
+                        }
+                        #[cfg(not(test))]
+                        {
+                            0
+                        }
+                    },
+                    |dense| dense.ir.global_symbols.len(),
+                ),
+            );
+            let mut undefined = roots.iter().cloned().collect::<HashSet<_>>();
+            let mut definitions = HashSet::new();
+            for_each_selected_global(snapshot, dense, |symbol| {
+                let name = symbol.name;
+                if symbol.is_definition || symbol.is_common {
+                    // Keep empty global definitions, matching object_definition_names.
+                    definitions.insert(name);
+                } else if !name.is_empty() && symbol.is_undefined && !symbol.is_weak {
+                    undefined.insert(name.to_vec());
+                }
+                Ok(())
+            })
+            .expect("selected globals were validated during dense finalization");
+            undefined.retain(|name| !definitions.contains(name.as_slice()));
+            (
+                Self {
+                    legacy_globals: &snapshot.globals,
+                    weak: &snapshot.weak_resolution,
+                    definition_names: definitions,
+                    dense,
+                },
+                undefined,
+            )
+        }
     }
 
+    #[cfg(test)]
     fn definition_names(&self) -> &HashSet<&'a [u8]> {
         &self.definition_names
+    }
+
+    fn has_selected_definition(&self, name: &[u8]) -> bool {
+        if let Some(dense) = self.dense {
+            let Some(name) = dense
+                .names
+                .lookup_prehashed(name, crate::hash::hash_bytes(name))
+            else {
+                return false;
+            };
+            return dense.symbols.providers_for(name).is_some_and(|providers| {
+                providers
+                    .iter()
+                    .any(|provider| provider.kind() == pe_symbol_db::ProviderKind::ObjectSymbol)
+            });
+        }
+        #[cfg(test)]
+        {
+            self.definition_names.contains(name)
+        }
+        #[cfg(not(test))]
+        unreachable!("production metadata requires dense symbol providers")
     }
 
     fn weak(&self) -> &linker_utils::coff_runtime::WeakExternalResolution {
@@ -1594,6 +1633,7 @@ impl<'a, 'data> SelectedObjectMetadata<'a, 'data> {
     }
 }
 
+#[cfg(test)]
 fn for_each_selected_global<'a, 'data>(
     _snapshot: &'a pe_resolver::SelectedSymbolSnapshot,
     dense: Option<&'a DenseProductionState<'data>>,
@@ -1642,7 +1682,9 @@ fn for_each_selected_global_parts<'a, 'data>(
                 size: u64::from(symbol.size),
                 is_definition: symbol.is_definition(),
                 is_common: symbol.is_common(),
+                #[cfg(test)]
                 is_undefined: symbol.is_undefined(),
+                #[cfg(test)]
                 is_weak: symbol.is_weak(),
                 is_absolute: symbol.is_absolute(),
             })?;
@@ -1736,7 +1778,6 @@ fn absolute_symbol_values(
     metadata: &SelectedObjectMetadata<'_, '_>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<HashMap<Vec<u8>, u64>> {
-    let definitions = metadata.definition_names();
     let mut absolute = HashMap::new();
     metadata.for_each_global(|symbol| {
         if symbol.is_absolute {
@@ -1748,27 +1789,29 @@ fn absolute_symbol_values(
         Ok(())
     })?;
     for symbol in LINKER_ABSOLUTE_ZERO_SYMBOLS {
-        if !definitions.contains(*symbol) {
+        if !metadata.has_selected_definition(symbol) {
             absolute.insert(symbol.to_vec(), 0);
         }
     }
 
     let weak = metadata.weak();
     for (symbol, _, _) in weak.records() {
-        if definitions.contains(symbol) {
+        if metadata.has_selected_definition(symbol) {
             continue;
         }
-        let target = weak.resolve(symbol, |candidate| definitions.contains(candidate))?;
+        let target = weak.resolve(symbol, |candidate| {
+            metadata.has_selected_definition(candidate)
+        })?;
         if let Some(value) = absolute.get(target).copied() {
             absolute.insert(symbol.to_vec(), value);
         }
     }
     for (symbol, _) in runtime_resolution.alternate_names() {
-        if definitions.contains(symbol.as_bytes()) {
+        if metadata.has_selected_definition(symbol.as_bytes()) {
             continue;
         }
         let target = runtime_resolution.resolve_alternate_name(symbol, |candidate| {
-            definitions.contains(candidate.as_bytes())
+            metadata.has_selected_definition(candidate.as_bytes())
         })?;
         if let Some(value) = absolute.get(target.as_bytes()).copied() {
             absolute.insert(symbol.as_bytes().to_vec(), value);
@@ -2194,23 +2237,20 @@ fn build_image_with_delay_loads(
         args.force.multiple,
     )?;
     for (name, (offset, id)) in common_offsets {
-        definitions
-            .entry(name)
-            .or_insert(config.image_base + u64::from(layout.placements[&id].rva + offset));
+        definitions.insert_if_absent(
+            name,
+            config.image_base + u64::from(layout.placements[&id].rva + offset),
+        );
     }
     for (name, rva) in &emitted_imports.symbols {
-        definitions
-            .entry(name.clone())
-            .or_insert(config.image_base + u64::from(*rva));
+        definitions.insert_if_absent(name.clone(), config.image_base + u64::from(*rva));
     }
     for (name, rva) in &emitted_delay_imports.symbols {
-        definitions
-            .entry(name.clone())
-            .or_insert(config.image_base + u64::from(*rva));
+        definitions.insert_if_absent(name.clone(), config.image_base + u64::from(*rva));
     }
     add_image_base_symbol(&mut definitions, config.image_base);
     for (symbol, value) in &absolute_symbols {
-        definitions.entry(symbol.clone()).or_insert(*value);
+        definitions.insert_if_absent(symbol.clone(), *value);
     }
     bind_weak_externals(objects, symbol_metadata, &mut definitions)?;
     bind_alternate_names(&mut definitions, runtime_resolution)?;
@@ -2484,7 +2524,7 @@ fn build_image_with_delay_loads(
     })
 }
 
-fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u64) {
+fn add_image_base_symbol(definitions: &mut DefinitionMap<'_, '_>, image_base: u64) {
     use linker_utils::coff_runtime::LinkerDefinedValue;
     use linker_utils::coff_runtime::linker_defined_symbol;
 
@@ -2495,9 +2535,7 @@ fn add_image_base_symbol(definitions: &mut HashMap<Vec<u8>, u64>, image_base: u6
     else {
         unreachable!("the PE runtime policy always defines __ImageBase")
     };
-    definitions
-        .entry(b"__ImageBase".to_vec())
-        .or_insert(address);
+    definitions.insert_if_absent(b"__ImageBase".to_vec(), address);
 }
 
 fn delay_iat_slots(
@@ -2524,37 +2562,37 @@ fn delay_iat_slots(
 fn bind_weak_externals(
     _objects: &[crate::coff::CoffObject<'_>],
     metadata: &SelectedObjectMetadata,
-    definitions: &mut HashMap<Vec<u8>, u64>,
+    definitions: &mut DefinitionMap<'_, '_>,
 ) -> Result<()> {
     let weak = metadata.weak();
-    let strong = definitions.keys().cloned().collect::<HashSet<_>>();
     for (symbol, _, _) in weak.records() {
-        if strong.contains(symbol) {
+        if definitions.contains_strong(symbol) {
             continue;
         }
-        let target = weak.resolve(symbol, |candidate| strong.contains(candidate))?;
+        let target = weak.resolve(symbol, |candidate| definitions.contains_strong(candidate))?;
         if let Some(address) = definitions.get(target).copied() {
-            definitions.insert(symbol.to_vec(), address);
+            definitions.insert_alias(symbol.to_vec(), address);
         }
     }
     Ok(())
 }
 
 fn bind_alternate_names(
-    definitions: &mut HashMap<Vec<u8>, u64>,
+    definitions: &mut DefinitionMap<'_, '_>,
     runtime_resolution: &linker_utils::coff_runtime::RuntimeResolution,
 ) -> Result<()> {
     // Resolve every chain against the immutable set of real definitions. Alias
     // bindings added earlier in this loop must never become strong definitions.
-    let strong = definitions.keys().cloned().collect::<HashSet<_>>();
+    definitions.promote_aliases();
     for (symbol, _) in runtime_resolution.alternate_names() {
-        if strong.contains(symbol.as_bytes()) {
+        if definitions.contains_strong(symbol.as_bytes()) {
             continue;
         }
-        let target = runtime_resolution
-            .resolve_alternate_name(symbol, |candidate| strong.contains(candidate.as_bytes()))?;
+        let target = runtime_resolution.resolve_alternate_name(symbol, |candidate| {
+            definitions.contains_strong(candidate.as_bytes())
+        })?;
         if let Some(address) = definitions.get(target.as_bytes()).copied() {
-            definitions.insert(symbol.as_bytes().to_vec(), address);
+            definitions.insert_alias(symbol.as_bytes().to_vec(), address);
         }
     }
     Ok(())
@@ -2604,7 +2642,7 @@ fn load_config_directory(
     contributions: &[Contribution],
     locations: &LocationMap,
     layout: &SectionLayout,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     image_base: u64,
 ) -> Result<Option<(u32, u32)>> {
     let Some(&selected_va) = definitions.get(LOAD_CONFIG_SYMBOL) else {
@@ -2718,7 +2756,7 @@ fn resolve_export_target<'a>(
     locations: &LocationMap,
     redirects: &SectionRedirects,
     layout: &SectionLayout,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     image_base: u64,
 ) -> Result<ExportTarget<'a>> {
     if looks_like_forwarder(export) {
@@ -4411,16 +4449,117 @@ fn dir64_rvas(sites: &[Dir64Site], layout: &SectionLayout) -> Result<Vec<u32>> {
 
 type LocationMap = HashMap<(usize, object::SectionIndex), ContributionId>;
 
-fn definitions(
+/// Dense object definitions stay indexed by canonical NameId. Only linker-generated names and
+/// compatibility aliases require byte-owned hash entries, avoiding one allocation and rehash for
+/// every selected COFF global.
+struct DefinitionMap<'state, 'data> {
+    names: Option<&'state pe_symbol_db::OrderedNameInterner<'data>>,
+    dense: Vec<Option<u64>>,
+    strong: HashMap<Vec<u8>, u64>,
+    aliases: HashMap<Vec<u8>, u64>,
+}
+
+impl<'state, 'data> DefinitionMap<'state, 'data> {
+    fn new(dense: Option<&'state DenseProductionState<'data>>) -> Self {
+        Self {
+            names: dense.map(|dense| &dense.names),
+            dense: vec![None; dense.map_or(0, |dense| dense.names.len())],
+            strong: HashMap::new(),
+            aliases: HashMap::new(),
+        }
+    }
+
+    fn dense_id(&self, name: &[u8]) -> Option<pe_ir::NameId> {
+        self.names?
+            .lookup_prehashed(name, crate::hash::hash_bytes(name))
+    }
+
+    fn get(&self, name: &[u8]) -> Option<&u64> {
+        self.aliases
+            .get(name)
+            .or_else(|| self.strong.get(name))
+            .or_else(|| {
+                self.dense_id(name)
+                    .and_then(|id| self.dense[id.index()].as_ref())
+            })
+    }
+
+    fn contains_strong(&self, name: &[u8]) -> bool {
+        self.strong.contains_key(name)
+            || self
+                .dense_id(name)
+                .is_some_and(|id| self.dense[id.index()].is_some())
+    }
+
+    fn insert_dense(&mut self, name: pe_ir::NameId, value: u64) -> Option<u64> {
+        self.dense[name.index()].replace(value)
+    }
+
+    fn insert_if_absent(&mut self, name: Vec<u8>, value: u64) {
+        if self.get(&name).is_some() {
+            return;
+        }
+        if let Some(id) = self.dense_id(&name) {
+            self.dense[id.index()] = Some(value);
+        } else {
+            self.strong.insert(name, value);
+        }
+    }
+
+    fn insert_alias(&mut self, name: Vec<u8>, value: u64) {
+        self.aliases.insert(name, value);
+    }
+
+    fn promote_aliases(&mut self) {
+        self.strong.extend(self.aliases.drain());
+    }
+}
+
+fn definitions<'state, 'data>(
     _objects: &[crate::coff::CoffObject<'_>],
-    metadata: &SelectedObjectMetadata,
+    metadata: &'state SelectedObjectMetadata<'_, 'data>,
     contributions: &[Contribution],
     layout: &SectionLayout,
     image_base: u64,
     allow_multiple: bool,
-) -> Result<(LocationMap, HashMap<Vec<u8>, u64>)> {
+) -> Result<(LocationMap, DefinitionMap<'state, 'data>)> {
     let locations = source_locations(contributions);
-    let mut definitions = HashMap::new();
+    let mut definitions = DefinitionMap::new(metadata.dense);
+    if let Some(dense) = metadata.dense {
+        let mut section_contributions = vec![None; dense.ir.sections.len()];
+        for contribution in contributions {
+            if let Some(section) = contribution.dense_section {
+                section_contributions[section.index()] = Some(contribution.spec.id);
+            }
+        }
+        for &symbol_id in &dense.ir.global_symbols {
+            let symbol = dense.ir.symbols[symbol_id.index()];
+            if symbol.is_common() {
+                continue;
+            }
+            let address = if let Some(section) = symbol.section.get() {
+                let Some(id) = section_contributions[section.index()] else {
+                    continue;
+                };
+                image_base + u64::from(layout.placements[id].rva) + symbol.value
+            } else if symbol.is_definition() {
+                symbol.value
+            } else {
+                continue;
+            };
+            if let Some(old) = definitions.insert_dense(symbol.name, address) {
+                ensure!(
+                    allow_multiple || old == address,
+                    "duplicate symbol `{}`",
+                    String::from_utf8_lossy(dense.names.bytes(symbol.name).unwrap_or_default())
+                );
+                if allow_multiple {
+                    definitions.insert_dense(symbol.name, old);
+                }
+            }
+        }
+        return Ok((locations, definitions));
+    }
     metadata.for_each_global(|symbol| {
         if symbol.is_common {
             return Ok(());
@@ -4436,14 +4575,16 @@ fn definitions(
         } else {
             return Ok(());
         };
-        if let Some(old) = definitions.insert(name.clone(), address) {
+        let old = definitions.get(&name).copied();
+        definitions.insert_if_absent(name.clone(), address);
+        if let Some(old) = old {
             ensure!(
                 allow_multiple || old == address,
                 "duplicate symbol `{}`",
                 String::from_utf8_lossy(&name)
             );
             if allow_multiple {
-                definitions.insert(name, old);
+                let _ = old;
             }
         }
         Ok(())
@@ -4574,7 +4715,7 @@ fn copy_and_apply_relocations(
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
     dense_targets: Option<&[Option<DenseSectionTarget>]>,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     image: &mut [u8],
@@ -4731,7 +4872,7 @@ fn copy_and_relocate_contribution(
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     parallel_image: pe_layout::DisjointOutput<'_>,
@@ -4811,7 +4952,7 @@ fn copy_and_relocate_dense_contribution(
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
     dense_targets: Option<&[Option<DenseSectionTarget>]>,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     parallel_image: pe_layout::DisjointOutput<'_>,
@@ -4887,7 +5028,7 @@ fn prepare_dense_relocation(
     redirects: &SectionRedirects,
     dense_gc: Option<&pe_gc::GcOutput>,
     dense_targets: Option<&[Option<DenseSectionTarget>]>,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     placement: &linker_utils::pe_sections::ContributionPlacement,
@@ -5072,7 +5213,7 @@ fn prepare_relocation(
     layout: &SectionLayout,
     locations: &LocationMap,
     redirects: &SectionRedirects,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     absolute_symbols: &HashMap<Vec<u8>, u64>,
     image_base: u64,
     placement: &linker_utils::pe_sections::ContributionPlacement,
@@ -5301,7 +5442,7 @@ fn prepare_tls_directory(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
     layout: &SectionLayout,
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     dir64_rvas: &[u32],
     image_base: u64,
     dynamic_base: bool,
@@ -5474,7 +5615,7 @@ fn validate_tls_callbacks(
 }
 
 fn tls_definition_rva(
-    definitions: &HashMap<Vec<u8>, u64>,
+    definitions: &DefinitionMap<'_, '_>,
     name: &[u8],
     image_base: u64,
 ) -> Result<u32> {
@@ -7004,10 +7145,9 @@ mod tests {
 
     #[test]
     fn alternate_binding_never_overrides_a_strong_definition() {
-        let mut definitions = HashMap::from([
-            (b"primary".to_vec(), 0x1111),
-            (b"fallback".to_vec(), 0x2222),
-        ]);
+        let mut definitions = DefinitionMap::new(None);
+        definitions.insert_if_absent(b"primary".to_vec(), 0x1111);
+        definitions.insert_if_absent(b"fallback".to_vec(), 0x2222);
         let mut runtime = linker_utils::coff_runtime::RuntimeResolution::new();
         runtime
             .parse_and_apply("/alternatename:primary=fallback", "directives.obj")
@@ -7015,7 +7155,7 @@ mod tests {
 
         bind_alternate_names(&mut definitions, &runtime).unwrap();
 
-        assert_eq!(definitions[b"primary".as_slice()], 0x1111);
+        assert_eq!(definitions.get(b"primary"), Some(&0x1111));
     }
 
     #[test]
@@ -7809,11 +7949,12 @@ mod tests {
 
     #[test]
     fn strong_image_base_definition_wins_over_linker_default() {
-        let mut definitions = HashMap::from([(b"__ImageBase".to_vec(), 0x1_4000_2000)]);
+        let mut definitions = DefinitionMap::new(None);
+        definitions.insert_if_absent(b"__ImageBase".to_vec(), 0x1_4000_2000);
 
         add_image_base_symbol(&mut definitions, 0x1_4000_0000);
 
-        assert_eq!(definitions[b"__ImageBase".as_slice()], 0x1_4000_2000);
+        assert_eq!(definitions.get(b"__ImageBase"), Some(&0x1_4000_2000));
     }
 
     #[test]
@@ -8849,11 +8990,12 @@ mod tests {
             file_size: 0,
             size_of_image: 0x1000,
         };
+        let definitions = DefinitionMap::new(None);
         let error = prepare_tls_directory(
             &[],
             &[],
             &layout,
-            &HashMap::new(),
+            &definitions,
             &[],
             PeWriterConfig::default().image_base,
             true,
