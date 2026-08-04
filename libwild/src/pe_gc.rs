@@ -207,20 +207,34 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         resolved: &ResolvedSymbolTargets,
         relocation: RelocationRecord,
     ) -> Result<ResolvedTarget> {
-        let target = resolved
-            .relocation(relocation)
+        if relocation.has_invalid_target() {
+            return Err(error!(
+                "Invalid COFF relocation symbol {}",
+                relocation.target.get()
+            ));
+        }
+        // Section GC never consumes a symbol's section-relative value. Read only the kind and
+        // target columns here; relocation application retains the full three-column lookup.
+        let (kind, target) = resolved
+            .kind_target(relocation.target)
             .context("relocation target is outside resolved symbol table")?;
-        Ok(match target.kind {
+        Ok(match kind {
             ResolvedTargetKind::Section => ResolvedTarget {
-                section: Some(SectionId::from_u32(target.target)),
+                section: Some(SectionId::from_u32(target)),
                 import: None,
                 import_name: None,
                 absolute: false,
             },
             ResolvedTargetKind::Import => ResolvedTarget {
                 section: None,
-                import: Some(super::pe_ir::ImportId::from_u32(target.value)),
-                import_name: Some(NameId::from_u32(target.target)),
+                // Load the value column only for the rare import edge. Section edges, which
+                // dominate production GC, avoid that extra random access entirely.
+                import: Some(super::pe_ir::ImportId::from_u32(
+                    resolved
+                        .value(relocation.target)
+                        .context("import target is outside resolved symbol table")?,
+                )),
+                import_name: Some(NameId::from_u32(target)),
                 absolute: false,
             },
             ResolvedTargetKind::Absolute => ResolvedTarget {
@@ -231,7 +245,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             },
             ResolvedTargetKind::Name => ResolvedTarget::default(),
             ResolvedTargetKind::Diagnostic => {
-                return Err(error!("Invalid COFF relocation symbol {}", target.target));
+                return Err(error!("Invalid COFF relocation symbol {}", target));
             }
         })
     }
@@ -1082,7 +1096,7 @@ mod tests {
             providers: Box::new([]),
             absolute_values: Box::new([]),
         };
-        let resolved = ir.resolve_symbol_targets(&database, &[]);
+        let resolved = ir.resolve_symbol_targets(&database, &[]).unwrap();
         let collector = DenseEventGc::new_resolved(&ir, &[], &resolved);
         let is_comdat = vec![false; SECTION_COUNT];
         let output = rayon::ThreadPoolBuilder::new()

@@ -1472,7 +1472,7 @@ impl<'data> DenseProductionState<'data> {
             crate::timing::PeMetric::Names,
             finalized.symbols.entries.len(),
         );
-        let resolved_targets = ir.resolve_symbol_targets(&finalized.symbols, &alternate_targets);
+        let resolved_targets = ir.resolve_symbol_targets(&finalized.symbols, &alternate_targets)?;
         drop(resolve_targets_phase);
         Ok(Self {
             ir,

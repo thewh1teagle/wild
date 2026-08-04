@@ -371,17 +371,40 @@ impl ResolvedTarget {
 
 #[derive(Debug)]
 pub(super) struct ResolvedSymbolTargets {
-    kinds: Box<[ResolvedTargetKind]>,
-    targets: Box<[u32]>,
+    packed: Box<[u32]>,
     values: Box<[u32]>,
     pub(super) names: Box<[ResolvedTarget]>,
 }
 
 impl ResolvedSymbolTargets {
+    const KIND_BITS: u32 = 3;
+    const KIND_MASK: u32 = (1 << Self::KIND_BITS) - 1;
+    const TARGET_MAX: u32 = u32::MAX >> Self::KIND_BITS;
+
+    fn pack(kind: ResolvedTargetKind, target: u32) -> Result<u32> {
+        if target > Self::TARGET_MAX {
+            return Err(crate::error!(
+                "resolved PE symbol target exceeds compact 29-bit range"
+            ));
+        }
+        Ok((target << Self::KIND_BITS) | kind as u32)
+    }
+
+    fn unpack(value: u32) -> Option<(ResolvedTargetKind, u32)> {
+        let kind = match value & Self::KIND_MASK {
+            0 => ResolvedTargetKind::Section,
+            1 => ResolvedTargetKind::Import,
+            2 => ResolvedTargetKind::Absolute,
+            3 => ResolvedTargetKind::Name,
+            4 => ResolvedTargetKind::Diagnostic,
+            _ => return None,
+        };
+        Some((kind, value >> Self::KIND_BITS))
+    }
+
     #[inline(always)]
     pub(super) fn kind_target(&self, symbol: SymbolId) -> Option<(ResolvedTargetKind, u32)> {
-        let index = symbol.index();
-        Some((*self.kinds.get(index)?, *self.targets.get(index)?))
+        Self::unpack(*self.packed.get(symbol.index())?)
     }
 
     #[inline(always)]
@@ -392,9 +415,10 @@ impl ResolvedSymbolTargets {
     #[inline(always)]
     pub(super) fn symbol(&self, symbol: SymbolId) -> Option<ResolvedTarget> {
         let index = symbol.index();
+        let (kind, target) = Self::unpack(*self.packed.get(index)?)?;
         Some(ResolvedTarget {
-            kind: *self.kinds.get(index)?,
-            target: *self.targets.get(index)?,
+            kind,
+            target,
             value: *self.values.get(index)?,
             flags: 0,
             reserved: 0,
@@ -483,15 +507,14 @@ impl<'data> PeIr<'data> {
         &self,
         symbols: &SymbolDb,
         alternate_targets: &[u32],
-    ) -> ResolvedSymbolTargets {
+    ) -> Result<ResolvedSymbolTargets> {
         let names = (0..symbols.entries.len())
             .map(|index| {
                 self.resolve_name_target(symbols, alternate_targets, NameId::from_u32(index as u32))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let mut kinds = Vec::with_capacity(self.symbols.len());
-        let mut targets = Vec::with_capacity(self.symbols.len());
+        let mut packed = Vec::with_capacity(self.symbols.len());
         let mut values = Vec::with_capacity(self.symbols.len());
         for symbol in &self.symbols {
             let target = if symbol.diagnostic == SymbolDiagnostic::InvalidRelocationTarget {
@@ -509,16 +532,14 @@ impl<'data> PeIr<'data> {
                     .copied()
                     .unwrap_or_else(|| ResolvedTarget::diagnostic(symbol.raw_index))
             };
-            kinds.push(target.kind);
-            targets.push(target.target);
+            packed.push(ResolvedSymbolTargets::pack(target.kind, target.target)?);
             values.push(target.value);
         }
-        ResolvedSymbolTargets {
-            kinds: kinds.into_boxed_slice(),
-            targets: targets.into_boxed_slice(),
+        Ok(ResolvedSymbolTargets {
+            packed: packed.into_boxed_slice(),
             values: values.into_boxed_slice(),
             names,
-        }
+        })
     }
 
     fn resolve_name_target(
@@ -1477,5 +1498,28 @@ mod tests {
         let error = ir.relocation_target(malformed).unwrap_err();
         assert!(format!("{error:?}").contains("Invalid COFF relocation symbol"));
         assert!(ir.relocation_target(ir.relocations.records[1]).is_ok());
+    }
+
+    #[test]
+    fn resolved_symbol_target_packing_round_trips_and_rejects_overflow() {
+        for kind in [
+            ResolvedTargetKind::Section,
+            ResolvedTargetKind::Import,
+            ResolvedTargetKind::Absolute,
+            ResolvedTargetKind::Name,
+            ResolvedTargetKind::Diagnostic,
+        ] {
+            for target in [0, 1, ResolvedSymbolTargets::TARGET_MAX] {
+                let packed = ResolvedSymbolTargets::pack(kind, target).unwrap();
+                assert_eq!(ResolvedSymbolTargets::unpack(packed), Some((kind, target)));
+            }
+        }
+        assert!(
+            ResolvedSymbolTargets::pack(
+                ResolvedTargetKind::Section,
+                ResolvedSymbolTargets::TARGET_MAX + 1,
+            )
+            .is_err()
+        );
     }
 }
