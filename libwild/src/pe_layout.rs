@@ -240,6 +240,8 @@ mod tests {
                 contents: SectionContents::Data,
                 comdat_selection: 0,
                 associative_section: OptionalSectionId::NONE,
+                comdat_leader: crate::pe_writer::pe_ir::OptionalSymbolId::NONE,
+                comdat_order: u32::MAX,
             }]
             .into_boxed_slice(),
             symbols: Box::new([]),

@@ -165,6 +165,8 @@ pub(super) struct SectionRecord {
     pub(super) contents: SectionContents,
     pub(super) comdat_selection: u8,
     pub(super) associative_section: OptionalSectionId,
+    pub(super) comdat_leader: OptionalSymbolId,
+    pub(super) comdat_order: u32,
 }
 
 /// `u32::MAX` is the packed no-section value; valid dense section IDs never use it.
@@ -779,11 +781,25 @@ fn build_dense_object_chunk(
             start: range.start,
             len: range.len,
         });
-        let associative_section = section
-            .associative_section
-            .map(|raw| section_from_raw(offsets.section, raw))
-            .transpose()?
-            .map_or(OptionalSectionId::NONE, OptionalSectionId::some);
+        let associative_section = if section.associative_section == u32::MAX {
+            OptionalSectionId::NONE
+        } else {
+            OptionalSectionId::some(section_from_raw(
+                offsets.section,
+                object::SectionIndex(section.associative_section as usize),
+            )?)
+        };
+        let comdat_leader = if section.comdat_leader == u32::MAX {
+            OptionalSymbolId::NONE
+        } else {
+            OptionalSymbolId::some(
+                offsets
+                    .symbol
+                    .checked_add(section.comdat_leader)
+                    .map(SymbolId::from_u32)
+                    .ok_or_else(|| crate::error!("Selected COFF COMDAT leader ID overflow"))?,
+            )
+        };
         sections.push(SectionRecord {
             object: object_id,
             raw_index: as_u32(section.index.0, "raw COFF section")?,
@@ -797,6 +813,8 @@ fn build_dense_object_chunk(
             contents: section_contents(section.kind),
             comdat_selection: section.comdat_selection,
             associative_section,
+            comdat_leader,
+            comdat_order: section.comdat_order,
         });
         for relocation in index.relocations(section) {
             relocations.push(RelocationRecord {

@@ -975,6 +975,8 @@ mod tests {
                 },
                 comdat_selection: 0,
                 associative_section: OptionalSectionId::NONE,
+                comdat_leader: OptionalSymbolId::NONE,
+                comdat_order: u32::MAX,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1177,6 +1179,8 @@ mod tests {
                 contents: SectionContents::Data,
                 comdat_selection: 0,
                 associative_section: OptionalSectionId::NONE,
+                comdat_leader: OptionalSymbolId::NONE,
+                comdat_order: u32::MAX,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1266,6 +1270,8 @@ mod tests {
                 contents: SectionContents::Data,
                 comdat_selection: 0,
                 associative_section: OptionalSectionId::NONE,
+                comdat_leader: OptionalSymbolId::NONE,
+                comdat_order: u32::MAX,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();

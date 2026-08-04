@@ -127,7 +127,9 @@ pub(crate) struct CoffSectionRecord {
     pub(super) relocation_start: u32,
     pub(super) relocation_len: u32,
     pub(super) comdat_selection: u8,
-    pub(super) associative_section: Option<object::SectionIndex>,
+    pub(super) associative_section: u32,
+    pub(super) comdat_leader: u32,
+    pub(super) comdat_order: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -499,7 +501,7 @@ impl CoffRelocationIndex {
         let mut names = Vec::new();
         let mut raw_to_dense = vec![None; file.coff_symbol_table().len()];
         let mut weak_defaults = Vec::new();
-        let mut section_comdats = vec![(0, None); section_count];
+        let mut section_comdats = vec![(0, None, None, u32::MAX); section_count];
 
         let mut next_global = 0usize;
         for (symbol_occurrence, (raw_index, raw_symbol)) in
@@ -611,7 +613,12 @@ impl CoffRelocationIndex {
                     .checked_sub(1)
                     .and_then(|index| section_comdats.get_mut(index))
             {
-                *slot = (selection.0, associative_section);
+                *slot = (
+                    selection.0,
+                    associative_section,
+                    None,
+                    dense_u32(raw_index.0, "COFF COMDAT auxiliary order")?,
+                );
             }
         }
         crate::ensure!(
@@ -624,6 +631,36 @@ impl CoffRelocationIndex {
         for (symbol, raw_default) in weak_defaults {
             symbols[symbol.0 as usize].weak_default =
                 raw_to_dense.get(raw_default.0).copied().flatten();
+        }
+
+        // A COFF COMDAT key is the first primary symbol after its section-definition auxiliary
+        // record that refers to the same section. Cache that dense symbol ID once so later COMDAT
+        // selection never scans the raw symbol table or constructs object::Comdat iterators.
+        for (symbol_index, symbol) in symbols.iter().enumerate() {
+            let Some(shape) = symbol.shape else {
+                continue;
+            };
+            let Some(section) = shape.section else {
+                continue;
+            };
+            let Some(slot) = section
+                .0
+                .checked_sub(1)
+                .and_then(|index| section_comdats.get_mut(index))
+            else {
+                continue;
+            };
+            if slot.0 == 0
+                || slot.0 == object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0
+                || slot.2.is_some()
+                || symbol.raw_index <= slot.3
+            {
+                continue;
+            }
+            slot.2 = Some(CoffRelocationSymbolId(dense_u32(
+                symbol_index,
+                "COFF COMDAT leader",
+            )?));
         }
 
         for (section_ordinal, section) in file.sections().enumerate() {
@@ -684,7 +721,8 @@ impl CoffRelocationIndex {
                 object::SectionFlags::Coff { characteristics } => Some(characteristics.0),
                 _ => None,
             };
-            let (comdat_selection, associative_section) = section_comdats[section_ordinal];
+            let (comdat_selection, associative_section, comdat_leader, comdat_order) =
+                section_comdats[section_ordinal];
             sections.push(CoffSectionRecord {
                 index: section.index(),
                 name,
@@ -696,7 +734,12 @@ impl CoffRelocationIndex {
                 relocation_start,
                 relocation_len: dense_u32(relocations.len(), "COFF relocation")? - relocation_start,
                 comdat_selection,
-                associative_section,
+                associative_section: associative_section
+                    .map(|section| dense_u32(section.0, "associative COMDAT parent"))
+                    .transpose()?
+                    .unwrap_or(u32::MAX),
+                comdat_leader: comdat_leader.map_or(u32::MAX, |symbol| symbol.0),
+                comdat_order,
             });
         }
         Ok(Self {
@@ -1221,10 +1264,8 @@ mod tests {
             index.sections[1].comdat_selection,
             object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0
         );
-        assert_eq!(
-            index.sections[1].associative_section,
-            Some(object::SectionIndex(1))
-        );
+        assert_eq!(index.sections[1].associative_section, 1);
+        assert_ne!(index.sections[0].comdat_leader, u32::MAX);
         let relocations = index.relocations(&index.sections[0]);
         assert_eq!(relocations[0].symbol, relocations[1].symbol);
     }
