@@ -176,12 +176,6 @@ struct IncrementalSymbolState<'data> {
     /// Active unresolved names, maintained in byte order. The set is normally small, so insertion
     /// and removal shifts are cheaper than rescanning or sorting all canonical names every wave.
     unresolved_names: Vec<NameId>,
-    /// Append-only feed for archive schedulers. A pass snapshots its cursor after initial seeding
-    /// and consumes only demands activated by subsequently selected members.
-    new_unresolved_names: Vec<NameId>,
-    /// Weak records become archive candidates under Library search in the primary pass and under
-    /// fallback resolution in the alternate pass.
-    new_weak_names: Vec<NameId>,
     weak_resolution: WeakExternalResolution,
     weak_names: Vec<ResolverWeakFallback>,
     alternate_names: Vec<ResolverAlternateFallback>,
@@ -240,8 +234,6 @@ impl<'data> IncrementalSymbolState<'data> {
             names: OrderedNameInterner::new(),
             states: Vec::new(),
             unresolved_names: Vec::new(),
-            new_unresolved_names: Vec::new(),
-            new_weak_names: Vec::new(),
             weak_resolution: WeakExternalResolution::default(),
             weak_names: Vec::new(),
             alternate_names: Vec::new(),
@@ -282,7 +274,6 @@ impl<'data> IncrementalSymbolState<'data> {
                 target,
                 search: record.search,
             };
-            let mut newly_accepted = false;
             if let Some(position) = existing {
                 let old = self.weak_names[position];
                 // Match WeakExternalResolution: a real fallback replaces an earlier incoming
@@ -291,16 +282,10 @@ impl<'data> IncrementalSymbolState<'data> {
                     && record.search != linker_utils::coff_symbols::WeakSearch::AntiDependency
                 {
                     self.weak_names[position] = fallback;
-                    newly_accepted = true;
                 }
             } else {
                 note_vec_push(&self.weak_names);
                 self.weak_names.push(fallback);
-                newly_accepted = true;
-            }
-            if newly_accepted {
-                note_vec_push(&self.new_weak_names);
-                self.new_weak_names.push(symbol);
             }
         }
         for symbol in object.file().symbols() {
@@ -409,8 +394,6 @@ impl<'data> IncrementalSymbolState<'data> {
                 .expect_err("new unresolved NameId is not already active");
             note_vec_push(&self.unresolved_names);
             self.unresolved_names.insert(position, id);
-            note_vec_push(&self.new_unresolved_names);
-            self.new_unresolved_names.push(id);
         }
     }
 
@@ -627,8 +610,6 @@ impl<'data> ResolverSession<'data> {
             names,
             states,
             unresolved_names: _,
-            new_unresolved_names: _,
-            new_weak_names: _,
             weak_resolution,
             weak_names,
             alternate_names,
@@ -801,54 +782,61 @@ fn extract_pass<'data>(
         .0
         .add(crate::timing::PeMetric::Archives, archives.len());
     let instrumentation_enabled = pass_phase.0.enabled();
+    let extracted_before = extracted.len();
     let mut changed = false;
+    let mut demand_count = 0usize;
     let mut waves = 0usize;
     let mut next_archive = 0;
-    let initial_demands = if use_alternates {
-        fallback_demands(symbol_state, runtime_resolution)?
-    } else {
-        let mut demands = symbol_state.unresolved_in_byte_order().to_vec();
-        demands.extend(
-            symbol_state
-                .weak_names
-                .iter()
-                .filter(|fallback| {
-                    fallback.search == linker_utils::coff_symbols::WeakSearch::Library
-                        && !symbol_state.is_defined(fallback.symbol)
-                })
-                .map(|fallback| fallback.symbol),
-        );
-        demands
-    };
-    let mut scheduler = ArchiveDemandScheduler::new(symbol_state, archives.len());
-    scheduler.schedule(
-        initial_demands,
-        archives,
-        archive_providers,
-        &symbol_state.names,
-    );
-    for (archive, &whole) in whole_archive.iter().enumerate() {
-        if whole {
-            scheduler.dirty_archives.insert(archive);
-        }
-    }
     while next_archive < archives.len() {
+        // A demand snapshot remains valid until an archive selects a member and mutates the
+        // symbol state. Reuse it across runs of archives that select nothing instead of cloning,
+        // resolving and allocating the same names once per archive.
+        let fallback_names;
+        let demands = if use_alternates {
+            fallback_names = fallback_demands(symbol_state, runtime_resolution)?;
+            fallback_names
+                .iter()
+                .map(|&name| CanonicalArchiveDemand { name })
+                .collect::<Vec<_>>()
+        } else {
+            let mut demands = symbol_state
+                .unresolved_in_byte_order()
+                .iter()
+                .copied()
+                .map(|name| CanonicalArchiveDemand { name })
+                .collect::<Vec<_>>();
+            demands.extend(
+                symbol_state
+                    .weak_names
+                    .iter()
+                    .filter(|fallback| {
+                        fallback.search == linker_utils::coff_symbols::WeakSearch::Library
+                            && !symbol_state.is_defined(fallback.symbol)
+                    })
+                    .map(|fallback| CanonicalArchiveDemand {
+                        name: fallback.symbol,
+                    }),
+            );
+            demands
+        };
         if instrumentation_enabled {
+            demand_count += demands.len();
             waves += 1;
         }
-        let selection = scheduler.next_selection(
+        let selection = next_archive_selection(
             archives,
             whole_archive,
             extracted,
-            symbol_state,
+            &demands,
             next_archive,
-            use_alternates,
+            archive_providers,
+            &symbol_state.names,
         );
         let Some((archive_index, selected)) = selection else {
             break;
         };
         next_archive = archive_index + 1;
-        let mut aliases_changed = false;
+        drop(demands);
         for member in selected {
             if extracted.len() == extracted.capacity() {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
@@ -923,7 +911,6 @@ fn extract_pass<'data>(
                         }
                         note_vec_push(selected_aliases);
                         selected_aliases.push((archive_index, member.index()));
-                        aliases_changed = true;
                         changed = true;
                     } else {
                         return Err(error!(
@@ -937,252 +924,29 @@ fn extract_pass<'data>(
                 }
             }
         }
-        if use_alternates && aliases_changed {
-            let demands = fallback_demands(symbol_state, runtime_resolution)?;
-            scheduler.reset_demands(symbol_state);
-            scheduler.schedule(demands, archives, archive_providers, &symbol_state.names);
-            for (archive, &whole) in whole_archive.iter().enumerate() {
-                if whole {
-                    scheduler.dirty_archives.insert(archive);
-                }
-            }
-        } else {
-            scheduler.drain_new_demands(
-                symbol_state,
-                runtime_resolution,
-                use_alternates,
-                archives,
-                archive_providers,
-            )?;
-        }
     }
     pass_phase
         .0
-        .add(crate::timing::PeMetric::Names, scheduler.provider_queries);
+        .add(crate::timing::PeMetric::Names, demand_count);
     pass_phase
         .0
-        .add(crate::timing::PeMetric::Lookups, scheduler.provider_queries);
-    pass_phase.0.add(
-        crate::timing::PeMetric::QueuePushes,
-        scheduler.provider_pairs,
-    );
+        .add(crate::timing::PeMetric::Lookups, demand_count);
     pass_phase.0.add(crate::timing::PeMetric::Waves, waves);
-    pass_phase
-        .0
-        .add(crate::timing::PeMetric::Events, scheduler.stale_filtered);
+    pass_phase.0.add(
+        crate::timing::PeMetric::Events,
+        extracted.len() - extracted_before,
+    );
     pass_phase
         .0
         .add(crate::timing::PeMetric::Objects, objects.len());
     Ok(changed)
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CanonicalArchiveDemand {
     name: NameId,
 }
 
-#[derive(Clone, Copy)]
-struct ScheduledArchiveDemand {
-    name: NameId,
-    member: usize,
-}
-
-/// Per-extraction-pass provider schedule. Archive buckets survive member-selection waves; only
-/// newly activated symbol demands query the provider cache and extend them.
-struct ArchiveDemandScheduler {
-    buckets: Vec<Vec<ScheduledArchiveDemand>>,
-    dirty_archives: BTreeSet<usize>,
-    scheduled_names: HashSet<NameId>,
-    unresolved_cursor: usize,
-    weak_cursor: usize,
-    provider_queries: usize,
-    provider_pairs: usize,
-    stale_filtered: usize,
-}
-
-impl ArchiveDemandScheduler {
-    fn new(state: &IncrementalSymbolState<'_>, archive_count: usize) -> Self {
-        Self {
-            buckets: (0..archive_count).map(|_| Vec::new()).collect(),
-            dirty_archives: BTreeSet::new(),
-            scheduled_names: HashSet::new(),
-            unresolved_cursor: state.new_unresolved_names.len(),
-            weak_cursor: state.new_weak_names.len(),
-            provider_queries: 0,
-            provider_pairs: 0,
-            stale_filtered: 0,
-        }
-    }
-
-    fn reset_demands(&mut self, state: &IncrementalSymbolState<'_>) {
-        for bucket in &mut self.buckets {
-            bucket.clear();
-        }
-        self.dirty_archives.clear();
-        self.scheduled_names.clear();
-        self.unresolved_cursor = state.new_unresolved_names.len();
-        self.weak_cursor = state.new_weak_names.len();
-    }
-
-    fn schedule(
-        &mut self,
-        demands: impl IntoIterator<Item = NameId>,
-        archives: &[&CoffArchive<'_>],
-        providers: &mut ArchiveProviderCache,
-        names: &OrderedNameInterner<'_>,
-    ) {
-        for name_id in demands {
-            if !self.scheduled_names.insert(name_id) {
-                continue;
-            }
-            self.provider_queries += 1;
-            let name = names
-                .bytes(name_id)
-                .expect("archive demands use canonical NameIds");
-            for &provider in providers.providers(name_id, name, archives) {
-                let archive = provider.archive.index();
-                self.buckets[archive].push(ScheduledArchiveDemand {
-                    name: name_id,
-                    member: provider.member.index(),
-                });
-                self.dirty_archives.insert(archive);
-                self.provider_pairs += 1;
-            }
-        }
-    }
-
-    fn drain_new_demands<'data>(
-        &mut self,
-        state: &mut IncrementalSymbolState<'data>,
-        runtime_resolution: &RuntimeResolution,
-        use_alternates: bool,
-        archives: &[&CoffArchive<'data>],
-        providers: &mut ArchiveProviderCache,
-    ) -> Result<()> {
-        let unresolved = state.new_unresolved_names[self.unresolved_cursor..].to_vec();
-        let weak = state.new_weak_names[self.weak_cursor..].to_vec();
-        self.unresolved_cursor = state.new_unresolved_names.len();
-        self.weak_cursor = state.new_weak_names.len();
-
-        let mut demands = Vec::with_capacity(unresolved.len() + weak.len());
-        if use_alternates {
-            for source in unresolved {
-                if let Some(target) =
-                    alternate_demand_for_source(state, runtime_resolution, source)?
-                {
-                    demands.push(target);
-                }
-            }
-            for source in weak {
-                if let Some(target) = weak_demand_for_source(state, source)? {
-                    demands.push(target);
-                }
-            }
-        } else {
-            demands.extend(
-                unresolved
-                    .into_iter()
-                    .filter(|&name| !state.is_defined(name)),
-            );
-            for source in weak {
-                if !state.is_defined(source)
-                    && state.weak_names.iter().any(|fallback| {
-                        fallback.symbol == source
-                            && fallback.search == linker_utils::coff_symbols::WeakSearch::Library
-                    })
-                {
-                    demands.push(source);
-                }
-            }
-        }
-        self.schedule(demands, archives, providers, &state.names);
-        Ok(())
-    }
-
-    fn next_selection<'archive, 'data>(
-        &mut self,
-        archives: &'archive [&CoffArchive<'data>],
-        whole_archive: &[bool],
-        extracted: &HashSet<(usize, usize)>,
-        state: &IncrementalSymbolState<'_>,
-        start: usize,
-        use_alternates: bool,
-    ) -> Option<(usize, Vec<&'archive CoffArchiveMember<'data>>)> {
-        loop {
-            let archive_index = self.dirty_archives.range(start..).next().copied()?;
-            self.dirty_archives.remove(&archive_index);
-            let scheduled = &mut self.buckets[archive_index];
-            if use_alternates {
-                scheduled.sort_by(|left, right| {
-                    state
-                        .names
-                        .bytes(left.name)
-                        .expect("scheduled archive demand is interned")
-                        .cmp(
-                            state
-                                .names
-                                .bytes(right.name)
-                                .expect("scheduled archive demand is interned"),
-                        )
-                });
-            } else {
-                scheduled.sort_by(|left, right| {
-                    let left_strong = state.states[left.name.index()].is_unresolved();
-                    let right_strong = state.states[right.name.index()].is_unresolved();
-                    match (left_strong, right_strong) {
-                        (true, true) => state
-                            .names
-                            .bytes(left.name)
-                            .expect("scheduled archive demand is interned")
-                            .cmp(
-                                state
-                                    .names
-                                    .bytes(right.name)
-                                    .expect("scheduled archive demand is interned"),
-                            ),
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        (false, false) => {
-                            let left_position = state
-                                .weak_names
-                                .iter()
-                                .position(|fallback| fallback.symbol == left.name);
-                            let right_position = state
-                                .weak_names
-                                .iter()
-                                .position(|fallback| fallback.symbol == right.name);
-                            left_position.cmp(&right_position)
-                        }
-                    }
-                });
-            }
-            let mut demands = Vec::with_capacity(scheduled.len());
-            for demand in scheduled {
-                if state.is_defined(demand.name) {
-                    self.stale_filtered += 1;
-                } else {
-                    let name = state
-                        .names
-                        .bytes(demand.name)
-                        .expect("scheduled archive demand is interned");
-                    demands.push((name, demand.member));
-                }
-            }
-            let mut selected = archives[archive_index]
-                .select_shallow_members_from_provider_indices(
-                    &demands,
-                    whole_archive[archive_index],
-                );
-            selected.retain(|member| !extracted.contains(&(archive_index, member.index())));
-            if !selected.is_empty() {
-                return Some((archive_index, selected));
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 fn next_archive_selection<'archive, 'data>(
     archives: &'archive [&CoffArchive<'data>],
     whole_archive: &[bool],
@@ -1327,70 +1091,6 @@ fn fallback_demands<'data>(
     });
     demands.dedup();
     Ok(demands)
-}
-
-fn alternate_demand_for_source<'data>(
-    state: &mut IncrementalSymbolState<'data>,
-    runtime_resolution: &RuntimeResolution,
-    source: NameId,
-) -> Result<Option<NameId>> {
-    if state.is_defined(source)
-        || !state
-            .states
-            .get(source.index())
-            .is_some_and(|item| item.is_unresolved())
-    {
-        return Ok(None);
-    }
-    let resolved = {
-        let bytes = state
-            .names
-            .bytes(source)
-            .expect("unresolved NameId is interned");
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return Ok(Some(source));
-        };
-        runtime_resolution
-            .resolve_alternate_name(text, |candidate| {
-                let bytes = candidate.as_bytes();
-                state
-                    .names
-                    .lookup_prehashed(bytes, hash_name(bytes))
-                    .is_some_and(|id| state.is_defined(id))
-            })?
-            .as_bytes()
-            .to_vec()
-    };
-    let target = state.intern_owned(&resolved);
-    Ok((!state.is_defined(target)).then_some(target))
-}
-
-fn weak_demand_for_source<'data>(
-    state: &mut IncrementalSymbolState<'data>,
-    source: NameId,
-) -> Result<Option<NameId>> {
-    if state.is_defined(source)
-        || !state
-            .weak_names
-            .iter()
-            .any(|fallback| fallback.symbol == source)
-    {
-        return Ok(None);
-    }
-    let target = {
-        let source_bytes = state.names.bytes(source).expect("weak NameId is interned");
-        state
-            .weak_resolution
-            .resolve(source_bytes, |name| {
-                state
-                    .names
-                    .lookup_prehashed(name, hash_name(name))
-                    .is_some_and(|id| state.is_defined(id))
-            })?
-            .to_vec()
-    };
-    let target = state.intern_owned(&target);
-    Ok((!state.is_defined(target)).then_some(target))
 }
 
 #[cfg(test)]
@@ -1916,146 +1616,6 @@ mod tests {
             .map(|symbol| symbol.name_bytes().unwrap().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(definitions, [b"primary".to_vec()]);
-    }
-
-    fn extraction_trace<'data>(
-        archives: &[&CoffArchive<'data>],
-        whole: &[bool],
-        roots: &[Vec<u8>],
-        incremental: bool,
-    ) -> Vec<(usize, usize)> {
-        let mut state = IncrementalSymbolState::new();
-        state.add_roots(roots);
-        let mut extracted = HashSet::new();
-        let mut providers = ArchiveProviderCache::new();
-        let mut trace = Vec::new();
-        loop {
-            let mut changed = false;
-            let mut start = 0;
-            let mut scheduler = ArchiveDemandScheduler::new(&state, archives.len());
-            if incremental {
-                scheduler.schedule(
-                    state.unresolved_in_byte_order().to_vec(),
-                    archives,
-                    &mut providers,
-                    &state.names,
-                );
-                for (archive, &is_whole) in whole.iter().enumerate() {
-                    if is_whole {
-                        scheduler.dirty_archives.insert(archive);
-                    }
-                }
-            }
-            while start < archives.len() {
-                let selection = if incremental {
-                    scheduler.next_selection(archives, whole, &extracted, &state, start, false)
-                } else {
-                    let demands = state
-                        .unresolved_in_byte_order()
-                        .iter()
-                        .copied()
-                        .map(|name| CanonicalArchiveDemand { name })
-                        .collect::<Vec<_>>();
-                    next_archive_selection(
-                        archives,
-                        whole,
-                        &extracted,
-                        &demands,
-                        start,
-                        &mut providers,
-                        &state.names,
-                    )
-                };
-                let Some((archive_index, selected)) = selection else {
-                    break;
-                };
-                start = archive_index + 1;
-                for member in selected {
-                    assert!(extracted.insert((archive_index, member.index())));
-                    trace.push((archive_index, member.index()));
-                    let CoffArchiveMemberKind::CoffObject { .. } = member.kind() else {
-                        panic!("trace fixtures contain only regular COFF members");
-                    };
-                    let object = crate::coff::CoffObject::parse(member.data()).unwrap();
-                    state.absorb_object(&object, trace.len()).unwrap();
-                    changed = true;
-                }
-                if incremental {
-                    scheduler
-                        .drain_new_demands(
-                            &mut state,
-                            &RuntimeResolution::new(),
-                            false,
-                            archives,
-                            &mut providers,
-                        )
-                        .unwrap();
-                }
-            }
-            if !changed {
-                return trace;
-            }
-        }
-    }
-
-    #[test]
-    fn incremental_scheduler_matches_rescan_order_for_deterministic_random_graphs() {
-        let symbol_names = (0..15).map(|index| format!("s{index}")).collect::<Vec<_>>();
-        let mut random = 0x9e37_79b9_u32;
-        for case in 0..32 {
-            let mut members_by_archive = vec![Vec::new(), Vec::new(), Vec::new()];
-            for definition in 0..symbol_names.len() {
-                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let archive_index = (random as usize) % members_by_archive.len();
-                let dependency_count = ((random >> 8) as usize) % 3;
-                let mut dependencies = Vec::new();
-                for _ in 0..dependency_count {
-                    random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    let dependency = (random as usize) % symbol_names.len();
-                    if dependency != definition && !dependencies.contains(&dependency) {
-                        dependencies.push(dependency);
-                    }
-                }
-                let definition_name = symbol_names[definition].as_str();
-                let dependency_names = dependencies
-                    .iter()
-                    .map(|&index| symbol_names[index].as_str())
-                    .collect::<Vec<_>>();
-                members_by_archive[archive_index].push((
-                    format!("case{case}_{definition}.obj"),
-                    coff_object(&[definition_name], &dependency_names),
-                ));
-            }
-            let archive_bytes = members_by_archive
-                .iter()
-                .map(|members| {
-                    let members = members
-                        .iter()
-                        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
-                        .collect::<Vec<_>>();
-                    archive(&members)
-                })
-                .collect::<Vec<_>>();
-            let parsed = archive_bytes
-                .iter()
-                .map(|bytes| CoffArchive::parse(bytes).unwrap())
-                .collect::<Vec<_>>();
-            let archives = parsed.iter().collect::<Vec<_>>();
-            let roots = [0, 4, 9]
-                .into_iter()
-                .map(|offset| {
-                    symbol_names[(case + offset) % symbol_names.len()]
-                        .as_bytes()
-                        .to_vec()
-                })
-                .collect::<Vec<_>>();
-            let whole = [case % 11 == 0, false, case % 13 == 0];
-            assert_eq!(
-                extraction_trace(&archives, &whole, &roots, true),
-                extraction_trace(&archives, &whole, &roots, false),
-                "case {case}"
-            );
-        }
     }
 
     #[test]
