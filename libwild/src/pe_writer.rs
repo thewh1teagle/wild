@@ -205,24 +205,53 @@ impl PeWriterConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Source {
+    Dense(pe_ir::SectionId),
     Object {
         object: usize,
         section: object::SectionIndex,
     },
-    Synthetic,
+    Synthetic(Vec<u8>),
 }
 
 #[derive(Debug)]
 struct Contribution {
     source: Source,
-    /// Dense identity for real selected-object sections. Synthetic contributions have none.
-    dense_section: Option<pe_ir::SectionId>,
     spec: SectionContribution,
-    /// Owned bytes exist only for linker-synthesized sections. Real input sections remain
-    /// source-backed until their final output slice is copied and relocated.
-    synthetic_data: Vec<u8>,
+}
+
+impl Contribution {
+    fn dense_section(&self) -> Option<pe_ir::SectionId> {
+        match self.source {
+            Source::Dense(section) => Some(section),
+            Source::Object { .. } | Source::Synthetic(_) => None,
+        }
+    }
+
+    fn is_real(&self) -> bool {
+        !matches!(self.source, Source::Synthetic(_))
+    }
+
+    fn synthetic_data(&self) -> &[u8] {
+        match &self.source {
+            Source::Synthetic(data) => data,
+            Source::Dense(_) | Source::Object { .. } => &[],
+        }
+    }
+
+    fn synthetic_data_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.source {
+            Source::Synthetic(data) => data,
+            Source::Dense(_) | Source::Object { .. } => {
+                panic!("real PE contribution has no synthetic data")
+            }
+        }
+    }
+
+    fn set_synthetic_data(&mut self, data: Vec<u8>) {
+        *self.synthetic_data_mut() = data;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2037,7 +2066,7 @@ fn build_image_with_delay_loads<B: ImageBytes>(
         imports.len() + delay_imports.len(),
     );
     let absolute_symbols = absolute_symbol_values(objects, symbol_metadata, runtime_resolution)?;
-    let has_tls_inputs = has_tls_contributions(objects, &contributions)?;
+    let has_tls_inputs = has_tls_contributions(objects, &contributions);
     let common_offsets = add_common_symbols(objects, symbol_metadata, &mut contributions)?;
     let (idata_size, thunk_size) = if imports.is_empty() {
         (0, 0)
@@ -2190,14 +2219,14 @@ fn build_image_with_delay_loads<B: ImageBytes>(
             .iter_mut()
             .find(|contribution| contribution.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_delay_unwind.xdata;
+            .set_synthetic_data(emitted_delay_unwind.xdata);
     }
     if let Some(id) = delay_pdata_id {
         contributions
             .iter_mut()
             .find(|contribution| contribution.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_delay_unwind.pdata;
+            .set_synthetic_data(emitted_delay_unwind.pdata);
     }
 
     let eager_imports_phase = crate::timing_guard!(PE_DETAIL_BUILD_IMPORTS);
@@ -2214,14 +2243,14 @@ fn build_image_with_delay_loads<B: ImageBytes>(
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_imports.idata.clone();
+            .set_synthetic_data(emitted_imports.idata.clone());
     }
     if let Some(id) = thunk_id {
         contributions
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_imports.thunks.clone();
+            .set_synthetic_data(emitted_imports.thunks.clone());
     }
     drop(eager_imports_phase);
     // Produce a first deterministic delay image to publish its synthetic definitions before
@@ -2244,14 +2273,14 @@ fn build_image_with_delay_loads<B: ImageBytes>(
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_delay_imports.didat.clone();
+            .set_synthetic_data(emitted_delay_imports.didat.clone());
     }
     if let Some(id) = delay_thunk_id {
         contributions
             .iter_mut()
             .find(|c| c.spec.id == id)
             .unwrap()
-            .synthetic_data = emitted_delay_imports.thunks.clone();
+            .set_synthetic_data(emitted_delay_imports.thunks.clone());
     }
     drop(delay_imports_phase);
     let resources_phase = crate::timing_guard!(PE_DETAIL_BUILD_RESOURCES);
@@ -2263,10 +2292,12 @@ fn build_image_with_delay_loads<B: ImageBytes>(
         .context("failed to build PE resource directory")?;
         let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
         ensure!(
-            section.bytes.len() == contribution.synthetic_data.len(),
+            section.bytes.len() == contribution.synthetic_data().len(),
             "PE resource section changed size after layout"
         );
-        contribution.synthetic_data.copy_from_slice(&section.bytes);
+        contribution
+            .synthetic_data_mut()
+            .copy_from_slice(&section.bytes);
         Some((section.data_directory.rva, section.data_directory.size))
     } else {
         None
@@ -2330,12 +2361,12 @@ fn build_image_with_delay_loads<B: ImageBytes>(
             .iter_mut()
             .find(|c| c.spec.id == didat)
             .unwrap()
-            .synthetic_data = emitted_delay_imports.didat.clone();
+            .set_synthetic_data(emitted_delay_imports.didat.clone());
         contributions
             .iter_mut()
             .find(|c| c.spec.id == thunks)
             .unwrap()
-            .synthetic_data = emitted_delay_imports.thunks.clone();
+            .set_synthetic_data(emitted_delay_imports.thunks.clone());
     }
     let load_config_directory = load_config_directory(
         objects,
@@ -2400,10 +2431,11 @@ fn build_image_with_delay_loads<B: ImageBytes>(
                 .context("failed to build PE export directory")?;
         let contribution = contributions.iter_mut().find(|c| c.spec.id == id).unwrap();
         ensure!(
-            directory.bytes.len() <= contribution.synthetic_data.len(),
+            directory.bytes.len() <= contribution.synthetic_data().len(),
             "PE export directory exceeded its reserved size"
         );
-        contribution.synthetic_data[..directory.bytes.len()].copy_from_slice(&directory.bytes);
+        contribution.synthetic_data_mut()[..directory.bytes.len()]
+            .copy_from_slice(&directory.bytes);
         Some(directory)
     } else {
         None
@@ -2435,16 +2467,16 @@ fn build_image_with_delay_loads<B: ImageBytes>(
         .add(crate::timing::PeMetric::Sections, contributions.len());
     let mut synthetic_bytes = 0usize;
     for contribution in &contributions {
-        if !matches!(contribution.source, Source::Synthetic) {
+        if !matches!(contribution.source, Source::Synthetic(_)) {
             continue;
         }
         let placement = &layout.placements[&contribution.spec.id];
         if let Some(file_offset) = placement.file_offset {
             let start = file_offset as usize;
-            image[start..start + contribution.synthetic_data.len()]
-                .copy_from_slice(&contribution.synthetic_data);
-            synthetic_bytes += contribution.synthetic_data.len();
-            count_pe_bytes_copied(contribution.synthetic_data.len());
+            let data = contribution.synthetic_data();
+            image[start..start + data.len()].copy_from_slice(data);
+            synthetic_bytes += data.len();
+            count_pe_bytes_copied(data.len());
         }
     }
     image_copy_phase
@@ -3087,11 +3119,7 @@ fn materialize_dense_contributions(
                     );
                 }
                 output.push(Contribution {
-                    source: Source::Object {
-                        object: section.object.index(),
-                        section: object::SectionIndex(section.raw_index as usize),
-                    },
-                    dense_section: Some(dense_section),
+                    source: Source::Dense(dense_section),
                     spec: SectionContribution {
                         id: ContributionId(index as u32),
                         name: merged_names[section.name.index()]
@@ -3103,7 +3131,6 @@ fn materialize_dense_contributions(
                         size: section.size,
                         kind,
                     },
-                    synthetic_data: Vec::new(),
                 });
             }
             Ok(output)
@@ -3214,11 +3241,13 @@ fn materialize_object_contributions_into(
         let alignment =
             u32::try_from(section.align().max(1)).context("COFF section alignment too large")?;
         output.push(Contribution {
-            source: Source::Object {
-                object: object_index,
-                section: section.index(),
+            source: match dense_section {
+                Some(section) => Source::Dense(section),
+                None => Source::Object {
+                    object: object_index,
+                    section: section.index(),
+                },
             },
-            dense_section,
             spec: SectionContribution {
                 // This ID is provisional in parallel object-local vectors. Empty-output-group
                 // filtering below assigns compact, globally ordered IDs before any downstream
@@ -3230,7 +3259,6 @@ fn materialize_object_contributions_into(
                 size,
                 kind,
             },
-            synthetic_data: Vec::new(),
         });
     }
     Ok(())
@@ -4932,8 +4960,7 @@ fn add_common_symbols(
             .context("common BSS overflow")?;
     }
     contributions.push(Contribution {
-        source: Source::Synthetic,
-        dense_section: None,
+        source: Source::Synthetic(Vec::new()),
         spec: SectionContribution {
             id,
             name: b".bss$common".to_vec().into(),
@@ -4942,7 +4969,6 @@ fn add_common_symbols(
             size: cursor,
             kind: ContributionKind::Bss,
         },
-        synthetic_data: Vec::new(),
     });
     Ok(offsets)
 }
@@ -4959,8 +4985,7 @@ fn add_synthetic(
     let id = ContributionId(contributions.len() as u32);
     let size = u32::try_from(size).context("synthetic PE section too large")?;
     contributions.push(Contribution {
-        source: Source::Synthetic,
-        dense_section: None,
+        source: Source::Synthetic(vec![0; size as usize]),
         spec: SectionContribution {
             id,
             name: name.to_vec().into(),
@@ -4975,7 +5000,6 @@ fn add_synthetic(
             size,
             kind: ContributionKind::Data,
         },
-        synthetic_data: vec![0; size as usize],
     });
     Ok(Some(id))
 }
@@ -5027,7 +5051,7 @@ fn converge_relocation_layout(
                 .iter_mut()
                 .find(|contribution| contribution.spec.id == reloc_id)
                 .expect("synthetic relocation contribution remains present");
-            contribution.synthetic_data = data;
+            contribution.set_synthetic_data(data);
             return Ok((layout, Some(reloc_id), true, 0));
         }
 
@@ -5040,7 +5064,7 @@ fn converge_relocation_layout(
             .expect("synthetic relocation contribution remains present");
         contribution.spec.size =
             u32::try_from(expected_size).context("base relocation table too large")?;
-        contribution.synthetic_data.resize(expected_size, 0);
+        contribution.synthetic_data_mut().resize(expected_size, 0);
     }
 
     loop {
@@ -5057,7 +5081,7 @@ fn converge_relocation_layout(
                 .iter_mut()
                 .find(|contribution| contribution.spec.id == reloc_id)
                 .expect("synthetic relocation contribution remains present");
-            contribution.synthetic_data = data;
+            contribution.set_synthetic_data(data);
             return Ok((layout, Some(reloc_id), true, relayouts));
         }
 
@@ -5076,7 +5100,7 @@ fn converge_relocation_layout(
             .expect("synthetic relocation contribution remains present");
         contribution.spec.size =
             u32::try_from(expected_size).context("base relocation table too large")?;
-        contribution.synthetic_data.resize(expected_size, 0);
+        contribution.synthetic_data_mut().resize(expected_size, 0);
     }
 }
 
@@ -5124,7 +5148,7 @@ fn source_locations(
         }));
         let mut entries = vec![None; dense.ir.sections.len()];
         for contribution in contributions {
-            if let Some(section) = contribution.dense_section {
+            if let Some(section) = contribution.dense_section() {
                 entries[section.index()] = Some(contribution.spec.id);
             }
         }
@@ -5142,7 +5166,7 @@ fn source_locations(
         let mut locations = HashMap::with_capacity(contributions.len());
         locations.extend(contributions.iter().filter_map(|c| match c.source {
             Source::Object { object, section } => Some(((object, section), c.spec.id)),
-            Source::Synthetic => None,
+            Source::Dense(_) | Source::Synthetic(_) => None,
         }));
         LocationMap::Sparse(locations)
     };
@@ -5233,7 +5257,7 @@ fn discover_dense_dir64_sites_in_contributions(
 ) -> Result<Vec<Dir64Site>> {
     let mut sites = Vec::new();
     for contribution in contributions {
-        let Some(section) = contribution.dense_section else {
+        let Some(section) = contribution.dense_section() else {
             continue;
         };
         let relocations = dense
@@ -5538,7 +5562,7 @@ fn dense_section_targets(
 ) -> Result<Vec<Option<DenseSectionTarget>>> {
     let mut output = vec![None; dense.ir.sections.len()];
     for contribution in contributions {
-        let Some(section) = contribution.dense_section else {
+        let Some(section) = contribution.dense_section() else {
             continue;
         };
         let record = dense
@@ -5689,7 +5713,7 @@ fn validate_object_output_ranges(
     if dense_ids {
         let expected_objects = contributions
             .iter()
-            .filter(|contribution| matches!(contribution.source, Source::Object { .. }))
+            .filter(|contribution| contribution.is_real())
             .count();
         let mut validated_objects = 0usize;
         let mut previous_file_end = 0usize;
@@ -5699,7 +5723,7 @@ fn validate_object_output_ranges(
                     .get(id.0 as usize)
                     .filter(|contribution| contribution.spec.id == id)
                     .context("dense PE layout contribution ID is invalid")?;
-                if !matches!(contribution.source, Source::Object { .. }) {
+                if !contribution.is_real() {
                     continue;
                 }
                 let placement = layout
@@ -5749,12 +5773,12 @@ fn validate_object_output_ranges(
     count_pe_hot_allocation();
     let object_count = contributions
         .iter()
-        .filter(|contribution| matches!(contribution.source, Source::Object { .. }))
+        .filter(|contribution| contribution.is_real())
         .count();
     let mut ids = Vec::with_capacity(object_count);
     let mut ranges = Vec::with_capacity(object_count);
     for contribution in contributions {
-        if !matches!(contribution.source, Source::Object { .. }) {
+        if !contribution.is_real() {
             continue;
         }
         let placement = layout
@@ -5931,12 +5955,9 @@ fn copy_and_relocate_dense_contribution(
     image_base: u64,
     parallel_image: pe_layout::DisjointOutput<'_>,
 ) -> Result<()> {
-    let Source::Object { .. } = contribution.source else {
+    let Source::Dense(section) = contribution.source else {
         return Ok(());
     };
-    let section = contribution
-        .dense_section
-        .context("real contribution has no dense PE section")?;
     let record = &dense.ir.sections[section.index()];
     let relocations = dense
         .ir
@@ -6392,23 +6413,19 @@ fn rva_file_offset(layout: &SectionLayout, rva: u32, size: u32) -> Result<usize>
 }
 
 fn has_tls_contributions(
-    objects: &[crate::coff::CoffObject<'_>],
+    _objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
-) -> Result<bool> {
+) -> bool {
     for contribution in contributions {
-        let Source::Object { object, section } = contribution.source else {
+        if !contribution.is_real() {
             continue;
-        };
-        let name = objects[object]
-            .file()
-            .section_by_index(section)?
-            .name_bytes()
-            .context("invalid COFF TLS section name")?;
+        }
+        let name = contribution.spec.name.as_ref();
         if name == b".tls" || name.starts_with(b".tls$") || name.starts_with(b".CRT$XL") {
-            return Ok(true);
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6468,7 +6485,7 @@ fn prepare_tls_directory(
     let template = image
         .get(template_offset..template_offset + template_size as usize)
         .context("TLS template extends past the PE file")?;
-    let alignment = tls_template_alignment(objects, contributions)?;
+    let alignment = tls_template_alignment(objects, contributions);
     let zero_fill = u32::from_le_bytes(original[32..36].try_into().unwrap());
     let template_virtual_end = raw_end
         .checked_add(zero_fill)
@@ -6536,23 +6553,20 @@ fn prepare_tls_directory(
 }
 
 fn tls_template_alignment(
-    objects: &[crate::coff::CoffObject<'_>],
+    _objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
-) -> Result<u32> {
+) -> u32 {
     let mut alignment = 1;
     for contribution in contributions {
-        let Source::Object { object, section } = contribution.source else {
+        if !contribution.is_real() {
             continue;
-        };
-        let section = objects[object].file().section_by_index(section)?;
-        let name = section
-            .name_bytes()
-            .context("invalid COFF TLS section name")?;
+        }
+        let name = contribution.spec.name.as_ref();
         if name == b".tls" || name.starts_with(b".tls$") {
             alignment = alignment.max(contribution.spec.alignment);
         }
     }
-    Ok(alignment)
+    alignment
 }
 
 fn validate_tls_callbacks(
@@ -6980,8 +6994,7 @@ mod tests {
 
     fn synthetic_test_contribution(id: u32, name: &[u8], size: u32) -> Contribution {
         Contribution {
-            source: Source::Synthetic,
-            dense_section: None,
+            source: Source::Synthetic(vec![0; size as usize]),
             spec: SectionContribution {
                 id: ContributionId(id),
                 name: name.to_vec().into(),
@@ -6990,7 +7003,6 @@ mod tests {
                 size,
                 kind: ContributionKind::Data,
             },
-            synthetic_data: vec![0; size as usize],
         }
     }
 
@@ -7001,7 +7013,6 @@ mod tests {
     ) -> Contribution {
         Contribution {
             source: Source::Object { object, section },
-            dense_section: None,
             spec: SectionContribution {
                 id: ContributionId(id),
                 name: b".text".to_vec().into(),
@@ -7010,7 +7021,6 @@ mod tests {
                 size: 5,
                 kind: ContributionKind::Data,
             },
-            synthetic_data: Vec::new(),
         }
     }
 
@@ -7042,7 +7052,7 @@ mod tests {
         assert_eq!(relayouts, 0);
         assert_eq!(reloc_id, Some(ContributionId(2)));
         assert!(has_relocations);
-        let data = &contributions[2].synthetic_data;
+        let data = contributions[2].synthetic_data();
         assert_eq!(
             linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
                 data,
@@ -7078,7 +7088,7 @@ mod tests {
         assert_eq!(relayouts, 2);
         assert_eq!(reloc_id, Some(ContributionId(1)));
         assert!(has_relocations);
-        let data = &contributions[1].synthetic_data;
+        let data = contributions[1].synthetic_data();
         assert_eq!(data.len(), 24);
         assert_eq!(
             linker_utils::pe_base_relocs::parse_amd64_base_relocation_table(
@@ -7106,7 +7116,6 @@ mod tests {
                     object: 0,
                     section: section_index,
                 },
-                dense_section: None,
                 spec: SectionContribution {
                     id: ContributionId(index as u32),
                     name: b".rdata".to_vec().into(),
@@ -7115,7 +7124,6 @@ mod tests {
                     size: 8,
                     kind: ContributionKind::Data,
                 },
-                synthetic_data: Vec::new(),
             })
             .collect::<Vec<_>>();
         let objects = [object];
@@ -8247,7 +8255,7 @@ mod tests {
                 .iter()
                 .all(|contribution| match contribution.source {
                     Source::Object { object, .. } => object == 0,
-                    Source::Synthetic => false,
+                    Source::Dense(_) | Source::Synthetic(_) => false,
                 })
         );
     }
@@ -8345,7 +8353,7 @@ mod tests {
                 .iter()
                 .all(|contribution| match contribution.source {
                     Source::Object { object, .. } => object != 2,
-                    Source::Synthetic => false,
+                    Source::Dense(_) | Source::Synthetic(_) => false,
                 })
         );
     }
@@ -8498,7 +8506,7 @@ mod tests {
                         .iter()
                         .map(|contribution| match contribution.source {
                             Source::Object { object, section } => Some((object, section)),
-                            Source::Synthetic => None,
+                            Source::Dense(_) | Source::Synthetic(_) => None,
                         })
                         .collect::<Vec<_>>();
                     (
@@ -8666,7 +8674,7 @@ mod tests {
                         .map(|contribution| {
                             let source = match contribution.source {
                                 Source::Object { object, section } => Some((object, section.0)),
-                                Source::Synthetic => None,
+                                Source::Dense(_) | Source::Synthetic(_) => None,
                             };
                             (
                                 source,
@@ -8676,7 +8684,7 @@ mod tests {
                                 contribution.spec.alignment,
                                 contribution.spec.size,
                                 contribution.spec.kind,
-                                contribution.synthetic_data.clone(),
+                                contribution.synthetic_data().to_vec(),
                             )
                         })
                         .collect::<Vec<_>>();
