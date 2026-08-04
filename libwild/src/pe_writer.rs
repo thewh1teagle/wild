@@ -2130,7 +2130,11 @@ fn build_image_with_delay_loads<B: ImageBytes>(
         .0
         .add(crate::timing::PeMetric::Sections, contributions.len());
     let dir64_sites = if dynamic_base {
-        discover_dir64_sites(objects, &contributions, &absolute_symbols)?
+        if let Some(dense) = dense {
+            discover_dense_dir64_sites(dense, &contributions, &absolute_symbols)?
+        } else {
+            discover_dir64_sites(objects, &contributions, &absolute_symbols)?
+        }
     } else {
         Vec::new()
     };
@@ -5214,6 +5218,81 @@ fn discover_dir64_sites(
     Ok(sites)
 }
 
+fn discover_dense_dir64_sites(
+    dense: &DenseProductionState<'_>,
+    contributions: &[Contribution],
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+) -> Result<Vec<Dir64Site>> {
+    let dir64_phase = crate::timing_guard!(PE_DETAIL_DIR64_SITES);
+    let chunk_results =
+        if rayon::current_num_threads() > 1 && contributions.len() > DIR64_DISCOVERY_CHUNK_SIZE {
+            contributions
+                .par_chunks(DIR64_DISCOVERY_CHUNK_SIZE)
+                .map(|chunk| {
+                    discover_dense_dir64_sites_in_contributions(dense, chunk, absolute_symbols)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![discover_dense_dir64_sites_in_contributions(
+                dense,
+                contributions,
+                absolute_symbols,
+            )]
+        };
+    let mut sites = Vec::new();
+    for chunk in chunk_results {
+        sites.extend(chunk?);
+    }
+    drop(dir64_phase);
+    Ok(sites)
+}
+
+fn discover_dense_dir64_sites_in_contributions(
+    dense: &DenseProductionState<'_>,
+    contributions: &[Contribution],
+    absolute_symbols: &HashMap<Vec<u8>, u64>,
+) -> Result<Vec<Dir64Site>> {
+    let mut sites = Vec::new();
+    for contribution in contributions {
+        let Some(section) = contribution.dense_section else {
+            continue;
+        };
+        let relocations = dense
+            .ir
+            .relocations
+            .for_section(section)
+            .context("dense PE contribution has no relocation CSR row")?;
+        for &relocation in relocations {
+            if relocation.typ != 1 {
+                continue;
+            }
+            if relocation.has_invalid_target() {
+                return Err(error!(
+                    "Invalid COFF relocation symbol {}",
+                    relocation.target.get()
+                ));
+            }
+            let symbol = dense
+                .ir
+                .symbols
+                .get(relocation.target.index())
+                .context("DIR64 target is outside dense symbol table")?;
+            if dense
+                .names
+                .bytes(symbol.name)
+                .is_some_and(|name| absolute_symbols.contains_key(name))
+            {
+                continue;
+            }
+            sites.push(Dir64Site {
+                contribution: contribution.spec.id,
+                offset: relocation.offset,
+            });
+        }
+    }
+    Ok(sites)
+}
+
 fn discover_dir64_sites_in_contributions(
     objects: &[crate::coff::CoffObject<'_>],
     contributions: &[Contribution],
@@ -5957,7 +6036,7 @@ fn prepare_dense_relocation(
 
     let resolved_target = dense
         .resolved_targets
-        .symbol(relocation.target)
+        .relocation(relocation)
         .context("relocation target is outside resolved symbol table")?;
     let (target, target_section, target_section_index, absolute_value) = if let Some(section) =
         resolved_target.section_id()

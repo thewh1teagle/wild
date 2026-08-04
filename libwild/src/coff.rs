@@ -620,7 +620,6 @@ impl CoffDensePlan {
             "COFF resolver summary has excess global symbols"
         );
 
-        let mut symbol_count = primary_symbol_count;
         let mut relocation_count = 0u32;
         for section in file.sections() {
             push_name_occurrence(&mut names, bytes, section.name_bytes(), true)?;
@@ -628,14 +627,6 @@ impl CoffDensePlan {
             relocation_count = relocation_count
                 .checked_add(dense_u32(relocations.len(), "COFF relocation")?)
                 .ok_or_else(|| crate::error!("COFF relocation count exceeds u32"))?;
-            for relocation in relocations {
-                let raw = relocation.symbol_table_index.get(LE) as usize;
-                if raw_to_dense_symbol.get(raw).copied().unwrap_or(u32::MAX) == u32::MAX {
-                    symbol_count = symbol_count
-                        .checked_add(1)
-                        .ok_or_else(|| crate::error!("COFF symbol count exceeds u32"))?;
-                }
-            }
         }
 
         Ok(Self {
@@ -643,7 +634,7 @@ impl CoffDensePlan {
             raw_to_dense_symbol: raw_to_dense_symbol.into_boxed_slice(),
             section_comdats: section_comdats.into_boxed_slice(),
             primary_symbol_count,
-            symbol_count,
+            symbol_count: primary_symbol_count,
             relocation_count,
         })
     }

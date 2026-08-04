@@ -283,6 +283,14 @@ pub(super) struct RelocationRecord {
     pub(super) flags: u16,
 }
 
+impl RelocationRecord {
+    pub(super) const INVALID_TARGET: u16 = 1;
+
+    pub(super) const fn has_invalid_target(self) -> bool {
+        self.flags & Self::INVALID_TARGET != 0
+    }
+}
+
 /// Compressed sparse row storage: `starts[section]..starts[section + 1]` indexes `records`.
 #[derive(Debug)]
 pub(super) struct RelocationCsr {
@@ -391,6 +399,14 @@ impl ResolvedSymbolTargets {
             flags: 0,
             reserved: 0,
         })
+    }
+
+    #[inline(always)]
+    pub(super) fn relocation(&self, relocation: RelocationRecord) -> Option<ResolvedTarget> {
+        if relocation.has_invalid_target() {
+            return Some(ResolvedTarget::diagnostic(relocation.target.get()));
+        }
+        self.symbol(relocation.target)
     }
 
     pub(super) fn name(&self, name: NameId) -> Option<ResolvedTarget> {
@@ -797,6 +813,12 @@ impl<'data> PeIr<'data> {
     /// Validate a relocation target only when a live consumer follows the edge. Indexing itself
     /// deliberately does not turn malformed targets in discarded sections into errors.
     pub(super) fn relocation_target(&self, relocation: RelocationRecord) -> Result<&SymbolRecord> {
+        if relocation.has_invalid_target() {
+            return Err(crate::error!(
+                "Invalid COFF relocation symbol {}",
+                relocation.target.get()
+            ));
+        }
         let target = self
             .symbols
             .get(relocation.target.index())
@@ -975,7 +997,6 @@ where
     );
 
     let mut relocation_position = 0usize;
-    let mut invalid_symbol = plan.primary_symbol_count();
     let mut sections_written = 0usize;
     for (section_ordinal, (section_slot, (start_slot, section))) in sections
         .iter_mut()
@@ -1041,42 +1062,29 @@ where
                 .get_mut(relocation_position)
                 .ok_or_else(|| crate::error!("Selected COFF relocation destination overflow"))?;
             let raw = relocation.symbol_table_index.get(LE) as usize;
-            let mut local_symbol = plan
+            let local_symbol = plan
                 .raw_to_dense_symbol()
                 .get(raw)
                 .copied()
                 .unwrap_or(u32::MAX);
-            if local_symbol == u32::MAX {
-                local_symbol = invalid_symbol;
-                invalid_symbol = invalid_symbol
-                    .checked_add(1)
-                    .ok_or_else(|| crate::error!("Selected COFF symbol count overflow"))?;
-                let symbol_slot = symbols
-                    .get_mut(local_symbol as usize)
-                    .ok_or_else(|| crate::error!("Invalid COFF symbol destination overflow"))?;
-                symbol_slot.write(SymbolRecord {
-                    object: object_id,
-                    raw_index: as_u32(raw, "invalid raw COFF symbol index")?,
-                    name: NameId::from_u32(u32::MAX),
-                    section: OptionalSectionId::NONE,
-                    value: 0,
-                    size: 0,
-                    flags: 0,
-                    storage_class: 0,
-                    typ: 0,
-                    weak_default: OptionalSymbolId::NONE,
-                    diagnostic: SymbolDiagnostic::InvalidRelocationTarget,
-                });
-            }
+            let (target, flags) = if local_symbol == u32::MAX {
+                (
+                    SymbolId::from_u32(as_u32(raw, "invalid raw COFF symbol index")?),
+                    RelocationRecord::INVALID_TARGET,
+                )
+            } else {
+                (
+                    SymbolId::from_u32(offsets.symbol.checked_add(local_symbol).ok_or_else(
+                        || crate::error!("Selected COFF relocation symbol ID overflow"),
+                    )?),
+                    0,
+                )
+            };
             slot.write(RelocationRecord {
                 offset: relocation.virtual_address.get(LE),
-                target: SymbolId::from_u32(
-                    offsets.symbol.checked_add(local_symbol).ok_or_else(|| {
-                        crate::error!("Selected COFF relocation symbol ID overflow")
-                    })?,
-                ),
+                target,
                 typ: relocation.typ.get(LE).0,
-                flags: 0,
+                flags,
             });
             relocation_position += 1;
         }
@@ -1095,10 +1103,6 @@ where
     crate::ensure!(
         relocation_position == relocations.len(),
         "Selected COFF relocation destination underflow"
-    );
-    crate::ensure!(
-        invalid_symbol == plan.symbol_count(),
-        "Selected COFF invalid-symbol destination underflow"
     );
     Ok(DenseObjectResult {
         object: ObjectRecord {

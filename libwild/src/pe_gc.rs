@@ -205,26 +205,22 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
     #[inline(always)]
     fn unpack_symbol_target(
         resolved: &ResolvedSymbolTargets,
-        symbol: SymbolId,
+        relocation: RelocationRecord,
     ) -> Result<ResolvedTarget> {
-        let (kind, target) = resolved
-            .kind_target(symbol)
+        let target = resolved
+            .relocation(relocation)
             .context("relocation target is outside resolved symbol table")?;
-        Ok(match kind {
+        Ok(match target.kind {
             ResolvedTargetKind::Section => ResolvedTarget {
-                section: Some(SectionId::from_u32(target)),
+                section: Some(SectionId::from_u32(target.target)),
                 import: None,
                 import_name: None,
                 absolute: false,
             },
             ResolvedTargetKind::Import => ResolvedTarget {
                 section: None,
-                import: Some(super::pe_ir::ImportId::from_u32(
-                    resolved
-                        .value(symbol)
-                        .context("resolved import has no import ID")?,
-                )),
-                import_name: Some(NameId::from_u32(target)),
+                import: Some(super::pe_ir::ImportId::from_u32(target.value)),
+                import_name: Some(NameId::from_u32(target.target)),
                 absolute: false,
             },
             ResolvedTargetKind::Absolute => ResolvedTarget {
@@ -235,7 +231,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             },
             ResolvedTargetKind::Name => ResolvedTarget::default(),
             ResolvedTargetKind::Diagnostic => {
-                return Err(error!("Invalid COFF relocation symbol {target}"));
+                return Err(error!("Invalid COFF relocation symbol {}", target.target));
             }
         })
     }
@@ -496,8 +492,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                                 .context("live section has no relocation CSR row")?;
                             scanned_relocations += relocations.len();
                             for relocation in relocations {
-                                let target =
-                                    Self::unpack_symbol_target(resolved, relocation.target)?;
+                                let target = Self::unpack_symbol_target(resolved, *relocation)?;
                                 if let Some(name) = target.import_name {
                                     import_names.push(name);
                                 }
@@ -553,7 +548,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                 relocation_count += relocations.len();
             }
             for relocation in relocations {
-                let target = Self::unpack_symbol_target(resolved, relocation.target)?;
+                let target = Self::unpack_symbol_target(resolved, *relocation)?;
                 if let Some(name) = target.import_name {
                     referenced_import_names.insert(name);
                 }
@@ -880,7 +875,7 @@ impl EventDrivenGc for DenseEventGc<'_, '_> {
                     .for_section(section)
                     .context("live section has no relocation CSR row")?;
                 for relocation in relocations {
-                    let target = Self::unpack_symbol_target(resolved, relocation.target)?;
+                    let target = Self::unpack_symbol_target(resolved, *relocation)?;
                     if relocation.typ == 1 && !target.absolute {
                         dir64_needs.push(Dir64Need {
                             section,
