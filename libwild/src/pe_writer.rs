@@ -5062,13 +5062,42 @@ fn section_layout_options(
 
 fn source_locations(
     contributions: &[Contribution],
-) -> HashMap<(usize, object::SectionIndex), ContributionId> {
+    dense: Option<&DenseProductionState<'_>>,
+) -> LocationMap {
     let locations_phase = crate::timing_guard!(PE_DETAIL_SOURCE_LOCATIONS);
-    let mut locations = HashMap::with_capacity(contributions.len());
-    locations.extend(contributions.iter().filter_map(|c| match c.source {
-        Source::Object { object, section } => Some(((object, section), c.spec.id)),
-        Source::Synthetic => None,
-    }));
+    let locations = if let Some(dense) = dense {
+        debug_assert!(dense.ir.objects.iter().all(|object| {
+            let start = object.sections.start() as usize;
+            let end = object.sections.end().unwrap() as usize;
+            dense.ir.sections[start..end]
+                .iter()
+                .enumerate()
+                .all(|(local, section)| section.raw_index as usize == local + 1)
+        }));
+        let mut entries = vec![None; dense.ir.sections.len()];
+        for contribution in contributions {
+            if let Some(section) = contribution.dense_section {
+                entries[section.index()] = Some(contribution.spec.id);
+            }
+        }
+        LocationMap::Dense {
+            entries: entries.into_boxed_slice(),
+            object_ranges: dense
+                .ir
+                .objects
+                .iter()
+                .map(|object| (object.sections.start(), object.sections.len()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    } else {
+        let mut locations = HashMap::with_capacity(contributions.len());
+        locations.extend(contributions.iter().filter_map(|c| match c.source {
+            Source::Object { object, section } => Some(((object, section), c.spec.id)),
+            Source::Synthetic => None,
+        }));
+        LocationMap::Sparse(locations)
+    };
     drop(locations_phase);
     locations
 }
@@ -5177,7 +5206,42 @@ fn dir64_rvas(sites: &[Dir64Site], layout: &SectionLayout) -> Result<Vec<u32>> {
     Ok(rvas)
 }
 
-type LocationMap = HashMap<(usize, object::SectionIndex), ContributionId>;
+enum LocationMap {
+    Dense {
+        entries: Box<[Option<ContributionId>]>,
+        object_ranges: Box<[(u32, u32)]>,
+    },
+    Sparse(HashMap<(usize, object::SectionIndex), ContributionId>),
+}
+
+impl LocationMap {
+    fn get(
+        &self,
+        &(object, raw_section): &(usize, object::SectionIndex),
+    ) -> Option<&ContributionId> {
+        match self {
+            Self::Dense {
+                entries,
+                object_ranges,
+            } => {
+                let &(start, len) = object_ranges.get(object)?;
+                let local = raw_section.0.checked_sub(1)?;
+                if local >= len as usize {
+                    return None;
+                }
+                entries.get(start as usize + local)?.as_ref()
+            }
+            Self::Sparse(locations) => locations.get(&(object, raw_section)),
+        }
+    }
+
+    fn get_dense(&self, section: pe_ir::SectionId) -> Option<&ContributionId> {
+        match self {
+            Self::Dense { entries, .. } => entries.get(section.index())?.as_ref(),
+            Self::Sparse(_) => None,
+        }
+    }
+}
 
 /// Dense object definitions stay indexed by canonical NameId. Only linker-generated names and
 /// compatibility aliases require byte-owned hash entries, avoiding one allocation and rehash for
@@ -5253,22 +5317,16 @@ fn definitions<'state, 'data>(
     image_base: u64,
     allow_multiple: bool,
 ) -> Result<(LocationMap, DefinitionMap<'state, 'data>)> {
-    let locations = source_locations(contributions);
+    let locations = source_locations(contributions, metadata.dense);
     let mut definitions = DefinitionMap::new(metadata.dense);
     if let Some(dense) = metadata.dense {
-        let mut section_contributions = vec![None; dense.ir.sections.len()];
-        for contribution in contributions {
-            if let Some(section) = contribution.dense_section {
-                section_contributions[section.index()] = Some(contribution.spec.id);
-            }
-        }
         for &symbol_id in &dense.ir.global_symbols {
             let symbol = dense.ir.symbols[symbol_id.index()];
             if symbol.is_common() {
                 continue;
             }
             let address = if let Some(section) = symbol.section.get() {
-                let Some(id) = section_contributions[section.index()] else {
+                let Some(&id) = locations.get_dense(section) else {
                     continue;
                 };
                 image_base + u64::from(layout.placements[id].rva) + symbol.value
