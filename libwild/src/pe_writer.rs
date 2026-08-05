@@ -3819,42 +3819,51 @@ impl CompactComdatAnalysis {
             is_comdat: Vec::with_capacity(section_count),
             ..Self::default()
         };
-        for section in &dense.ir.sections {
-            analysis
-                .is_comdat
-                .push(section.characteristics & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0);
-        }
         analysis.group_by_node = vec![usize::MAX; section_count];
 
         // Resolve every associative section to its ultimate non-associative leader using direct
         // SectionIds. `comdat_order` preserves the raw auxiliary-symbol encounter order used by
         // the previous object::Comdat iterator, including nested associative children.
         let no_leader = u32::MAX;
-        let mut leader_by_node = vec![no_leader; section_count];
-        let mut member_counts = vec![0u32; section_count];
-        for (node, section) in dense.ir.sections.iter().enumerate() {
-            if section.comdat_selection == 0 {
-                continue;
-            }
-            let mut leader = pe_ir::SectionId::from_u32(node as u32);
-            for _ in 0..=section_count {
-                let record = &dense.ir.sections[leader.index()];
-                if record.comdat_selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0 {
-                    leader_by_node[node] = leader.get();
-                    member_counts[leader.index()] = member_counts[leader.index()]
-                        .checked_add(1)
-                        .context("too many members in dense COMDAT group")?;
-                    break;
+        // Each section's parent chain is immutable and independent. Resolve those chains in
+        // parallel, but retain one ordered Result slot per SectionId so malformed inputs still
+        // report the first failing section deterministically on the caller thread.
+        let topology = dense
+            .ir
+            .sections
+            .par_iter()
+            .enumerate()
+            .map(|(node, section)| -> Result<(bool, u32)> {
+                let is_comdat =
+                    section.characteristics & object::pe::IMAGE_SCN_LNK_COMDAT.0 != 0;
+                if section.comdat_selection == 0 {
+                    return Ok((is_comdat, no_leader));
                 }
-                leader = record
-                    .associative_section
-                    .get()
-                    .context("associative COMDAT refers to a missing parent")?;
+                let mut leader = pe_ir::SectionId::from_u32(node as u32);
+                for _ in 0..=section_count {
+                    let record = &dense.ir.sections[leader.index()];
+                    if record.comdat_selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0 {
+                        return Ok((is_comdat, leader.get()));
+                    }
+                    leader = record
+                        .associative_section
+                        .get()
+                        .context("associative COMDAT refers to a missing parent")?;
+                }
+                Err(error!("cycle in associative COMDAT parent chain"))
+            })
+            .collect::<Vec<_>>();
+        let mut leader_by_node = Vec::with_capacity(section_count);
+        let mut member_counts = vec![0u32; section_count];
+        for result in topology {
+            let (is_comdat, leader) = result?;
+            analysis.is_comdat.push(is_comdat);
+            leader_by_node.push(leader);
+            if leader != no_leader {
+                member_counts[leader as usize] = member_counts[leader as usize]
+                    .checked_add(1)
+                    .context("too many members in dense COMDAT group")?;
             }
-            ensure!(
-                leader_by_node[node] != no_leader,
-                "cycle in associative COMDAT parent chain"
-            );
         }
 
         // Build dense groups as CSR. A Vec header per potential leader and another Vec allocation
