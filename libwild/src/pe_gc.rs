@@ -634,8 +634,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             let mut bits = bits;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
-                referenced_import_names
-                    .push(NameId::from_u32((word_index * 64 + bit) as u32));
+                referenced_import_names.push(NameId::from_u32((word_index * 64 + bit) as u32));
                 bits &= bits - 1;
             }
         }

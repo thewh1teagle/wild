@@ -612,15 +612,21 @@ struct CachedArchiveProviders {
 }
 
 struct ArchiveProviderCache {
+    // Preserve direct indexing for the common low-ID region without letting one sparse high ID
+    // resize and later scan a Vec across the entire global symbol namespace.
     by_name: Vec<Option<CachedArchiveProviders>>,
+    high_names: HashMap<NameId, CachedArchiveProviders>,
     by_hash_shards: Vec<HashMap<u64, SmallVec<[ArchiveProvider; 1]>>>,
     indexed_archives: usize,
 }
+
+const DENSE_ARCHIVE_NAME_CACHE_LIMIT: usize = 1 << 15;
 
 impl ArchiveProviderCache {
     fn new() -> Self {
         Self {
             by_name: Vec::new(),
+            high_names: HashMap::new(),
             by_hash_shards: Vec::new(),
             indexed_archives: 0,
         }
@@ -685,14 +691,22 @@ impl ArchiveProviderCache {
         archives: &[&CoffArchive<'data>],
     ) -> &'cache [ArchiveProvider] {
         self.extend_index(archives);
-        if self.by_name.len() <= name_id.index() {
-            if name_id.index() + 1 > self.by_name.capacity() {
+        let cached = if name_id.index() < DENSE_ARCHIVE_NAME_CACHE_LIMIT {
+            if self.by_name.len() <= name_id.index() {
+                if name_id.index() + 1 > self.by_name.capacity() {
+                    crate::perf::removal_counters::increment_hot_phase_allocations();
+                }
+                self.by_name.resize_with(name_id.index() + 1, || None);
+            }
+            self.by_name[name_id.index()].get_or_insert_with(CachedArchiveProviders::default)
+        } else {
+            if !self.high_names.contains_key(&name_id)
+                && self.high_names.len() == self.high_names.capacity()
+            {
                 crate::perf::removal_counters::increment_hot_phase_allocations();
             }
-            self.by_name.resize_with(name_id.index() + 1, || None);
-        }
-        let cached =
-            self.by_name[name_id.index()].get_or_insert_with(CachedArchiveProviders::default);
+            self.high_names.entry(name_id).or_default()
+        };
         if cached.archives_scanned == archives.len() {
             return &cached.providers;
         }
@@ -858,7 +872,6 @@ impl<'data> ResolverSession<'data> {
             drop(absorb_phase);
         }
         self.scanned_objects = objects.len();
-
         // Legacy alias members are not retained as ordinary objects. Reapply their directives
         // because the caller rebuilds runtime directives whenever newly selected objects add
         // another `.drectve` wave.
@@ -2178,22 +2191,26 @@ mod tests {
             CoffArchive::parse(&unrelated).unwrap(),
             CoffArchive::parse(&provider).unwrap(),
         ];
-        let mut cache = ArchiveProviderCache::new();
-        let name = NameId::from_u32(0);
         let target_definition = parsed[1]
             .definition_rows()
             .find(|(_, definition, _, _)| *definition == b"target")
             .unwrap()
             .0;
 
-        assert!(cache.providers(name, b"target", &[&parsed[0]]).is_empty());
-        assert_eq!(
-            cache.providers(name, b"target", &[&parsed[0], &parsed[1]]),
-            [ArchiveProvider {
-                archive: ArchiveId::from_u32(1),
-                definition: target_definition,
-            }]
-        );
+        for name in [
+            NameId::from_u32(0),
+            NameId::from_u32(DENSE_ARCHIVE_NAME_CACHE_LIMIT as u32 + 7),
+        ] {
+            let mut cache = ArchiveProviderCache::new();
+            assert!(cache.providers(name, b"target", &[&parsed[0]]).is_empty());
+            assert_eq!(
+                cache.providers(name, b"target", &[&parsed[0], &parsed[1]]),
+                [ArchiveProvider {
+                    archive: ArchiveId::from_u32(1),
+                    definition: target_definition,
+                }]
+            );
+        }
     }
 
     #[test]
