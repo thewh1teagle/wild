@@ -957,6 +957,7 @@ struct OpenSelection<'data> {
     exports: Vec<crate::args::coff::ExportSpec>,
     roots: Vec<Vec<u8>>,
     directives: crate::args::coff::CoffArgs,
+    directive_objects_scanned: usize,
     archive_definitions: BTreeSet<Vec<u8>>,
     resolver: pe_resolver::ResolverSession<'data>,
 }
@@ -1009,7 +1010,11 @@ fn select_opened_inputs<'data, F: FileSystem>(
         entry_name: None,
         exports: Vec::new(),
         roots: Vec::new(),
-        directives: Default::default(),
+        directives: crate::args::coff::CoffArgs {
+            runtime_resolution: args.runtime_resolution.clone(),
+            ..Default::default()
+        },
+        directive_objects_scanned: 0,
         archive_definitions: BTreeSet::new(),
         resolver: pe_resolver::ResolverSession::new(),
     };
@@ -1115,13 +1120,18 @@ fn resolve_open_selection(
             .map(|&index| &selection.objects[index]),
     )?;
     loop {
-        let mut directives = {
+        {
             crate::timing_phase!(PE_PHASE_PARSE_DIRECTIVES);
-            directive_args(args, &selection.objects)?
-        };
+            extend_directive_args(
+                &mut selection.directives,
+                &selection.objects[selection.directive_objects_scanned..],
+                selection.directive_objects_scanned,
+            )?;
+            selection.directive_objects_scanned = selection.objects.len();
+        }
         let selection_roots_phase = crate::timing_guard!(PE_DETAIL_REBUILD_SELECTION_ROOTS);
         let mut exports = command_exports.to_vec();
-        for export in &directives.exports {
+        for export in &selection.directives.exports {
             merge_export(
                 &mut exports,
                 export.clone(),
@@ -1131,11 +1141,12 @@ fn resolve_open_selection(
         let mut roots = args
             .force_undefined
             .iter()
-            .chain(directives.force_undefined.iter())
+            .chain(selection.directives.force_undefined.iter())
             .map(|symbol| symbol.as_bytes().to_vec())
             .collect::<Vec<_>>();
         roots.extend(
-            directives
+            selection
+                .directives
                 .runtime_resolution
                 .include_roots()
                 .map(|symbol| symbol.as_bytes().to_vec()),
@@ -1161,7 +1172,7 @@ fn resolve_open_selection(
         }
         // The delay helper is referenced by linker-generated thunks rather than an input
         // relocation, so explicitly root it before archive extraction can reach delayimp.lib.
-        if (!args.delay_load_dlls.is_empty() || !directives.delay_load_dlls.is_empty())
+        if (!args.delay_load_dlls.is_empty() || !selection.directives.delay_load_dlls.is_empty())
             && selection
                 .resolver
                 .has_archive_definition(b"__delayLoadHelper2")
@@ -1176,37 +1187,34 @@ fn resolve_open_selection(
         let archive_definitions = selection.resolver.resolve(
             &mut selection.objects,
             &roots,
-            &mut directives.runtime_resolution,
+            &mut selection.directives.runtime_resolution,
         )?;
         if selection.objects.len() == old_len {
             selection.exports = exports;
             selection.roots = roots;
-            selection.directives = directives;
             selection.archive_definitions = archive_definitions;
             return Ok(());
         }
     }
 }
 
-fn directive_args(
-    args: &crate::args::coff::CoffArgs,
+fn extend_directive_args(
+    parsed: &mut crate::args::coff::CoffArgs,
     objects: &[crate::coff::CoffObject<'_>],
-) -> Result<crate::args::coff::CoffArgs> {
-    let mut parsed = crate::args::coff::CoffArgs {
-        runtime_resolution: args.runtime_resolution.clone(),
-        ..Default::default()
-    };
-    for (index, object) in objects.iter().enumerate() {
+    first_object: usize,
+) -> Result<()> {
+    for (offset, object) in objects.iter().enumerate() {
+        let index = first_object + offset;
         let Some(section) = object.file().section_by_name(".drectve") else {
             continue;
         };
         let text = std::str::from_utf8(section.data().context("invalid COFF .drectve")?)
             .with_context(|| format!("non-UTF-8 .drectve in selected COFF object #{index}"))?
             .trim_end_matches('\0');
-        crate::args::coff::parse_directives(&mut parsed, text)
+        crate::args::coff::parse_directives(parsed, text)
             .with_context(|| format!("in selected COFF object #{index}"))?;
     }
-    Ok(parsed)
+    Ok(())
 }
 
 fn deduplicate_case_insensitive(values: &mut Vec<String>) {
