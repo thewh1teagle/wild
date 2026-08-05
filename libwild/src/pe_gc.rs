@@ -440,7 +440,14 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             }
             Ok(())
         };
-        let mut referenced_import_names = BTreeSet::new();
+        let mut referenced_import_bits = vec![0u64; resolved.names.len().div_ceil(64)];
+        let mark_import = |name: NameId, bits: &mut [u64]| -> Result<()> {
+            let word = bits
+                .get_mut(name.index() / 64)
+                .context("import name is outside resolved namespace")?;
+            *word |= 1u64 << (name.index() % 64);
+            Ok(())
+        };
         for (index, &is_comdat) in input.is_comdat.iter().enumerate() {
             if !is_comdat {
                 mark(
@@ -458,7 +465,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     .context("GC root name is outside resolved namespace")?,
             )?;
             if let Some(name) = target.import_name {
-                referenced_import_names.insert(name);
+                mark_import(name, &mut referenced_import_bits)?;
             }
             if let Some(section) = target.section {
                 mark(section, &mut live_bits, &mut pending, &mut visited_sections)?;
@@ -552,7 +559,9 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     if instrumentation_enabled {
                         relocation_count += scanned_relocations;
                     }
-                    referenced_import_names.extend(import_names);
+                    for name in import_names {
+                        mark_import(name, &mut referenced_import_bits)?;
+                    }
                     for section in section_targets {
                         mark(section, &mut live_bits, &mut pending, &mut visited_sections)?;
                     }
@@ -597,8 +606,10 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                             &mut visited_sections,
                         )?,
                         1 => {
-                            referenced_import_names
-                                .insert(NameId::from_u32(target & Self::PREDECODE_TARGET_MASK));
+                            mark_import(
+                                NameId::from_u32(target & Self::PREDECODE_TARGET_MASK),
+                                &mut referenced_import_bits,
+                            )?;
                         }
                         2 => {}
                         _ => {
@@ -610,12 +621,22 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                 for relocation in relocations {
                     let target = Self::unpack_symbol_target(resolved, *relocation)?;
                     if let Some(name) = target.import_name {
-                        referenced_import_names.insert(name);
+                        mark_import(name, &mut referenced_import_bits)?;
                     }
                     if let Some(target) = target.section {
                         mark(target, &mut live_bits, &mut pending, &mut visited_sections)?;
                     }
                 }
+            }
+        }
+        let mut referenced_import_names = Vec::new();
+        for (word_index, &bits) in referenced_import_bits.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                referenced_import_names
+                    .push(NameId::from_u32((word_index * 64 + bit) as u32));
+                bits &= bits - 1;
             }
         }
         if instrumentation_enabled {
@@ -641,7 +662,7 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             // compatibility snapshots remain populated by the general event collector below.
             visitation_order: Box::new([]),
             referenced_imports: Box::new([]),
-            referenced_import_names: referenced_import_names.into_iter().collect(),
+            referenced_import_names: referenced_import_names.into_boxed_slice(),
             dir64_needs: Box::new([]),
         })
     }
