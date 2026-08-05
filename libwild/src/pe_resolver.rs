@@ -613,7 +613,7 @@ struct CachedArchiveProviders {
 
 struct ArchiveProviderCache {
     by_name: Vec<Option<CachedArchiveProviders>>,
-    by_hash: HashMap<u64, SmallVec<[ArchiveProvider; 1]>>,
+    by_hash_shards: Vec<HashMap<u64, SmallVec<[ArchiveProvider; 1]>>>,
     indexed_archives: usize,
 }
 
@@ -621,7 +621,7 @@ impl ArchiveProviderCache {
     fn new() -> Self {
         Self {
             by_name: Vec::new(),
-            by_hash: HashMap::new(),
+            by_hash_shards: Vec::new(),
             indexed_archives: 0,
         }
     }
@@ -653,11 +653,28 @@ impl ArchiveProviderCache {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        if self.by_hash_shards.is_empty() {
+            let shard_count = rayon::current_num_threads().next_power_of_two();
+            self.by_hash_shards = (0..shard_count).map(|_| HashMap::new()).collect();
+        }
+        let shard_mask = self.by_hash_shards.len() - 1;
+        let row_count = chunks.iter().map(Vec::len).sum::<usize>();
+        let mut partitions = (0..self.by_hash_shards.len())
+            .map(|_| Vec::with_capacity(row_count / self.by_hash_shards.len() + 1))
+            .collect::<Vec<_>>();
         for chunk in chunks {
             for (hash, provider) in chunk {
-                self.by_hash.entry(hash).or_default().push(provider);
+                partitions[hash as usize & shard_mask].push((hash, provider));
             }
         }
+        self.by_hash_shards
+            .par_iter_mut()
+            .zip(partitions.into_par_iter())
+            .for_each(|(shard, rows)| {
+                for (hash, provider) in rows {
+                    shard.entry(hash).or_default().push(provider);
+                }
+            });
         self.indexed_archives = archives.len();
     }
 
@@ -679,8 +696,13 @@ impl ArchiveProviderCache {
         if cached.archives_scanned == archives.len() {
             return &cached.providers;
         }
+        if self.by_hash_shards.is_empty() {
+            cached.archives_scanned = archives.len();
+            return &cached.providers;
+        }
         let hash = crate::hash::hash_bytes(name);
-        if let Some(candidates) = self.by_hash.get(&hash) {
+        let shard = &self.by_hash_shards[hash as usize & (self.by_hash_shards.len() - 1)];
+        if let Some(candidates) = shard.get(&hash) {
             for &provider in candidates {
                 let archive_index = provider.archive.index();
                 if archive_index < cached.archives_scanned {
