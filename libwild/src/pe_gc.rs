@@ -158,6 +158,13 @@ pub(super) struct ProductionGcInput<'a> {
 }
 
 impl<'ir, 'data> DenseEventGc<'ir, 'data> {
+    const PREDECODE_RELOCATIONS_MIN: usize = 500_000;
+    const PREDECODE_KIND_SHIFT: u32 = 29;
+    const PREDECODE_TARGET_MASK: u32 = (1 << Self::PREDECODE_KIND_SHIFT) - 1;
+    const PREDECODE_IMPORT: u32 = 1 << Self::PREDECODE_KIND_SHIFT;
+    const PREDECODE_NONE: u32 = 2 << Self::PREDECODE_KIND_SHIFT;
+    const PREDECODE_DIAGNOSTIC: u32 = 3 << Self::PREDECODE_KIND_SHIFT;
+
     pub(super) fn new(ir: &'ir PeIr<'data>, alternate_targets: &'ir [u32]) -> Self {
         Self {
             ir,
@@ -251,6 +258,24 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                 return Err(error!("Invalid COFF relocation symbol {}", target));
             }
         })
+    }
+
+    #[inline(always)]
+    fn predecode_relocation_target(
+        resolved: &ResolvedSymbolTargets,
+        relocation: RelocationRecord,
+    ) -> u32 {
+        if relocation.has_invalid_target() {
+            return Self::PREDECODE_DIAGNOSTIC;
+        }
+        match resolved.kind_target(relocation.target) {
+            Some((ResolvedTargetKind::Section, target)) => target,
+            Some((ResolvedTargetKind::Import, name)) => Self::PREDECODE_IMPORT | name,
+            Some((ResolvedTargetKind::Absolute | ResolvedTargetKind::Name, _)) => {
+                Self::PREDECODE_NONE
+            }
+            Some((ResolvedTargetKind::Diagnostic, _)) | None => Self::PREDECODE_DIAGNOSTIC,
+        }
     }
 
     fn resolve_name(&self, symbols: &SymbolDb, mut name: NameId) -> Result<ResolvedTarget> {
@@ -443,6 +468,21 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
         let mut traversal_phase = crate::pe_timing_guard!("PE dense GC: Traverse resolved CSR");
         let instrumentation_enabled = traversal_phase.0.enabled();
         let mut relocation_count = 0usize;
+        // Large Rust links revisit enough scattered symbol-target entries during GC that one
+        // parallel, linear pass is cheaper than resolving each live relocation in queue order.
+        // The compact stream has the same CSR offsets as `records`; diagnostics remain deferred
+        // until their source section becomes live. Small links retain the lower-overhead path.
+        let predecoded_targets = (self.ir.relocations.records.len()
+            >= Self::PREDECODE_RELOCATIONS_MIN
+            && rayon::current_num_threads() > 1)
+            .then(|| {
+                self.ir
+                    .relocations
+                    .records
+                    .par_iter()
+                    .map(|&relocation| Self::predecode_relocation_target(resolved, relocation))
+                    .collect::<Vec<_>>()
+            });
         const PARALLEL_FRONTIER_MIN: usize = 8192;
         while !pending.is_empty() {
             if rayon::current_num_threads() > 1 && pending.len() >= PARALLEL_FRONTIER_MIN {
@@ -472,13 +512,35 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                                 .for_section(section)
                                 .context("live section has no relocation CSR row")?;
                             scanned_relocations += relocations.len();
-                            for relocation in relocations {
-                                let target = Self::unpack_symbol_target(resolved, *relocation)?;
-                                if let Some(name) = target.import_name {
-                                    import_names.push(name);
+                            if let Some(predecoded_targets) = predecoded_targets.as_deref() {
+                                let range = self
+                                    .ir
+                                    .relocations
+                                    .range(section)
+                                    .context("live section has no relocation CSR row")?;
+                                for (relocation, &target) in
+                                    relocations.iter().zip(&predecoded_targets[range])
+                                {
+                                    match target >> Self::PREDECODE_KIND_SHIFT {
+                                        0 => section_targets.push(SectionId::from_u32(target)),
+                                        1 => import_names.push(NameId::from_u32(
+                                            target & Self::PREDECODE_TARGET_MASK,
+                                        )),
+                                        2 => {}
+                                        _ => {
+                                            Self::unpack_symbol_target(resolved, *relocation)?;
+                                        }
+                                    }
                                 }
-                                if let Some(section) = target.section {
-                                    section_targets.push(section);
+                            } else {
+                                for relocation in relocations {
+                                    let target = Self::unpack_symbol_target(resolved, *relocation)?;
+                                    if let Some(name) = target.import_name {
+                                        import_names.push(name);
+                                    }
+                                    if let Some(section) = target.section {
+                                        section_targets.push(section);
+                                    }
                                 }
                             }
                         }
@@ -520,13 +582,39 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
             if instrumentation_enabled {
                 relocation_count += relocations.len();
             }
-            for relocation in relocations {
-                let target = Self::unpack_symbol_target(resolved, *relocation)?;
-                if let Some(name) = target.import_name {
-                    referenced_import_names.insert(name);
+            if let Some(predecoded_targets) = predecoded_targets.as_deref() {
+                let range = self
+                    .ir
+                    .relocations
+                    .range(section)
+                    .context("live section has no relocation CSR row")?;
+                for (relocation, &target) in relocations.iter().zip(&predecoded_targets[range]) {
+                    match target >> Self::PREDECODE_KIND_SHIFT {
+                        0 => mark(
+                            SectionId::from_u32(target),
+                            &mut live_bits,
+                            &mut pending,
+                            &mut visited_sections,
+                        )?,
+                        1 => {
+                            referenced_import_names
+                                .insert(NameId::from_u32(target & Self::PREDECODE_TARGET_MASK));
+                        }
+                        2 => {}
+                        _ => {
+                            Self::unpack_symbol_target(resolved, *relocation)?;
+                        }
+                    }
                 }
-                if let Some(target) = target.section {
-                    mark(target, &mut live_bits, &mut pending, &mut visited_sections)?;
+            } else {
+                for relocation in relocations {
+                    let target = Self::unpack_symbol_target(resolved, *relocation)?;
+                    if let Some(name) = target.import_name {
+                        referenced_import_names.insert(name);
+                    }
+                    if let Some(target) = target.section {
+                        mark(target, &mut live_bits, &mut pending, &mut visited_sections)?;
+                    }
                 }
             }
         }
