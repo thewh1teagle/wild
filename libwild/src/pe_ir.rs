@@ -509,6 +509,13 @@ impl<'data> PeIr<'data> {
         symbols: &SymbolDb,
         alternate_targets: &[u32],
     ) -> Result<ResolvedSymbolTargets> {
+        // Keep the compact serial implementation in this function. Pulling the Rayon machinery
+        // into the same codegen unit measurably perturbs instruction layout for tiny PE links.
+        const LARGE_LINK_NAME_MIN: usize = 4 * 1024;
+        if symbols.entries.len() >= LARGE_LINK_NAME_MIN {
+            return self.resolve_symbol_targets_large(symbols, alternate_targets);
+        }
+
         let names = (0..symbols.entries.len())
             .map(|index| {
                 self.resolve_name_target(symbols, alternate_targets, NameId::from_u32(index as u32))
@@ -540,6 +547,82 @@ impl<'data> PeIr<'data> {
             packed: packed.into_boxed_slice(),
             values: values.into_boxed_slice(),
             names,
+        })
+    }
+
+    // This boundary is intentional: large links recover several milliseconds from parallel name
+    // and symbol columns without making the small-link serial path pay for that implementation.
+    #[inline(never)]
+    fn resolve_symbol_targets_large(
+        &self,
+        symbols: &SymbolDb,
+        alternate_targets: &[u32],
+    ) -> Result<ResolvedSymbolTargets> {
+        const PARALLEL_NAME_MIN: usize = 16 * 1024;
+        const PARALLEL_SYMBOL_MIN: usize = 32 * 1024;
+
+        let resolve_name = |index| {
+            self.resolve_name_target(symbols, alternate_targets, NameId::from_u32(index as u32))
+        };
+        let names = if symbols.entries.len() >= PARALLEL_NAME_MIN {
+            (0..symbols.entries.len())
+                .into_par_iter()
+                .map(resolve_name)
+                .collect::<Vec<_>>()
+        } else {
+            (0..symbols.entries.len())
+                .map(resolve_name)
+                .collect::<Vec<_>>()
+        };
+        let resolve_symbol = |symbol: &SymbolRecord| {
+            let target = if symbol.diagnostic == SymbolDiagnostic::InvalidRelocationTarget {
+                ResolvedTarget::diagnostic(symbol.raw_index)
+            } else if symbol.flags & 1 == 0
+                && let Some(section) = symbol.section.get()
+            {
+                u32::try_from(symbol.value).map_or_else(
+                    |_| ResolvedTarget::diagnostic(symbol.raw_index),
+                    |value| ResolvedTarget::section(section, value),
+                )
+            } else {
+                names
+                    .get(symbol.name.index())
+                    .copied()
+                    .unwrap_or_else(|| ResolvedTarget::diagnostic(symbol.raw_index))
+            };
+            Ok::<_, crate::error::Error>((
+                ResolvedSymbolTargets::pack(target.kind, target.target)?,
+                target.value,
+            ))
+        };
+        let mut packed = vec![0; self.symbols.len()];
+        let mut values = vec![0; self.symbols.len()];
+        if self.symbols.len() >= PARALLEL_SYMBOL_MIN {
+            packed
+                .par_iter_mut()
+                .zip(values.par_iter_mut())
+                .zip(self.symbols.par_iter())
+                .try_for_each(|((packed, value), symbol)| {
+                    let resolved = resolve_symbol(symbol)?;
+                    *packed = resolved.0;
+                    *value = resolved.1;
+                    Ok::<_, crate::error::Error>(())
+                })?;
+        } else {
+            for ((packed, value), symbol) in packed
+                .iter_mut()
+                .zip(values.iter_mut())
+                .zip(self.symbols.iter())
+            {
+                let resolved = resolve_symbol(symbol)?;
+                *packed = resolved.0;
+                *value = resolved.1;
+            }
+        }
+        Ok(ResolvedSymbolTargets {
+            packed: packed.into_boxed_slice(),
+            values: values.into_boxed_slice(),
+            names: names.into_boxed_slice(),
         })
     }
 
