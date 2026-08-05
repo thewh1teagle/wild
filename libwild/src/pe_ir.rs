@@ -17,6 +17,7 @@ use crate::coff::CoffObject;
 use crate::error::Result;
 use object::LittleEndian as LE;
 use object::Object as _;
+#[cfg(test)]
 use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 use object::read::coff::CoffHeader;
@@ -970,6 +971,7 @@ where
         relocations,
     } = destination;
     let object_id = ObjectId::from_u32(as_u32(object_index, "selected object")?);
+    let object_bytes = object.bytes();
     let plan = object.dense_plan();
     let resolver = object.resolver_summary()?;
     let mut globals = Vec::new();
@@ -1104,22 +1106,21 @@ where
         "COFF resolver summary has excess global symbols during dense fill"
     );
 
-    let mut relocation_position = 0usize;
-    let mut sections_written = 0usize;
-    for (section_ordinal, (section_slot, (start_slot, section))) in sections
-        .iter_mut()
-        .zip(relocation_starts.iter_mut().zip(file.sections()))
-        .enumerate()
-    {
+    let write_section = |section_ordinal: usize,
+                         relocation_base: usize,
+                         relocation_position: &mut usize,
+                         section_slot: &mut std::mem::MaybeUninit<SectionRecord>,
+                         start_slot: &mut std::mem::MaybeUninit<u32>,
+                         relocation_slots: &mut [std::mem::MaybeUninit<RelocationRecord>],
+                         section: &object::pe::ImageSectionHeader|
+     -> Result<()> {
         let data = section
-            .file_range()
+            .coff_file_range()
             .map(|(start, len)| {
                 Ok::<_, crate::error::Error>(SourceRange {
                     file: FileId::from_u32(object_id.get()),
-                    start: u32::try_from(start)
-                        .map_err(|_| crate::error!("COFF section payload offset exceeds u32"))?,
-                    len: u32::try_from(len)
-                        .map_err(|_| crate::error!("COFF section payload size exceeds u32"))?,
+                    start,
+                    len,
                 })
             })
             .transpose()?;
@@ -1146,28 +1147,40 @@ where
                     .ok_or_else(|| crate::error!("Selected COFF COMDAT leader ID overflow"))?,
             )
         };
+        let characteristics = section.characteristics.get(LE);
+        let contents = if characteristics
+            .intersects(object::pe::IMAGE_SCN_CNT_CODE | object::pe::IMAGE_SCN_MEM_EXECUTE)
+        {
+            SectionContents::Code
+        } else if characteristics.contains(object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA) {
+            if characteristics.contains(object::pe::IMAGE_SCN_MEM_DISCARDABLE) {
+                SectionContents::Metadata
+            } else {
+                SectionContents::Data
+            }
+        } else if characteristics.contains(object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA) {
+            SectionContents::Uninitialized
+        } else {
+            SectionContents::Metadata
+        };
         section_slot.write(SectionRecord {
             object: object_id,
-            raw_index: as_u32(section.index().0, "raw COFF section")?,
+            raw_index: as_u32(section_ordinal + 1, "raw COFF section")?,
             name: local_names[next_global + section_ordinal],
             data,
-            size: u32::try_from(section.size())
-                .map_err(|_| crate::error!("COFF section size exceeds u32"))?,
-            alignment: u32::try_from(section.align())
+            size: section.size_of_raw_data.get(LE),
+            alignment: u32::try_from(section.coff_alignment())
                 .map_err(|_| crate::error!("COFF section alignment exceeds u32"))?,
-            characteristics: match section.flags() {
-                object::SectionFlags::Coff { characteristics } => characteristics.0,
-                _ => 0,
-            },
-            contents: section_contents(section.kind()),
+            characteristics: characteristics.0,
+            contents,
             comdat_selection: comdat.selection,
             associative_section,
             comdat_leader,
             comdat_order: comdat.order,
         });
-        for relocation in section.coff_relocations().unwrap_or(&[]) {
-            let slot = relocations
-                .get_mut(relocation_position)
+        for relocation in section.coff_relocations(object_bytes).unwrap_or(&[]) {
+            let slot = relocation_slots
+                .get_mut(*relocation_position)
                 .ok_or_else(|| crate::error!("Selected COFF relocation destination overflow"))?;
             let raw = relocation.symbol_table_index.get(LE) as usize;
             let local_symbol = plan
@@ -1194,24 +1207,136 @@ where
                 typ: relocation.typ.get(LE).0,
                 flags,
             });
-            relocation_position += 1;
+            *relocation_position += 1;
         }
+        let relocation_end = relocation_base
+            .checked_add(*relocation_position)
+            .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?;
         start_slot.write(
             offsets
                 .relocation
-                .checked_add(as_u32(relocation_position, "selected relocation")?)
+                .checked_add(as_u32(relocation_end, "selected relocation")?)
                 .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?,
         );
-        sections_written += 1;
+        Ok(())
+    };
+
+    const INTRA_OBJECT_PARALLEL_SECTIONS: usize = if cfg!(test) { 16 } else { 32 * 1024 };
+    if sections.len() >= INTRA_OBJECT_PARALLEL_SECTIONS && rayon::current_num_threads() > 1 {
+        let section_table = file.coff_section_table();
+        let section_inputs = section_table.iter().as_slice();
+        crate::ensure!(
+            section_inputs.len() == sections.len(),
+            "Selected COFF section destination underflow"
+        );
+        let chunk_size = section_inputs
+            .len()
+            .div_ceil(rayon::current_num_threads().saturating_mul(2))
+            .max(1024);
+        let mut chunks = Vec::new();
+        let mut section_tail = &mut sections[..];
+        let mut start_tail = &mut relocation_starts[..];
+        let mut relocation_tail = &mut relocations[..];
+        let mut section_base = 0usize;
+        let mut relocation_base = 0usize;
+        for section_chunk in section_inputs.chunks(chunk_size) {
+            let section_len = section_chunk.len();
+            let relocation_len = section_chunk
+                .iter()
+                .map(|section| section.coff_relocations(object_bytes).unwrap_or(&[]).len())
+                .sum::<usize>();
+            let (section_slots, remaining_sections) = section_tail.split_at_mut(section_len);
+            section_tail = remaining_sections;
+            let (start_slots, remaining_starts) = start_tail.split_at_mut(section_len);
+            start_tail = remaining_starts;
+            let (relocation_slots, remaining_relocations) =
+                relocation_tail.split_at_mut(relocation_len);
+            relocation_tail = remaining_relocations;
+            chunks.push((
+                section_base,
+                relocation_base,
+                section_chunk,
+                section_slots,
+                start_slots,
+                relocation_slots,
+            ));
+            section_base = section_base
+                .checked_add(section_len)
+                .ok_or_else(|| crate::error!("Selected COFF section count overflow"))?;
+            relocation_base = relocation_base
+                .checked_add(relocation_len)
+                .ok_or_else(|| crate::error!("Selected COFF relocation count overflow"))?;
+        }
+        crate::ensure!(
+            section_tail.is_empty() && start_tail.is_empty() && relocation_tail.is_empty(),
+            "Selected COFF section chunk prefix mismatch"
+        );
+        let results = chunks
+            .into_par_iter()
+            .map(
+                |(
+                    section_base,
+                    relocation_base,
+                    section_inputs,
+                    section_slots,
+                    start_slots,
+                    relocation_slots,
+                )| {
+                    let mut relocation_position = 0usize;
+                    for (local_section, (section, (section_slot, start_slot))) in section_inputs
+                        .iter()
+                        .zip(section_slots.iter_mut().zip(start_slots))
+                        .enumerate()
+                    {
+                        write_section(
+                            section_base + local_section,
+                            relocation_base,
+                            &mut relocation_position,
+                            section_slot,
+                            start_slot,
+                            relocation_slots,
+                            section,
+                        )?;
+                    }
+                    crate::ensure!(
+                        relocation_position == relocation_slots.len(),
+                        "Selected COFF relocation chunk underflow"
+                    );
+                    Ok(())
+                },
+            )
+            .collect::<Vec<Result<()>>>();
+        for result in results {
+            result?;
+        }
+    } else {
+        let mut relocation_position = 0usize;
+        let mut sections_written = 0usize;
+        for (section_ordinal, (section_slot, (start_slot, section))) in sections
+            .iter_mut()
+            .zip(relocation_starts.iter_mut().zip(file.sections()))
+            .enumerate()
+        {
+            write_section(
+                section_ordinal,
+                0,
+                &mut relocation_position,
+                section_slot,
+                start_slot,
+                relocations,
+                section.coff_section(),
+            )?;
+            sections_written += 1;
+        }
+        crate::ensure!(
+            sections_written == sections.len(),
+            "Selected COFF section destination underflow"
+        );
+        crate::ensure!(
+            relocation_position == relocations.len(),
+            "Selected COFF relocation destination underflow"
+        );
     }
-    crate::ensure!(
-        sections_written == sections.len(),
-        "Selected COFF section destination underflow"
-    );
-    crate::ensure!(
-        relocation_position == relocations.len(),
-        "Selected COFF relocation destination underflow"
-    );
     Ok(DenseObjectResult {
         object: ObjectRecord {
             file: FileId::from_u32(as_u32(object_index, "source file")?),
@@ -1338,15 +1463,6 @@ fn section_from_raw(start: u32, raw: object::SectionIndex) -> Result<SectionId> 
     ))
 }
 
-fn section_contents(kind: object::SectionKind) -> SectionContents {
-    match kind {
-        object::SectionKind::Text => SectionContents::Code,
-        object::SectionKind::UninitializedData => SectionContents::Uninitialized,
-        object::SectionKind::Data | object::SectionKind::ReadOnlyData => SectionContents::Data,
-        _ => SectionContents::Metadata,
-    }
-}
-
 fn as_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| crate::error!("{what} count exceeds u32"))
 }
@@ -1397,6 +1513,56 @@ mod tests {
                     text,
                     Relocation {
                         offset,
+                        symbol: target,
+                        addend: 0,
+                        flags: object::RelocationFlags::Coff {
+                            typ: object::pe::IMAGE_REL_AMD64_REL32,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        object.write().unwrap()
+    }
+
+    fn multi_section_fixture(section_count: usize) -> Vec<u8> {
+        let mut object = WritableObject::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let target = object.add_symbol(Symbol {
+            name: b"shared_parallel_target".to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        });
+        for index in 0..section_count {
+            let section = object.add_section(
+                Vec::new(),
+                format!(".text$parallel{index:04}").into_bytes(),
+                object::SectionKind::Text,
+            );
+            object.append_section_data(section, &[0, 0, 0, 0], 4);
+            object.add_symbol(Symbol {
+                name: format!("parallel_definition_{index:04}").into_bytes(),
+                value: 0,
+                size: 4,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: object::SymbolFlags::None,
+            });
+            object
+                .add_relocation(
+                    section,
+                    Relocation {
+                        offset: 0,
                         symbol: target,
                         addend: 0,
                         flags: object::RelocationFlags::Coff {
@@ -1520,7 +1686,7 @@ mod tests {
 
     #[test]
     fn parallel_dense_chunks_are_identical_at_one_and_twenty_threads() {
-        let bytes = (0..24).map(|_| selected_fixture()).collect::<Vec<_>>();
+        let bytes = [multi_section_fixture(24)];
         let objects = bytes
             .iter()
             .map(|bytes| CoffObject::parse(bytes).unwrap())
