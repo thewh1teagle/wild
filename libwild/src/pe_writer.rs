@@ -390,6 +390,12 @@ pub(crate) fn link<F: FileSystem>(
     args: &crate::args::coff::CoffArgs,
 ) -> Result<crate::LinkerOutput<'static>> {
     crate::timing_phase!("PE link");
+    #[cfg(feature = "wip")]
+    let report_removal_counters = std::env::var_os("WILD_PE_REMOVAL_COUNTERS").is_some();
+    #[cfg(feature = "wip")]
+    if report_removal_counters {
+        crate::perf::removal_counters::reset();
+    }
     ensure!(!args.common.inputs.is_empty(), "no COFF input files");
     ensure!(
         !(args.no_entry && args.entry.is_some()),
@@ -535,6 +541,13 @@ pub(crate) fn link<F: FileSystem>(
         if !resolved_exports.is_empty() {
             write_import_library(fs, args, dll_name.as_bytes(), &exports, &resolved_exports)?;
         }
+    }
+    #[cfg(feature = "wip")]
+    if report_removal_counters {
+        eprintln!(
+            "WILD_PE_REMOVAL_COUNTERS={:?}",
+            crate::perf::removal_counters::snapshot()
+        );
     }
     Ok(crate::LinkerOutput { layout: None })
 }

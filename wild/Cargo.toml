@@ -81,6 +81,9 @@ mimalloc = ["dep:mimalloc"]
 
 pe = ["libwild/pe", "mimalloc"]
 
+# Enable diagnostic work-removal counters in libwild.
+wip = ["libwild/wip"]
+
 # external tests
 external_tests = ["mold_tests"]
 mold_tests = []
