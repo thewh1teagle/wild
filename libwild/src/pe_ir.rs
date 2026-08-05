@@ -462,6 +462,7 @@ impl RelocationCsr {
 #[derive(Debug)]
 pub(super) struct PeIr<'data> {
     pub(super) sources: SourceFiles<'data>,
+    #[cfg(test)]
     pub(super) names: Box<[NameRecord]>,
     pub(super) objects: Box<[ObjectRecord]>,
     pub(super) sections: Box<[SectionRecord]>,
@@ -646,6 +647,7 @@ impl<'data> PeIr<'data> {
         let sources = SourceFiles::new(objects.iter().map(CoffObject::bytes).collect());
         let mut names_phase = crate::pe_timing_guard!("PE index: Canonicalize names");
         let (canonical_names, occurrence_names) = finalize_selected_names(objects, seed, globals)?;
+        #[cfg(test)]
         let names = name_records(objects, &canonical_names, &occurrence_names)?;
         names_phase
             .0
@@ -802,6 +804,7 @@ impl<'data> PeIr<'data> {
         drop(records_phase);
         let ir = Self {
             sources,
+            #[cfg(test)]
             names: names.into_boxed_slice(),
             objects: object_records.into_boxed_slice(),
             sections,
@@ -818,6 +821,7 @@ impl<'data> PeIr<'data> {
 
     /// Name decoding is intentionally deferred to the first semantic consumer. This is what keeps
     /// malformed names in discarded sections from changing the link's diagnostic behavior.
+    #[cfg(test)]
     pub(super) fn name_bytes(&self, name: NameId) -> Result<&[u8]> {
         let record = self
             .names
@@ -1200,6 +1204,7 @@ fn finalize_selected_names<'data>(
     Ok((names, occurrence_names.into_boxed_slice()))
 }
 
+#[cfg(test)]
 fn name_records<'data>(
     objects: &[CoffObject<'data>],
     interner: &OrderedNameInterner<'data>,
