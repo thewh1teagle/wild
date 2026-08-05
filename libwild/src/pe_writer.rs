@@ -2401,6 +2401,7 @@ fn build_image_with_delay_loads<B: ImageBytes>(
     }
     let load_config_directory = load_config_directory(
         objects,
+        dense,
         &contributions,
         &locations,
         &layout,
@@ -2755,6 +2756,7 @@ fn canonicalize_exception_directory(
 
 fn load_config_directory(
     objects: &[crate::coff::CoffObject<'_>],
+    dense: Option<&DenseProductionState<'_>>,
     contributions: &[Contribution],
     locations: &LocationMap,
     layout: &SectionLayout,
@@ -2764,6 +2766,86 @@ fn load_config_directory(
     let Some(&selected_va) = definitions.get(LOAD_CONFIG_SYMBOL) else {
         return Ok(None);
     };
+    if let Some(dense) = dense {
+        let name = dense
+            .names
+            .lookup_prehashed(
+                LOAD_CONFIG_SYMBOL,
+                crate::hash::hash_bytes(LOAD_CONFIG_SYMBOL),
+            )
+            .context("selected `_load_config_used` has no canonical NameId")?;
+        let Some(provider) = dense
+            .symbols
+            .entry(name)
+            .and_then(|entry| entry.resolution.provider())
+            .and_then(|provider| dense.symbols.provider(provider))
+            .filter(|provider| provider.kind() == pe_symbol_db::ProviderKind::ObjectSymbol)
+        else {
+            return Ok(None);
+        };
+        let symbol = dense
+            .ir
+            .symbols
+            .get(provider.subject as usize)
+            .context("`_load_config_used` provider has an invalid dense symbol")?;
+        let Some(section_id) = symbol.section.get() else {
+            return Ok(None);
+        };
+        let &id = locations
+            .get_dense(section_id)
+            .context("`_load_config_used` contribution was discarded")?;
+        let placement = &layout.placements[id];
+        let symbol_offset = u32::try_from(symbol.value)
+            .context("`_load_config_used` section offset exceeds u32")?;
+        let symbol_rva = placement
+            .rva
+            .checked_add(symbol_offset)
+            .context("`_load_config_used` RVA overflow")?;
+        ensure!(
+            image_base + u64::from(symbol_rva) == selected_va,
+            "`_load_config_used` provider does not match its selected address"
+        );
+        let contribution = contributions
+            .get(id.0 as usize)
+            .filter(|contribution| contribution.spec.id == id)
+            .context("`_load_config_used` contribution disappeared")?;
+        ensure!(
+            contribution.spec.kind == ContributionKind::Data,
+            "`_load_config_used` points to uninitialized data"
+        );
+        let section = dense
+            .ir
+            .sections
+            .get(section_id.index())
+            .context("`_load_config_used` has an invalid dense section")?;
+        let data = section
+            .data
+            .and_then(|source| dense.ir.sources.bytes(source))
+            .context("`_load_config_used` points to uninitialized data")?;
+        let offset = usize::try_from(symbol_offset)
+            .context("`_load_config_used` section offset exceeds usize")?;
+        let size_field_end = offset
+            .checked_add(4)
+            .context("`_load_config_used` section offset overflow")?;
+        let size_field = data
+            .get(offset..size_field_end)
+            .context("`_load_config_used` section is too small")?;
+        let size = u32::from_le_bytes(size_field.try_into().unwrap());
+        let end = symbol_offset
+            .checked_add(size)
+            .context("`_load_config_used` size overflow")?;
+        ensure!(
+            end <= section.size,
+            "`_load_config_used` declares size {size} beyond its containing section"
+        );
+        ensure!(
+            symbol_rva
+                .checked_add(size)
+                .is_some_and(|end| end <= layout.size_of_image),
+            "`_load_config_used` extends beyond the PE image"
+        );
+        return Ok(Some((symbol_rva, size)));
+    }
     for (object_index, object) in objects.iter().enumerate() {
         for symbol in object.file().symbols() {
             if !symbol.is_global() || symbol.name_bytes()? != LOAD_CONFIG_SYMBOL {
