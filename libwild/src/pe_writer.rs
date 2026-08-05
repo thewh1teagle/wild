@@ -2166,28 +2166,38 @@ fn build_image_with_delay_loads<B: ImageBytes>(
     )?;
     let dynamic_base = args.dynamic_base && !args.fixed;
     drop(layout_prepare_phase);
-    let mut initial_layout_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
-    initial_layout_phase
-        .0
-        .add(crate::timing::PeMetric::Sections, contributions.len());
-    let mut layout = make_layout(&contributions, config)?;
-    initial_layout_phase
-        .0
-        .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
-    drop(initial_layout_phase);
+    let build_initial_layout = || {
+        let mut initial_layout_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_INITIAL);
+        initial_layout_phase
+            .0
+            .add(crate::timing::PeMetric::Sections, contributions.len());
+        let layout = make_layout(&contributions, config)?;
+        initial_layout_phase
+            .0
+            .add_u64(crate::timing::PeMetric::Bytes, u64::from(layout.file_size));
+        Ok::<_, crate::error::Error>(layout)
+    };
+    let discover_base_relocations = || {
+        if !dynamic_base {
+            return Ok(Vec::new());
+        }
+        if let Some(dense) = dense {
+            discover_dense_dir64_sites(dense, &contributions, &absolute_symbols)
+        } else {
+            discover_dir64_sites(objects, &contributions, &absolute_symbols)
+        }
+    };
+    let (initial_layout, dir64_sites) = if dynamic_base && rayon::current_num_threads() > 1 {
+        rayon::join(build_initial_layout, discover_base_relocations)
+    } else {
+        (build_initial_layout(), discover_base_relocations())
+    };
+    let mut layout = initial_layout?;
+    let dir64_sites = dir64_sites?;
     let mut relocation_layout_phase = crate::pe_timing_guard!(PE_DETAIL_LAYOUT_RELOCATIONS);
     relocation_layout_phase
         .0
         .add(crate::timing::PeMetric::Sections, contributions.len());
-    let dir64_sites = if dynamic_base {
-        if let Some(dense) = dense {
-            discover_dense_dir64_sites(dense, &contributions, &absolute_symbols)?
-        } else {
-            discover_dir64_sites(objects, &contributions, &absolute_symbols)?
-        }
-    } else {
-        Vec::new()
-    };
     let (next_layout, reloc_id, has_base_relocations, relocation_relayouts) = if dynamic_base {
         converge_relocation_layout(&mut contributions, layout, config, |layout| {
             let delay_iat_slots = delay_iat_slots(
