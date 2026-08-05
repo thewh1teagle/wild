@@ -3179,7 +3179,7 @@ fn materialize_dense_contributions(
         .enumerate()
         .map(|(chunk, sections)| {
             let first = chunk * chunk_size;
-            let mut output = Vec::new();
+            let mut output = Vec::with_capacity(sections.len());
             for (offset, section) in sections.iter().enumerate() {
                 let index = first + offset;
                 let dense_section = pe_ir::SectionId::from_u32(
@@ -3247,7 +3247,12 @@ fn materialize_dense_contributions(
             Ok(output)
         })
         .collect::<Vec<Result<Vec<_>>>>();
-    let mut output = Vec::new();
+    let contribution_count = chunks
+        .iter()
+        .filter_map(|chunk| chunk.as_ref().ok())
+        .map(Vec::len)
+        .sum();
+    let mut output = Vec::with_capacity(contribution_count);
     for chunk in chunks {
         output.extend(chunk?);
     }
