@@ -28,10 +28,19 @@ pub fn build_amd64_base_relocation_table(
     dir64_rvas: impl IntoIterator<Item = u32>,
     size_of_image: u32,
 ) -> Result<Vec<u8>> {
-    let mut rvas = Vec::new();
-    for rva in dir64_rvas {
+    let mut rvas = dir64_rvas.into_iter().collect::<Vec<_>>();
+    sort_and_build_amd64_base_relocation_table(&mut rvas, size_of_image)
+}
+
+/// Sorts and deduplicates a caller-owned RVA vector, then encodes it as an AMD64 base-relocation
+/// table. Retaining the canonicalized vector lets a linker reuse it when a later layout operation
+/// applies an order-preserving RVA transformation.
+pub fn sort_and_build_amd64_base_relocation_table(
+    rvas: &mut Vec<u32>,
+    size_of_image: u32,
+) -> Result<Vec<u8>> {
+    for &rva in rvas.iter() {
         validate_dir64_bounds(rva, size_of_image)?;
-        rvas.push(rva);
     }
     if rvas.len() >= 8192 && rayon::current_num_threads() > 1 {
         rvas.par_sort_unstable();
@@ -39,7 +48,26 @@ pub fn build_amd64_base_relocation_table(
         rvas.sort_unstable();
     }
     rvas.dedup();
+    encode_sorted_amd64_base_relocations(rvas)
+}
 
+/// Encodes RVAs that are already strictly increasing. This avoids sorting the same relocation
+/// sites again after an order-preserving layout shift.
+pub fn build_amd64_base_relocation_table_from_sorted(
+    rvas: &[u32],
+    size_of_image: u32,
+) -> Result<Vec<u8>> {
+    ensure!(
+        rvas.windows(2).all(|pair| pair[0] < pair[1]),
+        "base relocation RVAs are not sorted and unique"
+    );
+    for &rva in rvas {
+        validate_dir64_bounds(rva, size_of_image)?;
+    }
+    encode_sorted_amd64_base_relocations(rvas)
+}
+
+fn encode_sorted_amd64_base_relocations(rvas: &[u32]) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(rvas.len().saturating_mul(ENTRY_SIZE));
     let mut start = 0usize;
     while start < rvas.len() {
@@ -217,6 +245,29 @@ mod tests {
         let first = build_amd64_base_relocation_table([0x3008, 0x1010, 0x3008], 0x5000).unwrap();
         let second = build_amd64_base_relocation_table([0x1010, 0x3008], 0x5000).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn canonicalized_rvas_can_be_reencoded_without_sorting() {
+        let mut rvas = vec![0x3008, 0x1010, 0x3008, 0x1ff8];
+        let first = sort_and_build_amd64_base_relocation_table(&mut rvas, 0x5000).unwrap();
+        assert_eq!(rvas, vec![0x1010, 0x1ff8, 0x3008]);
+        assert_eq!(
+            build_amd64_base_relocation_table_from_sorted(&rvas, 0x5000).unwrap(),
+            first
+        );
+        assert!(
+            build_amd64_base_relocation_table_from_sorted(&[0x3008, 0x1010], 0x5000)
+                .unwrap_err()
+                .to_string()
+                .contains("not sorted and unique")
+        );
+        assert!(
+            build_amd64_base_relocation_table_from_sorted(&[0x1010, 0x1010], 0x5000)
+                .unwrap_err()
+                .to_string()
+                .contains("not sorted and unique")
+        );
     }
 
     #[test]

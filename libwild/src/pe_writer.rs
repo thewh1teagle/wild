@@ -12,6 +12,8 @@ use crate::fs::OutputOptions;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use linker_utils::pe_base_relocs::build_amd64_base_relocation_table;
+use linker_utils::pe_base_relocs::build_amd64_base_relocation_table_from_sorted;
+use linker_utils::pe_base_relocs::sort_and_build_amd64_base_relocation_table;
 use linker_utils::pe_exports::Export;
 use linker_utils::pe_exports::ExportTarget;
 use linker_utils::pe_exports::ResolvedExport;
@@ -5128,7 +5130,7 @@ fn converge_relocation_layout(
 ) -> Result<(SectionLayout, Option<ContributionId>, bool, usize)> {
     let mut initial_rvas = relocation_rvas(&layout)?;
     let initial =
-        build_amd64_base_relocation_table(initial_rvas.iter().copied(), layout.size_of_image)
+        sort_and_build_amd64_base_relocation_table(&mut initial_rvas, layout.size_of_image)
             .context("failed to build PE base relocation table")?;
     if initial.is_empty() {
         return Ok((layout, None, false, 0));
@@ -5160,8 +5162,9 @@ fn converge_relocation_layout(
                     .context("relocation RVA overflow")?;
             }
         }
-        let data = build_amd64_base_relocation_table(initial_rvas, layout.size_of_image)
-            .context("failed to build PE base relocation table")?;
+        let data =
+            build_amd64_base_relocation_table_from_sorted(&initial_rvas, layout.size_of_image)
+                .context("failed to build PE base relocation table")?;
         if data.len() == expected_size {
             let contribution = contributions
                 .iter_mut()
