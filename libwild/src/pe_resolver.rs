@@ -1242,6 +1242,9 @@ struct PrimaryArchiveScheduler {
     next_archive: usize,
     event_cursor: usize,
     lookups: usize,
+    local_definition_epochs: Vec<u32>,
+    selected_member_epochs: Vec<u32>,
+    selection_epoch: u32,
 }
 
 impl PrimaryArchiveScheduler {
@@ -1255,6 +1258,9 @@ impl PrimaryArchiveScheduler {
             next_archive: 0,
             event_cursor: symbols.archive_demand_events.len(),
             lookups: 0,
+            local_definition_epochs: Vec::new(),
+            selected_member_epochs: Vec::new(),
+            selection_epoch: 0,
         };
         // `next` sorts active unresolved demands by bytes within each archive before selection.
         // Sorting the entire unresolved namespace here first therefore cannot affect semantics and
@@ -1360,23 +1366,44 @@ impl PrimaryArchiveScheduler {
                     ScheduledDemandKind::LibraryWeak(right),
                 ) => left.cmp(&right),
             });
-            let candidates = demands
-                .iter()
-                .map(|demand| {
-                    (
-                        symbols
-                            .names
-                            .bytes(demand.name)
-                            .expect("scheduled archive demand remains interned"),
-                        demand.member,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut selected = archives[archive_index]
-                .select_shallow_members_from_provider_indices(
-                    &candidates,
-                    whole_archive[archive_index],
-                );
+            let archive = archives[archive_index];
+            let mut selected = if whole_archive[archive_index] {
+                archive.members().iter().collect::<Vec<_>>()
+            } else {
+                // All demands are interned. Map definitions from selected members back to their
+                // canonical IDs and mark them in generation-stamped dense tables. This preserves
+                // exact local-definition suppression while reusing storage across archives,
+                // instead of allocating and hashing two fresh sets for every archive visited.
+                self.selection_epoch = self.selection_epoch.wrapping_add(1);
+                if self.selection_epoch == 0 {
+                    self.local_definition_epochs.fill(0);
+                    self.selected_member_epochs.fill(0);
+                    self.selection_epoch = 1;
+                }
+                let epoch = self.selection_epoch;
+                self.local_definition_epochs.resize(symbols.states.len(), 0);
+                self.selected_member_epochs
+                    .resize(archive.members().len(), 0);
+                let mut selected = Vec::new();
+                for demand in demands.iter() {
+                    let name_index = demand.name.index();
+                    if self.local_definition_epochs[name_index] == epoch
+                        || self.selected_member_epochs[demand.member] == epoch
+                    {
+                        continue;
+                    }
+                    self.selected_member_epochs[demand.member] = epoch;
+                    let member = &archive.members()[demand.member];
+                    for definition in member.definitions() {
+                        let hash = hash_name(definition);
+                        if let Some(name) = symbols.names.lookup_prehashed(definition, hash) {
+                            self.local_definition_epochs[name.index()] = epoch;
+                        }
+                    }
+                    selected.push(member);
+                }
+                selected
+            };
             selected.retain(|member| !extracted.contains(&(archive_index, member.index())));
             if !selected.is_empty() {
                 return Some((archive_index, selected));
