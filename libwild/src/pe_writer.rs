@@ -34,6 +34,7 @@ use object::RelocationTarget;
 use object::SectionFlags;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
@@ -971,7 +972,6 @@ struct OpenSelection<'data> {
     roots: Vec<Vec<u8>>,
     directives: crate::args::coff::CoffArgs,
     directive_objects_scanned: usize,
-    archive_definitions: BTreeSet<Vec<u8>>,
     resolver: pe_resolver::ResolverSession<'data>,
 }
 
@@ -1028,7 +1028,6 @@ fn select_opened_inputs<'data, F: FileSystem>(
             ..Default::default()
         },
         directive_objects_scanned: 0,
-        archive_definitions: BTreeSet::new(),
         resolver: pe_resolver::ResolverSession::new(),
     };
     for symbol in LINKER_ABSOLUTE_ZERO_SYMBOLS {
@@ -1197,7 +1196,7 @@ fn resolve_open_selection(
         drop(selection_roots_phase);
 
         let old_len = selection.objects.len();
-        let archive_definitions = selection.resolver.resolve(
+        selection.resolver.resolve(
             &mut selection.objects,
             &roots,
             &mut selection.directives.runtime_resolution,
@@ -1205,7 +1204,6 @@ fn resolve_open_selection(
         if selection.objects.len() == old_len {
             selection.exports = exports;
             selection.roots = roots;
-            selection.archive_definitions = archive_definitions;
             return Ok(());
         }
     }

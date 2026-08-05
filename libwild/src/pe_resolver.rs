@@ -27,6 +27,7 @@ use object::Object;
 use object::ObjectSymbol;
 use rayon::prelude::*;
 use smallvec::SmallVec;
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -41,13 +42,13 @@ type SymbolState = (HashSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 ///
 /// - the test-only `SelectedGlobalSymbol` snapshot (legacy COMDAT/layout metadata),
 /// - `WeakExternalResolution` raw-name records (replace with the SymbolDb fallback column), and
-/// - the returned `BTreeSet<Vec<u8>>` import-definition snapshot (legacy import writer input).
+/// - import-definition compatibility state once all downstream consumers use the SymbolDb.
 ///
 /// None of these bridges participates in archive provider lookup or canonical ID assignment.
 const COMPATIBILITY_DELETION_SITES: &[&str] = &[
     "SelectedGlobalSymbol fixed metadata snapshot",
     "WeakExternalResolution raw-name records",
-    "BTreeSet<Vec<u8>> import-definition snapshot",
+    "import-definition compatibility state",
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -743,7 +744,7 @@ pub(super) struct ResolverSession<'data> {
     prepared_archive_objects: Vec<Vec<Option<Result<crate::coff::CoffObject<'data>>>>>,
     whole_archive: Vec<bool>,
     extracted: HashSet<(usize, usize)>,
-    import_definitions: BTreeSet<Vec<u8>>,
+    import_definitions: HashSet<NameId>,
     selected_imports: Vec<ShortImportObject<'data>>,
     symbol_state: IncrementalSymbolState<'data>,
     scanned_objects: usize,
@@ -758,7 +759,7 @@ impl<'data> ResolverSession<'data> {
             prepared_archive_objects: Vec::new(),
             whole_archive: Vec::new(),
             extracted: HashSet::new(),
-            import_definitions: BTreeSet::new(),
+            import_definitions: HashSet::new(),
             selected_imports: Vec::new(),
             symbol_state: IncrementalSymbolState::new(),
             scanned_objects: 0,
@@ -846,7 +847,7 @@ impl<'data> ResolverSession<'data> {
         objects: &mut Vec<crate::coff::CoffObject<'data>>,
         roots: &[Vec<u8>],
         runtime_resolution: &mut RuntimeResolution,
-    ) -> Result<BTreeSet<Vec<u8>>> {
+    ) -> Result<()> {
         let mut resolve_phase = crate::pe_timing_guard!(super::PE_PHASE_RESOLVE_ARCHIVES);
         resolve_phase
             .0
@@ -926,21 +927,6 @@ impl<'data> ResolverSession<'data> {
             if !changed {
                 // Alias members selected in the final extraction waves update runtime state.
                 self.symbol_state.sync_alternates(runtime_resolution);
-                let snapshot_phase =
-                    crate::timing_guard!(super::PE_DETAIL_SNAPSHOT_RESOLVER_OUTPUTS);
-                // Legacy import-writer snapshot clones one owned Vec payload per name. Internal
-                // BTree node allocation is deliberately outside the explicit-call-site counter.
-                crate::perf::removal_counters::add_name_bytes_allocated(
-                    self.import_definitions
-                        .iter()
-                        .map(|name| name.len() as u64)
-                        .sum(),
-                );
-                crate::perf::removal_counters::add_hot_phase_allocations(
-                    self.import_definitions.len() as u64,
-                );
-                let import_definitions = self.import_definitions.clone();
-                drop(snapshot_phase);
                 resolve_phase.0.add(crate::timing::PeMetric::Waves, waves);
                 resolve_phase
                     .0
@@ -953,7 +939,7 @@ impl<'data> ResolverSession<'data> {
                     crate::timing::PeMetric::Symbols,
                     self.symbol_state.global_names.len(),
                 );
-                return Ok(import_definitions);
+                return Ok(());
             }
         }
     }
@@ -969,7 +955,7 @@ fn extract<'data>(
     whole_archive: &[bool],
     roots: &[Vec<u8>],
     runtime_resolution: &mut RuntimeResolution,
-) -> Result<BTreeSet<Vec<u8>>> {
+) -> Result<()> {
     ensure!(
         archive_bytes.len() == whole_archive.len(),
         "internal archive policy mismatch"
@@ -988,7 +974,7 @@ fn extract_pass<'data>(
     whole_archive: &[bool],
     runtime_resolution: &mut RuntimeResolution,
     extracted: &mut HashSet<(usize, usize)>,
-    import_definitions: &mut BTreeSet<Vec<u8>>,
+    import_definitions: &mut HashSet<NameId>,
     selected_imports: &mut Vec<ShortImportObject<'data>>,
     symbol_state: &mut IncrementalSymbolState<'data>,
     selected_aliases: &mut Vec<(usize, usize)>,
@@ -1135,7 +1121,7 @@ fn process_selected_members<'data>(
     objects: &mut Vec<crate::coff::CoffObject<'data>>,
     runtime_resolution: &mut RuntimeResolution,
     extracted: &mut HashSet<(usize, usize)>,
-    import_definitions: &mut BTreeSet<Vec<u8>>,
+    import_definitions: &mut HashSet<NameId>,
     selected_imports: &mut Vec<ShortImportObject<'data>>,
     symbol_state: &mut IncrementalSymbolState<'data>,
     selected_aliases: &mut Vec<(usize, usize)>,
@@ -1194,12 +1180,10 @@ fn process_selected_members<'data>(
                             archive,
                             member: archive_member,
                         });
-                    if !import_definitions.contains(definition) {
-                        crate::perf::removal_counters::add_name_bytes_allocated(
-                            definition.len() as u64
-                        );
+                    if import_definitions.len() == import_definitions.capacity() {
                         crate::perf::removal_counters::increment_hot_phase_allocations();
-                        import_definitions.insert(definition.to_vec());
+                    }
+                    if import_definitions.insert(name) {
                         changed = true;
                     }
                 }
@@ -2269,7 +2253,7 @@ mod tests {
         }
     }
 
-    fn extraction_signature(threads: usize) -> (Vec<Vec<Vec<u8>>>, BTreeSet<Vec<u8>>) {
+    fn extraction_signature(threads: usize) -> Vec<Vec<Vec<u8>>> {
         // Keep this at the production eager-preparation threshold so the parallel cache path,
         // not only the small-link lazy path, is covered by the thread-count determinism check.
         const ARCHIVE_COUNT: usize = 128;
@@ -2299,7 +2283,7 @@ mod tests {
                     session.add_archive(library, false).unwrap();
                 }
                 let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
-                let imports = session
+                session
                     .resolve(&mut objects, &[], &mut RuntimeResolution::new())
                     .unwrap();
                 let definitions = objects
@@ -2313,7 +2297,7 @@ mod tests {
                             .collect::<Vec<_>>()
                     })
                     .collect();
-                (definitions, imports)
+                definitions
             })
     }
 
