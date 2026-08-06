@@ -77,7 +77,7 @@ fn encode_sorted_amd64_base_relocations(rvas: &[u32]) -> Result<Vec<u8>> {
             end += 1;
         }
         let offsets = &rvas[start..end];
-        let needs_padding = offsets.len() % 2 != 0;
+        let needs_padding = !offsets.len().is_multiple_of(2);
         let entry_count = offsets
             .len()
             .checked_add(usize::from(needs_padding))

@@ -2402,7 +2402,7 @@ mod tests {
                 session
                     .resolve(&mut objects, &[], &mut RuntimeResolution::new())
                     .unwrap();
-                let definitions = objects
+                objects
                     .iter()
                     .map(|object| {
                         object
@@ -2412,8 +2412,7 @@ mod tests {
                             .map(|symbol| symbol.name_bytes().unwrap().to_vec())
                             .collect::<Vec<_>>()
                     })
-                    .collect();
-                definitions
+                    .collect()
             })
     }
 
