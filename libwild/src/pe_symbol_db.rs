@@ -10,8 +10,7 @@ use super::pe_ir::NameId;
 use super::pe_ir::ObjectId;
 use super::pe_ir::ProviderId;
 use super::pe_ir::SymbolId;
-use foldhash::HashMap;
-use foldhash::HashMapExt;
+use hashbrown::HashMap;
 use std::fmt;
 
 const NONE_U32: u32 = u32::MAX;
@@ -252,8 +251,9 @@ impl NameStorage<'_> {
 pub(super) struct OrderedNameInterner<'data> {
     names: Vec<NameStorage<'data>>,
     hashes: Vec<u64>,
-    /// First dense NameId for each hash. Collisions continue through `collision_next`.
-    by_hash: HashMap<u64, NameId>,
+    /// First dense NameId for each precomputed hash. Collisions continue through
+    /// `collision_next`; the pass-through hasher avoids hashing the hash again.
+    by_hash: HashMap<u64, NameId, crate::hash::PassThroughHasher>,
     collision_next: Vec<u32>,
 }
 
@@ -262,7 +262,7 @@ impl<'data> OrderedNameInterner<'data> {
         Self {
             names: Vec::new(),
             hashes: Vec::new(),
-            by_hash: HashMap::new(),
+            by_hash: HashMap::with_hasher(crate::hash::PassThroughHasher::default()),
             collision_next: Vec::new(),
         }
     }
