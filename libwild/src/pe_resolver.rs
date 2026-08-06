@@ -1422,10 +1422,12 @@ impl PrimaryArchiveScheduler {
                     }
                     self.selected_member_epochs[demand.member] = epoch;
                     let member = &archive.members()[demand.member];
-                    for definition in member.definitions() {
-                        let hash = hash_name(definition);
-                        if let Some(name) = symbols.names.lookup_prehashed(definition, hash) {
-                            self.local_definition_epochs[name.index()] = epoch;
+                    if member.has_nonfirst_definition() {
+                        for definition in member.definitions() {
+                            let hash = hash_name(definition);
+                            if let Some(name) = symbols.names.lookup_prehashed(definition, hash) {
+                                self.local_definition_epochs[name.index()] = epoch;
+                            }
                         }
                     }
                     selected.push(member);

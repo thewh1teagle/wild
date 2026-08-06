@@ -120,6 +120,7 @@ pub struct CoffArchiveMember<'data> {
     kind: CoffArchiveMemberKind<'data>,
     opaque_error: Option<CoffArchiveError>,
     definitions: MemberDefinitions<'data>,
+    has_nonfirst_definition: bool,
     demands: OnceLock<Result<Vec<OwnedArchiveDemand>>>,
 }
 
@@ -176,6 +177,12 @@ impl<'data> CoffArchiveMember<'data> {
     #[must_use]
     pub fn definitions(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.definitions.as_slice().iter().map(AsRef::as_ref)
+    }
+
+    /// Whether this member defines a name whose first archive-index provider is another member.
+    #[must_use]
+    pub fn has_nonfirst_definition(&self) -> bool {
+        self.has_nonfirst_definition
     }
 
     fn demands(&self) -> &[OwnedArchiveDemand] {
@@ -381,10 +388,11 @@ impl<'data> CoffArchive<'data> {
                 indexed_definitions.push((member_index, Cow::Borrowed(symbol.name())));
             }
         }
-        let members = finalize_members(members, indexed_definitions)?;
+        let mut members = finalize_members(members, indexed_definitions)?;
 
         let mut definition_members = Vec::<DefinitionMember<'data>>::new();
         let mut definition_heads = HashMap::<u64, u32>::new();
+        let mut has_nonfirst_definition = vec![false; members.len()];
         for member in &members {
             for definition in member.definitions.as_slice() {
                 let hash = definition_hash(definition);
@@ -400,6 +408,9 @@ impl<'data> CoffArchive<'data> {
                         (entry.collision_next != NO_DEFINITION).then_some(entry.collision_next);
                 }
                 if let Some(index) = existing {
+                    if definition_members[index].first != member.index {
+                        has_nonfirst_definition[member.index] = true;
+                    }
                     definition_members[index].has_object |=
                         matches!(member.kind, CoffArchiveMemberKind::CoffObject { .. });
                 } else {
@@ -417,6 +428,9 @@ impl<'data> CoffArchive<'data> {
                     });
                 }
             }
+        }
+        for (member, has_nonfirst) in members.iter_mut().zip(has_nonfirst_definition) {
+            member.has_nonfirst_definition = has_nonfirst;
         }
 
         Ok(Self {
@@ -808,6 +822,7 @@ fn finalize_members<'data>(
                 start,
                 end,
             },
+            has_nonfirst_definition: false,
             demands: member.demands,
         })
         .collect())
@@ -1611,6 +1626,8 @@ mod tests {
             false,
         );
         let mut parsed = CoffArchive::parse(&archive).unwrap();
+        assert!(!parsed.members()[0].has_nonfirst_definition());
+        assert!(parsed.members()[1].has_nonfirst_definition());
 
         // Model an index candidate later than a definition already carried by the first member.
         // Selecting `trigger` must suppress the later `local` candidate before member 1 is read.
