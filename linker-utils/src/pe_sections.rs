@@ -203,8 +203,10 @@ enum ContentClass {
 struct Group<'a> {
     name: Vec<u8>,
     contributions: Vec<GroupedContribution<'a>>,
+    subsection_count: usize,
 }
 
+#[derive(Clone, Copy)]
 struct GroupedContribution<'a> {
     input_index: usize,
     contribution: &'a SectionContribution,
@@ -277,6 +279,7 @@ pub fn layout_sections_borrowed<'a>(
             has_separator: base.len() != contribution.name.len(),
         };
         if let Some(group) = groups.get_mut(base) {
+            group.subsection_count += usize::from(grouped.has_separator);
             group.contributions.push(grouped);
         } else {
             groups.insert(
@@ -284,6 +287,7 @@ pub fn layout_sections_borrowed<'a>(
                 Group {
                     name: base.to_vec(),
                     contributions: vec![grouped],
+                    subsection_count: usize::from(grouped.has_separator),
                 },
             );
         }
@@ -309,12 +313,20 @@ pub fn layout_sections_borrowed<'a>(
     };
 
     for mut group in groups {
-        if group.contributions.len() >= PARALLEL_SUBSECTION_SORT_MIN
-            && rayon::current_num_threads() > 1
-        {
-            parallel_sort_subsections(&mut group.contributions);
-        } else {
-            group.contributions.sort_unstable_by(compare_subsections);
+        if group.subsection_count == group.contributions.len() {
+            sort_subsections(&mut group.contributions);
+        } else if group.subsection_count != 0 {
+            let mut subsections = Vec::with_capacity(group.subsection_count);
+            group.contributions.retain(|grouped| {
+                if grouped.has_separator {
+                    subsections.push(*grouped);
+                    false
+                } else {
+                    true
+                }
+            });
+            sort_subsections(&mut subsections);
+            group.contributions.extend(subsections);
         }
         let characteristics = merged_characteristics(&group)?;
         let section_index = sections.len();
@@ -404,6 +416,15 @@ pub fn layout_sections_borrowed<'a>(
         file_size: next_file,
         size_of_image: next_rva,
     })
+}
+
+#[inline]
+fn sort_subsections(contributions: &mut [GroupedContribution<'_>]) {
+    if contributions.len() >= PARALLEL_SUBSECTION_SORT_MIN && rayon::current_num_threads() > 1 {
+        parallel_sort_subsections(contributions);
+    } else {
+        contributions.sort_unstable_by(compare_subsections);
+    }
 }
 
 #[inline]
