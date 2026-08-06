@@ -1128,7 +1128,30 @@ fn process_selected_members<'data>(
     prepared_archive_objects: &mut [Vec<Option<Result<crate::coff::CoffObject<'data>>>>],
 ) -> Result<bool> {
     let mut changed = false;
-    for member in selected {
+    // Selection semantics and diagnostics remain ordered, but parsing and summarizing a large
+    // selected batch is independent work. Prepare only the members that the resolver actually
+    // selected; unlike full-archive speculation, this does not touch irrelevant object payloads.
+    const PARALLEL_SELECTED_PREPARE_MIN: usize = 16;
+    let mut selected_objects = if prepared_archive_objects.is_empty()
+        && selected.len() >= PARALLEL_SELECTED_PREPARE_MIN
+        && rayon::current_num_threads() > 1
+    {
+        selected
+            .par_iter()
+            .map(|member| match member.kind() {
+                CoffArchiveMemberKind::CoffObject { .. } => Some(
+                    crate::coff::CoffObject::parse(member.data()).and_then(|object| {
+                        object.resolver_summary()?;
+                        Ok(object)
+                    }),
+                ),
+                CoffArchiveMemberKind::ShortImport(_) | CoffArchiveMemberKind::Opaque => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    for (selected_index, member) in selected.into_iter().enumerate() {
         if extracted.len() == extracted.capacity() {
             crate::perf::removal_counters::increment_hot_phase_allocations();
         }
@@ -1138,7 +1161,12 @@ fn process_selected_members<'data>(
         crate::perf::removal_counters::increment_selected_members();
         match member.kind() {
             CoffArchiveMemberKind::CoffObject { .. } => {
-                let object = if prepared_archive_objects.is_empty() {
+                let object = if let Some(prepared) = selected_objects
+                    .get_mut(selected_index)
+                    .and_then(Option::take)
+                {
+                    prepared
+                } else if prepared_archive_objects.is_empty() {
                     crate::coff::CoffObject::parse(member.data())
                 } else {
                     prepared_archive_objects
@@ -2278,6 +2306,67 @@ mod tests {
         for threads in [2, 4] {
             assert_eq!(extraction_signature(threads), baseline);
         }
+    }
+
+    #[test]
+    fn selected_batch_preparation_is_deterministic_across_thread_counts() {
+        let baseline = selected_batch_signature(1);
+        for threads in [2, 4, 8] {
+            assert_eq!(selected_batch_signature(threads), baseline);
+        }
+    }
+
+    fn selected_batch_signature(threads: usize) -> Vec<Vec<u8>> {
+        const MEMBER_COUNT: usize = 20;
+        let names = (0..MEMBER_COUNT)
+            .map(|index| format!("sym{index}"))
+            .collect::<Vec<_>>();
+        let undefined = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let root = coff_object(&[], &undefined);
+        let members = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                (
+                    format!("member{index}.o"),
+                    coff_object(&[name.as_str()], &[]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let member_refs = members
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect::<Vec<_>>();
+        let library = archive(&member_refs);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                let mut objects = vec![crate::coff::CoffObject::parse(&root).unwrap()];
+                extract(
+                    &mut objects,
+                    &[&library],
+                    &[false],
+                    &[],
+                    &mut RuntimeResolution::new(),
+                )
+                .unwrap();
+                objects
+                    .iter()
+                    .skip(1)
+                    .map(|object| {
+                        object
+                            .file()
+                            .symbols()
+                            .find(|symbol| symbol.is_global() && symbol.is_definition())
+                            .unwrap()
+                            .name_bytes()
+                            .unwrap()
+                            .to_vec()
+                    })
+                    .collect()
+            })
     }
 
     fn extraction_signature(threads: usize) -> Vec<Vec<Vec<u8>>> {
