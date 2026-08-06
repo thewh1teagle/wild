@@ -21,6 +21,7 @@ const LINK_ONLY_MASK: u32 = pe::IMAGE_SCN_LNK_OTHER.0
     | pe::IMAGE_SCN_LNK_COMDAT.0
     | pe::IMAGE_SCN_LNK_NRELOC_OVFL.0;
 const PARALLEL_SUBSECTION_SORT_MIN: usize = 4096;
+const PARALLEL_GROUP_LAYOUT_MIN_CONTRIBUTIONS: usize = 4096;
 
 /// Stable caller-assigned identity for an input section contribution.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -214,6 +215,14 @@ struct GroupedContribution<'a> {
     has_separator: bool,
 }
 
+struct PreparedGroup<'a> {
+    group: Group<'a>,
+    characteristics: u32,
+    relative_offsets: Vec<u32>,
+    virtual_size: u32,
+    initialized_extent: u32,
+}
+
 /// Groups `$` subsections and lays out all contributions with checked arithmetic.
 ///
 /// Standard PE sections are emitted first in conventional order. Other section
@@ -312,55 +321,41 @@ pub fn layout_sections_borrowed<'a>(
         entries: Vec::with_capacity(contribution_count),
     };
 
-    for mut group in groups {
-        if group.subsection_count == group.contributions.len() {
-            sort_subsections(&mut group.contributions);
-        } else if group.subsection_count != 0 {
-            let mut subsections = Vec::with_capacity(group.subsection_count);
-            group.contributions.retain(|grouped| {
-                if grouped.has_separator {
-                    subsections.push(*grouped);
-                    false
-                } else {
-                    true
-                }
-            });
-            sort_subsections(&mut subsections);
-            group.contributions.extend(subsections);
-        }
-        let characteristics = merged_characteristics(&group)?;
+    let prepared_groups = if contribution_count >= PARALLEL_GROUP_LAYOUT_MIN_CONTRIBUTIONS
+        && rayon::current_num_threads() > 1
+    {
+        groups
+            .into_par_iter()
+            .map(prepare_group)
+            .collect::<Vec<_>>()
+    } else {
+        groups.into_iter().map(prepare_group).collect::<Vec<_>>()
+    };
+
+    for prepared in prepared_groups {
+        let PreparedGroup {
+            group,
+            characteristics,
+            relative_offsets,
+            virtual_size,
+            initialized_extent,
+        } = prepared?;
         let section_index = sections.len();
         let section_rva = next_rva;
         let section_file = next_file;
-        let mut virtual_cursor = 0u32;
-        let mut initialized_extent = 0u32;
         let mut placed_ids = Vec::with_capacity(group.contributions.len());
 
-        for grouped in group.contributions {
+        for (grouped, offset) in group.contributions.into_iter().zip(relative_offsets) {
             let contribution = grouped.contribution;
-            let offset = align_up(
-                virtual_cursor,
-                contribution.alignment,
-                "contribution offset",
-            )?;
-            let end = offset.checked_add(contribution.size).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "section {:?} size overflow",
-                    String::from_utf8_lossy(&group.name)
-                )
-            })?;
             let rva = section_rva
                 .checked_add(offset)
                 .ok_or_else(|| anyhow::anyhow!("contribution RVA overflow"))?;
             let file_offset = match contribution.kind {
-                ContributionKind::Data => {
-                    initialized_extent = initialized_extent.max(end);
-                    Some(
-                        section_file
-                            .checked_add(offset)
-                            .ok_or_else(|| anyhow::anyhow!("contribution file offset overflow"))?,
-                    )
-                }
+                ContributionKind::Data => Some(
+                    section_file
+                        .checked_add(offset)
+                        .ok_or_else(|| anyhow::anyhow!("contribution file offset overflow"))?,
+                ),
                 ContributionKind::Bss => None,
             };
             ensure!(
@@ -380,7 +375,6 @@ pub fn layout_sections_borrowed<'a>(
                 contribution.id.0
             );
             placed_ids.push(contribution.id);
-            virtual_cursor = end;
         }
 
         let raw_size = align_up(
@@ -393,14 +387,14 @@ pub fn layout_sections_borrowed<'a>(
             name: group.name,
             characteristics,
             rva: section_rva,
-            virtual_size: virtual_cursor,
+            virtual_size,
             file_offset,
             raw_size,
             contributions: placed_ids,
         });
         next_rva = align_up(
             section_rva
-                .checked_add(virtual_cursor)
+                .checked_add(virtual_size)
                 .ok_or_else(|| anyhow::anyhow!("image RVA overflow"))?,
             options.section_alignment,
             "next section RVA",
@@ -415,6 +409,54 @@ pub fn layout_sections_borrowed<'a>(
         placements,
         file_size: next_file,
         size_of_image: next_rva,
+    })
+}
+
+fn prepare_group<'a>(mut group: Group<'a>) -> Result<PreparedGroup<'a>> {
+    if group.subsection_count == group.contributions.len() {
+        sort_subsections(&mut group.contributions);
+    } else if group.subsection_count != 0 {
+        let mut subsections = Vec::with_capacity(group.subsection_count);
+        group.contributions.retain(|grouped| {
+            if grouped.has_separator {
+                subsections.push(*grouped);
+                false
+            } else {
+                true
+            }
+        });
+        sort_subsections(&mut subsections);
+        group.contributions.extend(subsections);
+    }
+    let characteristics = merged_characteristics(&group)?;
+    let mut relative_offsets = Vec::with_capacity(group.contributions.len());
+    let mut virtual_cursor = 0u32;
+    let mut initialized_extent = 0u32;
+    for grouped in &group.contributions {
+        let contribution = grouped.contribution;
+        let offset = align_up(
+            virtual_cursor,
+            contribution.alignment,
+            "contribution offset",
+        )?;
+        let end = offset.checked_add(contribution.size).ok_or_else(|| {
+            anyhow::anyhow!(
+                "section {:?} size overflow",
+                String::from_utf8_lossy(&group.name)
+            )
+        })?;
+        relative_offsets.push(offset);
+        if contribution.kind == ContributionKind::Data {
+            initialized_extent = initialized_extent.max(end);
+        }
+        virtual_cursor = end;
+    }
+    Ok(PreparedGroup {
+        group,
+        characteristics,
+        relative_offsets,
+        virtual_size: virtual_cursor,
+        initialized_extent,
     })
 }
 
@@ -1384,6 +1426,30 @@ mod tests {
             file_alignment: 0x1000,
         };
         assert!(layout_sections(&[], bad_options).is_err());
+    }
+
+    #[test]
+    fn parallel_group_preparation_matches_serial_layout() {
+        let inputs = (0..5000u32)
+            .map(|id| {
+                let name = match (id % 3, id % 97) {
+                    (0, 0) => b".text$z".as_slice(),
+                    (0, _) => b".text".as_slice(),
+                    (1, 0) => b".rdata$a".as_slice(),
+                    (1, _) => b".rdata".as_slice(),
+                    _ => b".pdata".as_slice(),
+                };
+                contribution(id, name, ContributionKind::Data, id % 31 + 1, 1 << (id % 4))
+            })
+            .collect::<Vec<_>>();
+        let layout_with_threads = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| layout_sections(&inputs, options()).unwrap())
+        };
+        assert_eq!(layout_with_threads(1), layout_with_threads(4));
     }
 
     #[test]
