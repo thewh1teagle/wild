@@ -521,14 +521,24 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     let word = parallel_live
                         .get(canonical.index() / 64)
                         .context("canonical live section is outside dense IR")?;
-                    word.fetch_or(1u64 << (canonical.index() % 64), Ordering::Relaxed);
+                    let mask = 1u64 << (canonical.index() % 64);
+                    // Most relocation edges revisit an already-live section. Avoid the cache-line
+                    // write and exclusive ownership request in that common case. A racing worker
+                    // may observe the old value too and also execute `fetch_or`; that is harmless
+                    // and preserves the atomic first-mark semantics.
+                    if word.load(Ordering::Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Ordering::Relaxed);
+                    }
                     Ok(())
                 };
                 let mark_import_parallel = |name: NameId| -> Result<()> {
                     let word = parallel_imports
                         .get(name.index() / 64)
                         .context("import name is outside resolved namespace")?;
-                    word.fetch_or(1u64 << (name.index() % 64), Ordering::Relaxed);
+                    let mask = 1u64 << (name.index() % 64);
+                    if word.load(Ordering::Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Ordering::Relaxed);
+                    }
                     Ok(())
                 };
                 let chunks = frontier
