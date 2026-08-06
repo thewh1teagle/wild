@@ -1,10 +1,103 @@
-# PE/COFF goals 1 and 2 session handoff
+# PE/COFF goals 1–3 session handoff
 
-Last updated: 2026-08-03 after Goal 2 closeout. This is the continuity document
+Last updated: 2026-08-06 at the user-requested Goal 3 stopping point. This is the continuity document
 for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
 current-state summary.
+
+## Goal 3 stopping point (2026-08-06)
+
+The user asked to stop before Goal 3 reached its statistical completion gate. The
+branch is nevertheless substantially faster and remains the best accepted,
+correctness-preserving PE implementation from this tuning session. Do not describe
+Goal 3 as complete: the final authoritative holdout, bootstrap intervals, memory
+report, and native-Windows closeout gates have not been run, and the measured PE
+speedup remains below the frozen ELF parity target.
+
+Repository state at the stop:
+
+- Branch: `feature/pe-coff-dgx-performance`.
+- Accepted code tip before this handoff: `32a504c6` (`Avoid redundant atomic PE GC
+  marks`).
+- The branch was 85 commits ahead of
+  `origin/feature/pe-coff-dgx-performance` immediately before this handoff commit.
+- The protected untracked directory `plans/pe-coff/__pycache__/` is local generated
+  state; do not commit or delete it as part of linker work.
+- Accepted non-PGO binary:
+  `/tmp/wild-gc-load-guard/release/wild`.
+- Accepted PGO binary: `/tmp/wild-accepted-32a-pgo`.
+- Frozen corpora:
+  `/home/yakov/Documents/wild-goal3-corpora/frozen/{ruststd,ripgrep,rust-analyzer,uv}`.
+
+Current performance result:
+
+- The accepted fixed-protocol projected PE geometric-mean speedup is
+  **2.0437098877x** over `lld-link`.
+- A diagnostic independent thread-count sweep selected Wild thread counts 6, 6,
+  10, and 10 for ruststd, ripgrep, rust-analyzer, and uv respectively, producing a
+  **2.0607474868x** geometric-mean point estimate. Its per-corpus point estimates
+  were 2.497642x, 1.799782x, 2.103976x, and 1.906814x. This short sweep used only
+  15 samples per row and zero minimum accumulated time, so it is not the final
+  five-second holdout required by `GOAL.md`.
+- The frozen mature-ELF target is **2.814256458x**. Thus the accepted fixed-protocol
+  point estimate is about 72.6% of the target and is still 27.4% short when expressed
+  as a fraction of the final multiplier. An earlier conversational “10.3% left”
+  referred to an obsolete 2.518x target and must not be reused.
+
+Accepted commits late in the tuning session, newest first:
+
+- `32a504c6`: avoid redundant atomic PE GC marks.
+- `bf25dcb9`: skip redundant PE archive definition scans.
+- `86e7ef75`: avoid rehashing interned PE symbol names.
+- `a47e499d`: prepare PE section groups in parallel.
+- `294751a8`: satisfy Rust 1.94 PE clippy checks.
+- `0b23d3b3`: sort only actual PE subsections.
+- `0f49fbe4`: prepare selected PE archive members in parallel.
+
+The latest fresh phase timing on rust-analyzer attributed approximately 115 ms total
+to: input selection 35 ms, COMDAT plus `/OPT:REF` 21 ms, layout 12 ms, dense
+finalization 9 ms, relocations 8.5 ms, dense-IR construction 6 ms, and output writing
+4 ms. Reusing one tmpfs output path produced misleading allocation/truncation timing;
+always use a fresh output path. Temporary resolver instrumentation further split the
+two dominant archive waves into about 6.1 ms of demand refresh/provider mapping,
+11.1 ms of selected-member processing (chiefly serial name interning and state
+absorption), and 1.8 ms of ordering. All diagnostic instrumentation was removed.
+
+Important rejected experiments:
+
+- Allocation-free library-name comparison looked 0.63% faster before PGO but was a
+  1.08% PGO regression; fully reverted.
+- Parallel immutable name probes plus deterministic serial miss commit passed 22
+  resolver tests. Broad activation was neutral, a >=16-occurrence threshold gained
+  only 0.32%, and >=32 regressed 0.64%; the roughly 300-line implementation was fully
+  reverted as unjustified complexity.
+- The old binary
+  `/tmp/wild-skip-materialize-source-default-candidate/release/wild` appeared 2.3%
+  faster only against its historical baseline. A fresh 100-pair comparison against
+  the accepted binary found it **44.9% slower geometrically** (candidate/baseline
+  time ratios 1.2033, 1.4464, 1.5349, and 1.6504), so it is not reusable evidence.
+- Prior `/tmp` artifacts named `contentflags2`, `compact-global-*`,
+  `name-hashtable-*`, `wild-layout-sparse-pgo`, `single-scan-layout-1904`,
+  `relocreduce`, `skip-source-check-screen`, and similar are rejected experiments or
+  changes already represented by accepted commits. Do not infer a win from their old
+  filenames or incomparable baselines.
+
+If Goal 3 resumes, begin at the accepted tip and re-profile the measured archive
+refresh and selected-member absorption paths in `libwild/src/pe_resolver.rs` and the
+dense finalization path in `libwild/src/pe_ir.rs`. One unbenchmarked idea—removing a
+redundant interner lookup on new-name insertion—was deliberately reverted when the
+user requested the stop, so the pushed branch contains no speculative code. Every
+candidate must first pass focused resolver tests and output validation on all four
+corpora, then beat an identical-code control, then survive a separately trained PGO
+comparison. Only after reaching the target should the full `GOAL.md` sweep,
+five-second confirmation, bootstrap, RSS, determinism, local PE, and native-Windows
+gates run.
+
+The short benchmark command is `plans/pe-coff/pe-link-bench_001.py` with warm mode,
+fresh `/dev/shm` output, pinned CPUs `5,6,7,8,9,15,16,17,18,19`, and each corpus run
+from its `pe/corpus/source-reproduce` directory. Never run corpora concurrently on
+the shared pinned CPUs.
 
 ## Executive summary
 
