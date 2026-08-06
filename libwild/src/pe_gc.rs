@@ -20,6 +20,8 @@ use crate::error::Result;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[inline]
 fn count_hot_allocations(count: u64) {
@@ -498,21 +500,48 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                     .len()
                     .div_ceil(rayon::current_num_threads().saturating_mul(2))
                     .max(1024);
+                let parallel_live = live_bits
+                    .iter()
+                    .copied()
+                    .map(AtomicU64::new)
+                    .collect::<Vec<_>>();
+                let parallel_imports = referenced_import_bits
+                    .iter()
+                    .copied()
+                    .map(AtomicU64::new)
+                    .collect::<Vec<_>>();
+                let mark_parallel = |section: SectionId| -> Result<()> {
+                    let canonical = *input
+                        .redirect_targets
+                        .get(section.index())
+                        .context("live section is outside dense IR")?;
+                    if input.discarded[canonical.index()] {
+                        return Ok(());
+                    }
+                    let word = parallel_live
+                        .get(canonical.index() / 64)
+                        .context("canonical live section is outside dense IR")?;
+                    word.fetch_or(1u64 << (canonical.index() % 64), Ordering::Relaxed);
+                    Ok(())
+                };
+                let mark_import_parallel = |name: NameId| -> Result<()> {
+                    let word = parallel_imports
+                        .get(name.index() / 64)
+                        .context("import name is outside resolved namespace")?;
+                    word.fetch_or(1u64 << (name.index() % 64), Ordering::Relaxed);
+                    Ok(())
+                };
                 let chunks = frontier
                     .par_chunks(chunk_size)
                     .map(|sections| {
-                        let mut section_targets = Vec::new();
-                        let mut import_names = Vec::new();
                         let mut scanned_relocations = 0usize;
                         for &section in sections {
                             let group = input.group_by_section[section.index()];
                             let start = input.group_starts[group] as usize;
                             let end = input.group_starts[group + 1] as usize;
-                            section_targets.extend(
-                                input.group_members[start..end]
-                                    .iter()
-                                    .map(|&member| SectionId::from_u32(member as u32)),
-                            );
+                            for &member in &input.group_members[start..end] {
+                                mark_parallel(SectionId::from_u32(member as u32))?;
+                            }
                             let relocations = self
                                 .ir
                                 .relocations
@@ -529,10 +558,10 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                                     relocations.iter().zip(&predecoded_targets[range])
                                 {
                                     match target >> Self::PREDECODE_KIND_SHIFT {
-                                        0 => section_targets.push(SectionId::from_u32(target)),
-                                        1 => import_names.push(NameId::from_u32(
+                                        0 => mark_parallel(SectionId::from_u32(target))?,
+                                        1 => mark_import_parallel(NameId::from_u32(
                                             target & Self::PREDECODE_TARGET_MASK,
-                                        )),
+                                        ))?,
                                         2 => {}
                                         _ => {
                                             Self::unpack_symbol_target(resolved, *relocation)?;
@@ -543,27 +572,39 @@ impl<'ir, 'data> DenseEventGc<'ir, 'data> {
                                 for relocation in relocations {
                                     let target = Self::unpack_symbol_target(resolved, *relocation)?;
                                     if let Some(name) = target.import_name {
-                                        import_names.push(name);
+                                        mark_import_parallel(name)?;
                                     }
                                     if let Some(section) = target.section {
-                                        section_targets.push(section);
+                                        mark_parallel(section)?;
                                     }
                                 }
                             }
                         }
-                        Ok((section_targets, import_names, scanned_relocations))
+                        Ok(scanned_relocations)
                     })
                     .collect::<Vec<Result<_>>>();
                 for chunk in chunks {
-                    let (section_targets, import_names, scanned_relocations) = chunk?;
+                    let scanned_relocations = chunk?;
                     if instrumentation_enabled {
                         relocation_count += scanned_relocations;
                     }
-                    for name in import_names {
-                        mark_import(name, &mut referenced_import_bits)?;
-                    }
-                    for section in section_targets {
-                        mark(section, &mut live_bits, &mut pending, &mut visited_sections)?;
+                }
+                for (bits, parallel) in referenced_import_bits.iter_mut().zip(&parallel_imports) {
+                    *bits = parallel.load(Ordering::Relaxed);
+                }
+                for (word_index, (bits, parallel)) in
+                    live_bits.iter_mut().zip(&parallel_live).enumerate()
+                {
+                    let updated = parallel.load(Ordering::Relaxed);
+                    let mut added = updated & !*bits;
+                    *bits = updated;
+                    while added != 0 {
+                        let bit = added.trailing_zeros() as usize;
+                        pending.push_back(SectionId::from_u32(
+                            (word_index * 64 + bit) as u32,
+                        ));
+                        visited_sections += 1;
+                        added &= added - 1;
                     }
                 }
                 continue;
