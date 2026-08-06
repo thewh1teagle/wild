@@ -3820,6 +3820,7 @@ impl CompactComdatAnalysis {
             ..Self::default()
         };
         analysis.group_by_node = vec![usize::MAX; section_count];
+        analysis.dense_group_starts.reserve(section_count + 1);
 
         // Resolve every associative section to its ultimate non-associative leader using direct
         // SectionIds. `comdat_order` preserves the raw auxiliary-symbol encounter order used by
@@ -3869,7 +3870,7 @@ impl CompactComdatAnalysis {
         // Build dense groups as CSR. A Vec header per potential leader and another Vec allocation
         // per actual group cost more memory than the member IDs themselves on large Rust links.
         let mut group_by_leader = vec![usize::MAX; section_count];
-        let mut group_leaders = Vec::new();
+        let mut group_leaders = Vec::with_capacity(section_count);
         let mut member_count = 0usize;
         for (leader, &count) in member_counts.iter().enumerate() {
             if count == 0 {
@@ -3884,7 +3885,10 @@ impl CompactComdatAnalysis {
                 .checked_add(count as usize)
                 .context("dense COMDAT member count overflow")?;
         }
-        analysis.dense_group_members = vec![usize::MAX; member_count];
+        analysis.dense_group_members = Vec::with_capacity(section_count);
+        analysis
+            .dense_group_members
+            .resize(member_count, usize::MAX);
         let mut cursors = analysis
             .dense_group_starts
             .iter()
