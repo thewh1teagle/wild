@@ -1,10 +1,85 @@
 # PE/COFF goals 1–3 session handoff
 
-Last updated: 2026-08-06 at the user-requested Goal 3 stopping point. This is the continuity document
+Last updated: 2026-08-08 after upstreaming began. This is the continuity document
 for a new agent session.
 Read it together with [`GOAL.md`](../../GOAL.md) and
 [`quality-gate.md`](quality-gate.md), but treat this file as the broad narrative and
 current-state summary.
+
+## Update 2026-08-08: upstreaming started (read this first)
+
+This section supersedes older branch/priority instructions where they conflict.
+
+### Branch map after the 2026-08-08 rebase
+
+- `feature/pe-coff-dgx-performance` is the latest and authoritative fork branch.
+  It was rebased onto the fork's `main` on 2026-08-08; the pre-rebase tip is
+  preserved at `backup/pe-coff-dgx-pre-main-rebase-20260808` and other
+  pre-rebase branches under `backup/rebase-20260808/*`. The `dev` branch was
+  only a rebase-testing area; ignore it.
+- The Goal 3 performance state is unchanged from the 2026-08-06 stopping point
+  below: accepted PE geometric-mean speedup 2.0437x over lld-link versus the
+  frozen 2.814x ELF-parity target; Goal 3 is NOT complete.
+- The work is validated on a real Windows laptop too: Wild beat MSVC link.exe
+  by 9.1% and lld by 10.2% on a clean ripgrep build
+  (`windows-native-performance-001.md`).
+
+### Upstream PR 1 is open
+
+- PR: <https://github.com/wild-linker/wild/pull/2374>
+  "port(coff): add MSVC link.exe-style argument parsing".
+- Branch: `pe/args-msvc` on the fork, one commit `33b29517`, based directly on
+  `upstream/main` (`2f6c83dc`), NOT on the dgx branch.
+- Contents: new `libwild/src/args/coff.rs` (~580 lines, half tests) plus
+  dispatch wiring in `args.rs`/`lib.rs`. Parse-only: `Args::Coff` bails
+  "PE/COFF support is not yet implemented". Core options
+  `/OUT /ENTRY /SUBSYSTEM /DLL /MACHINE /LIBPATH /DEFAULTLIB /NODEFAULTLIB`;
+  the remaining rustc-emitted MSVC flags are recognised-and-ignored; unknown
+  options error via the shared `report_unrecognized()` (upstream convention
+  from their PR #2318). `-flavor link` and `link`/`lld-link` argv[0] select
+  the flavor. No response files yet (disclosed in the PR body).
+- Design decisions a reviewer may probe (know these): hand-rolled
+  case-insensitive `NAME:value` token loop instead of upstream's declarative
+  `ArgumentParser` (MSVC syntax does not fit it; offered to restructure);
+  option-vs-input rule = known-table match, else token with a path separator
+  is an input, else unrecognized error (lld-link matches a complete option
+  table, ours is small); values must be attached (`/OUT: next-token` form was
+  deliberately rejected); `/NXCOMPAT:NO`/`/DYNAMICBASE:NO` accepted;
+  separate-token values do not exist in link.exe.
+- Upstream context: davidlattimore explicitly invited an args-first PR in
+  issue #2320 and left MSVC-vs-GNU order to the contributor. mati865 prefers
+  GNU and is openly skeptical of LLM-made contributions; the MSVC-vs-GNU
+  driver architecture (separate drivers versus lld-style MinGW translation)
+  is an open question upstream. Prior attempt PR #1670 died for being too big
+  and adding `target-lexicon`; do not repeat that.
+
+### Hard rules for future sessions
+
+- NEVER add a Claude/AI co-author trailer to commits.
+- NEVER open a PR, or push to an upstream-visible branch, without the user
+  explicitly asking.
+- PR descriptions and review replies must be plain human text the user can
+  own; per upstream CONTRIBUTING a human must understand and defend every
+  change.
+
+### Planned upstream ladder (after PR 1 feedback)
+
+Wait for davidlattimore's response to PR 2374 before building more; his
+feedback on the parser shape determines the next PRs' design. Then, carving
+from this branch (~35k lines of PE code total) rewritten small against
+upstream main:
+
+1. COFF object reading (file-kind + minimal parser, ~1k lines).
+2. Minimal PE writer: trivial freestanding exe, no relocations/imports/CRT,
+   plus integration-test hookup so Windows CI executes it (~1.5–2k lines).
+   This is davidlattimore's stated first milestone.
+3. Then one feature per PR: relocations, archives + default-library
+   resolution, imports/IAT, COMDAT + CRT survival, unwind/load-config,
+   response files. A real rustc hello-world link needs roughly 12–15k lines
+   across ~6–8 PRs; never as one PR.
+
+The dgx branch remains the reference implementation and user-facing
+distribution channel until upstream catches up.
 
 ## Goal 3 stopping point (2026-08-06)
 
